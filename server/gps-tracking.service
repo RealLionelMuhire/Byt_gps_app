@@ -1,0 +1,19 @@
+[Unit]
+Description=GPS Tracking Server
+After=network.target postgresql.service
+
+[Service]
+Type=simple
+User=www-data
+WorkingDirectory=/opt/gps-tracking-server
+Environment="PATH=/opt/gps-tracking-server/venv/bin"
+ExecStart=/opt/gps-tracking-server/venv/bin/python -m app.main
+Restart=always
+RestartSec=10
+
+# Logging
+StandardOutput=append:/var/log/gps-tracking/server.log
+StandardError=append:/var/log/gps-tracking/error.log
+
+[Install]
+WantedBy=multi-user.target

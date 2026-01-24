@@ -1,0 +1,358 @@
+#!/usr/bin/env python3
+"""
+Battery Monitor for GPS Tracker (ASCII Status Format)
+Monitors battery voltage from GPS tracker status messages
+"""
+
+import serial
+import time
+import sys
+import argparse
+import re
+
+class BatteryMonitorASCII:
+    """Monitor battery status from ASCII status messages"""
+    
+    def __init__(self, port='/dev/ttyUSB0', baudrate=115200, timeout=1):
+        self.port = port
+        self.baudrate = baudrate
+        self.timeout = timeout
+        self.ser = None
+    
+    def connect(self):
+        """Connect to the GPS tracker"""
+        try:
+            self.ser = serial.Serial(
+                port=self.port,
+                baudrate=self.baudrate,
+                bytesize=serial.EIGHTBITS,
+                parity=serial.PARITY_NONE,
+                stopbits=serial.STOPBITS_ONE,
+                timeout=self.timeout
+            )
+            return True
+        except serial.SerialException as e:
+            print(f"❌ Error connecting to {self.port}: {e}")
+            return False
+    
+    def parse_status_message(self, message):
+        """Parse ASCII status message from GPS tracker"""
+        info = {}
+        
+        # Extract all fields using regex
+        patterns = {
+            'datetime': r'<(\d{4}-\d{2}-\d{2},\d{2}:\d{2}:\d{2})',
+            'sim': r'SIM:(\d+),(\d+)',
+            'csq': r'CSQ:(\d+)',
+            'gps': r'GPS:(\d+)',
+            'av': r'AV:([AV])',
+            'sv': r'SV:(\d+)',
+            'pd': r'PD:([\d.]+)',
+            'sn': r'SN:(\d+)',
+            'addr': r'ADDR:([^,]+),(\d+),(\d+)',
+            'apn': r'APN:([^;]*)',
+            'user': r'USER:([^;]*)',
+            'pwd': r'PWD:([^;]*)',
+            'vol': r'VOL:(\d+),(\d+)',
+            'gs': r'GS:(\d+),(\d+)',
+            'pwr': r'PWR:(\d+)',
+            'acc': r'ACC:(\d+)',
+            'sos': r'SOS:(\d+)',
+            'in': r'IN:(\d+)',
+            'login': r'LOGIN:(\d+)',
+            'version': r'(TK\w+_VER_[\d.]+)',
+            'mem': r'MEM:(\d+),(\d+)',  # Memory: used,total (KB)
+            'ram': r'RAM:(\d+)',  # RAM usage (%)
+            'storage': r'STORAGE:(\d+),(\d+)',  # Storage: used,total (KB)
+            'flash': r'FLASH:(\d+)',  # Flash usage (%)
+        }
+        
+        for field, pattern in patterns.items():
+            match = re.search(pattern, message)
+            if match:
+                if field == 'vol':
+                    # VOL:3840,1 means 3840mV, battery status 1
+                    info['voltage_mv'] = int(match.group(1))
+                    info['battery_status'] = int(match.group(2))
+                    info['voltage_v'] = info['voltage_mv'] / 1000.0
+                elif field == 'csq':
+                    info['signal_quality'] = int(match.group(1))
+                elif field == 'gps':
+                    info['gps_locked'] = int(match.group(1)) == 1
+                elif field == 'acc':
+                    info['acc_on'] = int(match.group(1)) == 1
+                elif field == 'addr':
+                    info['server'] = match.group(1)
+                    info['port'] = int(match.group(2))
+                elif field == 'sn':
+                    info['serial_number'] = match.group(1)
+                elif field == 'version':
+                    info['firmware'] = match.group(1)
+                elif field == 'mem':
+                    info['mem_used_kb'] = int(match.group(1))
+                    info['mem_total_kb'] = int(match.group(2))
+                    info['mem_used_percent'] = (info['mem_used_kb'] / info['mem_total_kb']) * 100
+                elif field == 'ram':
+                    info['ram_percent'] = int(match.group(1))
+                elif field == 'storage':
+                    info['storage_used_kb'] = int(match.group(1))
+                    info['storage_total_kb'] = int(match.group(2))
+                    info['storage_used_percent'] = (info['storage_used_kb'] / info['storage_total_kb']) * 100
+                elif field == 'flash':
+                    info['flash_percent'] = int(match.group(1))
+                elif field == 'datetime':
+                    info['device_time'] = match.group(1)
+                elif field == 'login':
+                    info['logged_in'] = int(match.group(1)) == 1
+        
+        return info if info else None
+    
+    def get_battery_percentage(self, voltage_mv):
+        """Estimate battery percentage from voltage (LiPo 3.7V battery)"""
+        # LiPo voltage ranges:
+        # 4.2V = 100% (fully charged)
+        # 3.7V = 50% (nominal)
+        # 3.5V = 20%
+        # 3.3V = 5%
+        # 3.0V = 0% (discharged)
+        
+        if voltage_mv >= 4200:
+            return 100
+        elif voltage_mv >= 4000:
+            return 80 + ((voltage_mv - 4000) / 200) * 20
+        elif voltage_mv >= 3700:
+            return 50 + ((voltage_mv - 3700) / 300) * 30
+        elif voltage_mv >= 3500:
+            return 20 + ((voltage_mv - 3500) / 200) * 30
+        elif voltage_mv >= 3300:
+            return 5 + ((voltage_mv - 3300) / 200) * 15
+        elif voltage_mv >= 3000:
+            return ((voltage_mv - 3000) / 300) * 5
+        else:
+            return 0
+    
+    def display_status(self, info):
+        """Display battery and device status"""
+        print("\n" + "=" * 60)
+        print("📊 GPS TRACKER STATUS")
+        print("=" * 60)
+        
+        # Battery Information
+        if 'voltage_mv' in info:
+            voltage_v = info['voltage_v']
+            percentage = self.get_battery_percentage(info['voltage_mv'])
+            
+            print(f"\n🔋 Battery Status:")
+            print(f"   Voltage:    {voltage_v:.2f}V ({info['voltage_mv']}mV)")
+            print(f"   Level:      {percentage:.1f}%")
+            
+            # Visual battery indicator
+            bar_length = 20
+            filled = int((percentage / 100) * bar_length)
+            bar = "█" * filled + "░" * (bar_length - filled)
+            
+            # Color indicator
+            if percentage >= 80:
+                indicator = "🟢"
+            elif percentage >= 50:
+                indicator = "🟡"
+            elif percentage >= 20:
+                indicator = "🟠"
+            else:
+                indicator = "🔴"
+            
+            print(f"   {indicator} [{bar}] {percentage:.1f}%")
+        
+        # GPS Status
+        if 'gps_locked' in info:
+            gps_icon = "🛰️  LOCKED" if info['gps_locked'] else "📍 SEARCHING"
+            print(f"\n🛰️  GPS:        {gps_icon}")
+        
+        # GSM Signal
+        if 'signal_quality' in info:
+            csq = info['signal_quality']
+            bars = min(4, csq // 7)  # CSQ 0-31, map to 0-4 bars
+            signal_bar = "📶" + "▂▄▆█"[bars] if bars > 0 else "📵"
+            print(f"📶 GSM Signal: {signal_bar} (CSQ: {csq})")
+        
+        # ACC Status
+        if 'acc_on' in info:
+            acc_status = "🚗 ON (Moving)" if info['acc_on'] else "🅿️  OFF (Parked)"
+            print(f"🚗 ACC:        {acc_status}")
+        
+        # Server Connection
+        if 'server' in info:
+            login_status = "✅ Connected" if info.get('logged_in', False) else "❌ Not Connected"
+            print(f"\n🌐 Server:     {info['server']}:{info['port']}")
+        # Memory and Storage Information
+        has_mem_info = False
+        
+        if 'mem_used_kb' in info:
+            if not has_mem_info:
+                print(f"\n💾 Memory & Storage:")
+                has_mem_info = True
+            mem_used_mb = info['mem_used_kb'] / 1024
+            mem_total_mb = info['mem_total_kb'] / 1024
+            mem_percent = info['mem_used_percent']
+            print(f"   Memory:     {mem_used_mb:.1f}MB / {mem_total_mb:.1f}MB ({mem_percent:.1f}%)")
+        
+        if 'ram_percent' in info:
+            if not has_mem_info:
+                print(f"\n💾 Memory & Storage:")
+                has_mem_info = True
+            ram_percent = info['ram_percent']
+            print(f"   RAM Usage:  {ram_percent}%")
+        
+        if 'storage_used_kb' in info:
+            if not has_mem_info:
+                print(f"\n💾 Memory & Storage:")
+                has_mem_info = True
+            storage_used_mb = info['storage_used_kb'] / 1024
+            storage_total_mb = info['storage_total_kb'] / 1024
+            storage_percent = info['storage_used_percent']
+            print(f"   Storage:    {storage_used_mb:.1f}MB / {storage_total_mb:.1f}MB ({storage_percent:.1f}%)")
+        
+        if 'flash_percent' in info:
+            if not has_mem_info:
+                print(f"\n💾 Memory & Storage:")
+                has_mem_info = True
+            flash_percent = info['flash_percent']
+            print(f"   Flash Usage: {flash_percent}%")
+        
+            print(f"   Status:     {login_status}")
+        
+        # Device Information
+        if 'serial_number' in info:
+            print(f"\n📱 Serial:     {info['serial_number']}")
+        
+        if 'firmware' in info:
+            print(f"💾 Firmware:   {info['firmware']}")
+        
+        if 'device_time' in info:
+            print(f"⏰ Device Time: {info['device_time']}")
+        
+        print(f"\n🕐 System Time: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+        print("=" * 60)
+    
+    def monitor(self, duration=30, debug=False):
+        """Monitor the GPS tracker for status messages"""
+        print("🔍 Connecting to GPS tracker...")
+        
+        if not self.connect():
+            return False
+        
+        print(f"✅ Connected at {self.baudrate} baud!")
+        print(f"⏱️  Will monitor for {duration} seconds...")
+        print("   Waiting for status messages...\n")
+        
+        if debug:
+            print("🐛 DEBUG MODE: Showing raw messages\n")
+        
+        start_time = time.time()
+        message_count = 0
+        buffer = ""
+        
+        try:
+            while (time.time() - start_time) < duration:
+                if self.ser.in_waiting > 0:
+                    # Read data and decode as ASCII
+                    data = self.ser.read(self.ser.in_waiting).decode('ascii', errors='ignore')
+                    buffer += data
+                    
+                    # Look for complete messages (enclosed in < >)
+                    while '<' in buffer and '>' in buffer:
+                        start = buffer.index('<')
+                        end = buffer.index('>', start) + 1
+                        message = buffer[start:end]
+                        buffer = buffer[end:]
+                        
+                        message_count += 1
+                        
+                        if debug:
+                            print(f"📨 Message #{message_count}:")
+                            print(f"   {message[:100]}{'...' if len(message) > 100 else ''}\n")
+                        
+                        # Parse the message
+                        info = self.parse_status_message(message)
+                        
+                        if info:
+                            self.display_status(info)
+                            
+                            if not debug:
+                                print("\n💡 Press Ctrl+C to exit")
+                        else:
+                            if debug:
+                                print("   ⚠️  Could not parse message\n")
+                
+                time.sleep(0.1)
+            
+            # Timeout
+            if message_count == 0:
+                print("\n❌ No status messages received")
+                print("\n💡 Troubleshooting:")
+                print("   1. Is the device powered on (12V)?")
+                print("   2. Try: sudo ./test_connection.py")
+                print("   3. Check baud rate with: sudo ./analyze_protocol.py")
+            else:
+                print(f"\n✅ Received {message_count} status messages")
+            
+            return message_count > 0
+            
+        except KeyboardInterrupt:
+            print("\n\n👋 Monitoring stopped by user")
+            return True
+        finally:
+            if self.ser:
+                self.ser.close()
+
+def main():
+    parser = argparse.ArgumentParser(
+        description='Monitor GPS tracker battery status (ASCII format)',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  sudo ./battery_monitor_ascii.py
+  sudo ./battery_monitor_ascii.py --duration 60
+  sudo ./battery_monitor_ascii.py --debug
+  sudo ./battery_monitor_ascii.py --baud 115200 --duration 180
+        """
+    )
+    
+    parser.add_argument(
+        '--port',
+        default='/dev/ttyUSB0',
+        help='Serial port (default: /dev/ttyUSB0)'
+    )
+    
+    parser.add_argument(
+        '--baud',
+        type=int,
+        default=115200,
+        help='Baud rate (default: 115200)'
+    )
+    
+    parser.add_argument(
+        '--duration',
+        type=int,
+        default=30,
+        help='Monitoring duration in seconds (default: 30)'
+    )
+    
+    parser.add_argument(
+        '--debug',
+        action='store_true',
+        help='Show debug information'
+    )
+    
+    args = parser.parse_args()
+    
+    monitor = BatteryMonitorASCII(
+        port=args.port,
+        baudrate=args.baud
+    )
+    
+    success = monitor.monitor(duration=args.duration, debug=args.debug)
+    sys.exit(0 if success else 1)
+
+if __name__ == '__main__':
+    main()
