@@ -14,6 +14,7 @@ from app.core.config import settings
 from app.core.database import init_db
 from app.tcp_server import TCPServer
 from app.api import devices, locations
+from app import dashboard
 
 # Configure logging
 logging.basicConfig(
@@ -77,6 +78,7 @@ app.add_middleware(
 # Include routers
 app.include_router(devices.router, prefix="/api/devices", tags=["devices"])
 app.include_router(locations.router, prefix="/api/locations", tags=["locations"])
+app.include_router(dashboard.router, tags=["dashboard"])
 
 
 @app.get("/")

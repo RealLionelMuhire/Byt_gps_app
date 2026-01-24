@@ -45,12 +45,34 @@ Send commands from server after device connects.
 ### Common Configuration Commands
 
 #### Set Server IP and Port
+
+**Method 1: SERVER Command (Recommended for TK903ELE)**
+```
+SERVER,0,164.92.212.186,7018,0#
+```
+- Format: `SERVER,0,IP_ADDRESS,PORT,0#`
+- No password required
+- Replace `164.92.212.186` with your server IP
+- Replace `7018` with your server port
+- Device will reply: `server ok`
+
+**Example:**
+```
+SERVER,0,api.gocavgo.com,7018,0#
+```
+or
+```
+SERVER,0,164.92.212.186,7018,0#
+```
+
+**Method 2: ADMINIP Command (Alternative)**
 ```
 adminip123456 yourserver.com 7018
 ```
 - Replace `123456` with your password
 - Replace `yourserver.com` with your server address
 - Replace `7018` with your server port
+- Note: May not work on all firmware versions
 
 #### Set APN (Mobile Data)
 ```
@@ -134,21 +156,29 @@ sudo python3 gps_config.py
 1. **Insert SIM card** into GPS tracker
 2. **Power on device** (12V)
 3. **Wait for GSM connection** (LED blinking)
-4. **Send SMS** from your phone:
+4. **Set admin phone** (optional):
 
 ```
 admin123456 YOUR_PHONE_NUMBER
 ```
 
-5. **Set server address:**
+5. **Set server address (REQUIRED):**
 ```
-adminip123456 yourserver.com 7018
+SERVER,0,164.92.212.186,7018,0#
 ```
+
+Reply: `server ok`
 
 6. **Set APN (if using mobile data):**
 ```
-apn123456 internet.yourcarrier.com
+APN,internet,,#
 ```
+or
+```
+apn123456 internet
+```
+
+Reply: `apn ok`
 
 7. **Set upload interval:**
 ```
@@ -162,25 +192,40 @@ check123456
 
 9. **Device will respond with current configuration**
 
+10. **Verify via USB (optional):**
+```bash
+sudo ./device_info.py
+```
+Check that Server shows: `164.92.212.186:7018`
+
 ---
 
 ### Scenario 2: Change Server Address
 
 **To update server IP/domain:**
 
+**Recommended Method:**
+```
+SERVER,0,164.92.212.186,7018,0#
+```
+
+**Alternative Method:**
 ```
 adminip123456 newserver.com 8080
 ```
 
 **Verify:**
 ```
-IPAPN123456
+check123456
 ```
 
-**Reset device to apply:**
+**Or via USB:**
+```bash
+sudo ./device_info.py
+# Check that Server line shows new address
 ```
-reset123456
-```
+
+**Note:** Settings take effect immediately, no reset needed
 
 ---
 
@@ -230,12 +275,24 @@ resume123456
 
 | Command | Description | Example |
 |---------|-------------|---------|
-| `adminip123456 SERVER PORT` | Set server address | `adminip123456 gps.example.com 7018` |
-| `apn123456 APN USER PASS` | Set APN settings | `apn123456 internet.mobile.com web web` |
+| `SERVER,0,IP,PORT,0#` | Set server address (Recommended) | `SERVER,0,164.92.212.186,7018,0#` |
+| `adminip123456 SERVER PORT` | Set server address (Alternative) | `adminip123456 gps.example.com 7018` |
+| `APN,apn_name,,#` | Set APN settings | `APN,internet,,#` |
+| `apn123456 APN USER PASS` | Set APN with password | `apn123456 internet.mobile.com web web` |
 | `password123456 NEWPASS` | Change password | `password123456 888888` |
 | `check123456` | Check settings | `check123456` |
 | `IPAPN123456` | Check IP/APN | `IPAPN123456` |
 | `reset123456` | Reset device | `reset123456` |
+
+### TK903ELE Tested Commands (Firmware v1.1.6)
+
+| Command | Status | Reply | Notes |
+|---------|--------|-------|-------|
+| `SERVER,0,IP,PORT,0#` | ✅ Working | `server ok` | Takes effect immediately |
+| `APN,internet,,#` | ✅ Working | `apn ok` | For MTN Rwanda |
+| `check123456` | ✅ Working | Full status | Returns all settings |
+| `STATUS#` | ✅ Working | Device status | Battery, GPS, GSM info |
+| `adminip123456 IP PORT` | ⚠️ Limited | No reply | USB only, not persistent |
 
 ### Interval Settings
 
@@ -405,6 +462,112 @@ begin123456
 
 ---
 
+## Complete Configuration Example
+
+### Real-World Setup: TK903ELE on GOCAVGO Server
+
+**Device Details:**
+- Model: TK903ELE v1.1.6
+- IMEI: 868720064874575
+- SIM: MTN Rwanda
+- Server: 164.92.212.186 (api.gocavgo.com)
+
+**Step-by-Step Configuration:**
+
+1. **Check current status:**
+   ```sms
+   STATUS#
+   ```
+   
+   Reply:
+   ```
+   V:4.22V,12V;CSQ:22;PWR:1;ACC:0;GPS:3,0,0;GS:0,1
+   ```
+   - Battery: 4.22V (100%)
+   - GSM Signal: CSQ 22 (strong)
+   - GPS: 3 satellites
+
+2. **Configure server:**
+   ```sms
+   SERVER,0,164.92.212.186,7018,0#
+   ```
+   
+   Reply:
+   ```
+   server ok
+   ```
+
+3. **Set APN:**
+   ```sms
+   APN,internet,,#
+   ```
+   
+   Reply:
+   ```
+   apn ok
+   ```
+
+4. **Verify via USB:**
+   ```bash
+   sudo ./device_info.py
+   ```
+   
+   Output shows:
+   ```
+   🌐 Server: 164.92.212.186:7018
+   📶 GSM Signal: CSQ: 22
+   🔋 Battery: 100%
+   ```
+
+5. **Check server connection:**
+   On server (164.92.212.186):
+   ```bash
+   curl http://164.92.212.186:8000/api/devices/
+   ```
+   
+   Returns:
+   ```json
+   [
+     {
+       "id": 1,
+       "imei": "868720064874575",
+       "name": "TK903ELE",
+       "status": "online",
+       "battery_level": "Very High",
+       "gsm_signal": "Strong"
+     }
+   ]
+   ```
+
+6. **View location data:**
+   ```bash
+   curl http://164.92.212.186:8000/api/locations/1/latest
+   ```
+   
+   Returns GPS coordinates, speed, and timestamp.
+
+**Success!** Device is now tracking and sending data every 20 seconds when moving.
+
+---
+
+## Quick Reference Card
+
+**For TK903ELE (Print and keep):**
+
+| Task | SMS Command |
+|------|-------------|
+| Set Server | `SERVER,0,IP,PORT,0#` |
+| Set APN | `APN,internet,,#` |
+| Check Status | `STATUS#` |
+| Check Settings | `check123456` |
+| Change Password | `password123456 NEWPASS` |
+| Reset Device | `reset123456` |
+
+**Your Server:** 164.92.212.186:7018  
+**APN:** internet (MTN Rwanda)  
+**Default Password:** 123456  
+
+---
 ## Security Recommendations
 
 ### Change Default Password
