@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Battery Monitor for GPS Tracker (ASCII Status Format)
-Monitors battery voltage from GPS tracker status messages
+Device Info Monitor for GPS Tracker (ASCII Status Format)
+Monitors device status and GPS location from tracker
 """
 
 import serial
@@ -9,15 +9,18 @@ import time
 import sys
 import argparse
 import re
+import requests
+from datetime import datetime
 
 class BatteryMonitorASCII:
     """Monitor battery status from ASCII status messages"""
     
-    def __init__(self, port='/dev/ttyUSB0', baudrate=115200, timeout=1):
+    def __init__(self, port='/dev/ttyUSB0', baudrate=115200, timeout=1, server_url=None):
         self.port = port
         self.baudrate = baudrate
         self.timeout = timeout
         self.ser = None
+        self.server_url = server_url or "http://164.92.212.186:8000"
     
     def connect(self):
         """Connect to the GPS tracker"""
@@ -45,6 +48,7 @@ class BatteryMonitorASCII:
             'sim': r'SIM:(\d+),(\d+)',
             'csq': r'CSQ:(\d+)',
             'gps': r'GPS:(\d+)',
+            'gps_data': r'GPS:([-\d.]+),([-\d.]+),(\d+)',  # GPS:lat,lon,satellites
             'av': r'AV:([AV])',
             'sv': r'SV:(\d+)',
             'pd': r'PD:([\d.]+)',
@@ -65,6 +69,10 @@ class BatteryMonitorASCII:
             'ram': r'RAM:(\d+)',  # RAM usage (%)
             'storage': r'STORAGE:(\d+),(\d+)',  # Storage: used,total (KB)
             'flash': r'FLASH:(\d+)',  # Flash usage (%)
+            'lat': r'LAT:([-\d.]+)',  # Latitude
+            'lon': r'LON:([-\d.]+)',  # Longitude
+            'speed': r'SPEED:([\d.]+)',  # Speed in km/h
+            'course': r'COURSE:([\d.]+)',  # Direction in degrees
         }
         
         for field, pattern in patterns.items():
@@ -79,6 +87,20 @@ class BatteryMonitorASCII:
                     info['signal_quality'] = int(match.group(1))
                 elif field == 'gps':
                     info['gps_locked'] = int(match.group(1)) == 1
+                elif field == 'gps_data':
+                    # GPS:lat,lon,satellites format
+                    info['latitude'] = float(match.group(1))
+                    info['longitude'] = float(match.group(2))
+                    info['satellites'] = int(match.group(3))
+                    info['gps_locked'] = True
+                elif field == 'lat':
+                    info['latitude'] = float(match.group(1))
+                elif field == 'lon':
+                    info['longitude'] = float(match.group(1))
+                elif field == 'speed':
+                    info['speed_kmh'] = float(match.group(1))
+                elif field == 'course':
+                    info['course_deg'] = float(match.group(1))
                 elif field == 'acc':
                     info['acc_on'] = int(match.group(1)) == 1
                 elif field == 'addr':
@@ -107,6 +129,43 @@ class BatteryMonitorASCII:
         
         return info if info else None
     
+    def get_gps_from_server(self, imei):
+        """Fetch latest GPS location from server"""
+        try:
+            # Get device ID from IMEI (try with and without leading zero)
+            response = requests.get(f"{self.server_url}/api/devices/", timeout=5)
+            if response.status_code == 200:
+                devices = response.json()
+                device_id = None
+                for device in devices:
+                    device_imei = device.get('imei', '')
+                    # Match with or without leading zero
+                    if device_imei == imei or device_imei == f"0{imei}" or device_imei.lstrip('0') == imei.lstrip('0'):
+                        device_id = device.get('id')
+                        break
+                
+                if device_id:
+                    # Get latest location
+                    response = requests.get(
+                        f"{self.server_url}/api/locations/{device_id}/latest",
+                        timeout=5
+                    )
+                    if response.status_code == 200:
+                        location = response.json()
+                        return {
+                            'latitude': location.get('latitude'),
+                            'longitude': location.get('longitude'),
+                            'speed_kmh': location.get('speed', 0),
+                            'course_deg': location.get('course', 0),
+                            'satellites': location.get('satellites', 0),
+                            'timestamp': location.get('timestamp'),
+                            'gps_locked': True
+                        }
+        except Exception as e:
+            # Silently fail if server is not available
+            pass
+        return None
+    
     def get_battery_percentage(self, voltage_mv):
         """Estimate battery percentage from voltage (LiPo 3.7V battery)"""
         # LiPo voltage ranges:
@@ -133,6 +192,13 @@ class BatteryMonitorASCII:
     
     def display_status(self, info):
         """Display battery and device status"""
+        
+        # Try to get GPS data from server if IMEI is available
+        if 'serial_number' in info and not ('latitude' in info and 'longitude' in info):
+            gps_data = self.get_gps_from_server(info['serial_number'])
+            if gps_data:
+                info.update(gps_data)
+        
         print("\n" + "=" * 60)
         print("📊 GPS TRACKER STATUS")
         print("=" * 60)
@@ -167,6 +233,72 @@ class BatteryMonitorASCII:
         if 'gps_locked' in info:
             gps_icon = "🛰️  LOCKED" if info['gps_locked'] else "📍 SEARCHING"
             print(f"\n🛰️  GPS:        {gps_icon}")
+            
+            # Show GPS coordinates if available
+            if 'latitude' in info and 'longitude' in info:
+                lat = info['latitude']
+                lon = info['longitude']
+                
+                # Format coordinates in degrees, minutes, seconds
+                lat_deg = int(abs(lat))
+                lat_min = int((abs(lat) - lat_deg) * 60)
+                lat_sec = ((abs(lat) - lat_deg) * 60 - lat_min) * 60
+                lat_dir = 'N' if lat >= 0 else 'S'
+                
+                lon_deg = int(abs(lon))
+                lon_min = int((abs(lon) - lon_deg) * 60)
+                lon_sec = ((abs(lon) - lon_deg) * 60 - lon_min) * 60
+                lon_dir = 'E' if lon >= 0 else 'W'
+                
+                print(f"📍 Location:   {lat:.6f}°{lat_dir}, {lon:.6f}°{lon_dir}")
+                print(f"              {lat_deg}°{lat_min}'{lat_sec:.1f}\"{lat_dir}, {lon_deg}°{lon_min}'{lon_sec:.1f}\"{lon_dir}")
+                
+                # Show timestamp if available
+                if 'timestamp' in info:
+                    timestamp_str = info['timestamp']
+                    try:
+                        # Parse ISO timestamp
+                        timestamp = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
+                        time_ago = datetime.now(timestamp.tzinfo) - timestamp
+                        seconds_ago = int(time_ago.total_seconds())
+                        
+                        if seconds_ago < 60:
+                            time_str = f"{seconds_ago}s ago"
+                        elif seconds_ago < 3600:
+                            time_str = f"{seconds_ago // 60}m ago"
+                        elif seconds_ago < 86400:
+                            time_str = f"{seconds_ago // 3600}h ago"
+                        else:
+                            time_str = f"{seconds_ago // 86400}d ago"
+                        
+                        print(f"⏰ Last Update: {time_str} ({timestamp.strftime('%Y-%m-%d %H:%M:%S')})")
+                    except:
+                        print(f"⏰ Last Update: {timestamp_str}")
+                
+                # Google Maps link
+                maps_url = f"https://www.google.com/maps?q={lat},{lon}"
+                print(f"🗺️  Maps:       {maps_url}")
+                
+            # Show satellites if available
+            if 'satellites' in info:
+                sat_count = info['satellites']
+                sat_icon = "🛰️ " * min(sat_count, 5)  # Show up to 5 satellite icons
+                print(f"🛰️  Satellites: {sat_icon} ({sat_count})")
+            
+            # Show speed if available
+            if 'speed_kmh' in info:
+                speed = info['speed_kmh']
+                speed_icon = "🚗" if speed > 0 else "🅿️ "
+                print(f"{speed_icon} Speed:      {speed:.1f} km/h")
+            
+            # Show heading if available
+            if 'course_deg' in info:
+                course = info['course_deg']
+                # Convert degrees to cardinal direction
+                directions = ['N', 'NE', 'E', 'SE', 'S', 'SW', 'W', 'NW']
+                idx = int((course + 22.5) / 45) % 8
+                direction = directions[idx]
+                print(f"🧭 Heading:    {course:.1f}° ({direction})")
         
         # GSM Signal
         if 'signal_quality' in info:
@@ -307,14 +439,14 @@ class BatteryMonitorASCII:
 
 def main():
     parser = argparse.ArgumentParser(
-        description='Monitor GPS tracker battery status (ASCII format)',
+        description='Monitor GPS tracker device info and location',
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  sudo ./battery_monitor_ascii.py
-  sudo ./battery_monitor_ascii.py --duration 60
-  sudo ./battery_monitor_ascii.py --debug
-  sudo ./battery_monitor_ascii.py --baud 115200 --duration 180
+  sudo ./device_info.py
+  sudo ./device_info.py --duration 60
+  sudo ./device_info.py --debug
+  sudo ./device_info.py --server http://164.92.212.186:8000
         """
     )
     
@@ -344,11 +476,18 @@ Examples:
         help='Show debug information'
     )
     
+    parser.add_argument(
+        '--server',
+        default='http://164.92.212.186:8000',
+        help='GPS tracking server URL (default: http://164.92.212.186:8000)'
+    )
+    
     args = parser.parse_args()
     
     monitor = BatteryMonitorASCII(
         port=args.port,
-        baudrate=args.baud
+        baudrate=args.baud,
+        server_url=args.server
     )
     
     success = monitor.monitor(duration=args.duration, debug=args.debug)
