@@ -1,5 +1,19 @@
 
+import sys
+from unittest.mock import MagicMock
+
+# Mock pydantic_settings to avoid ImportError
+sys.modules["pydantic_settings"] = MagicMock()
+sys.modules["pydantic_settings"].BaseSettings = object
+
+# Mock app.core.config
+config_mock = MagicMock()
+config_mock.settings.FORCE_SOUTHERN_HEMISPHERE = False
+config_mock.settings.LOG_LEVEL = "INFO"
+sys.modules["app.core.config"] = config_mock
+
 import struct
+
 from app.protocol_parser import ProtocolParser
 
 def test_parsing():
@@ -24,68 +38,82 @@ def test_parsing():
     lon = struct.pack('>I', 1800000) # 1.0 degrees
     speed = b'\x00'
     
-    # Scenario 1: Course=0, Status: South (Bit 11=1), East (Bit 10=0)
-    # Bit 11 is 1. 0x0800.
-    # Course is 0.
-    # Total = 0x0800.
-    course_status_south = struct.pack('>H', 0x0800)
+    # Scenario 1: Course=0.
+    # We want to test South.
+    # Protocol says: Byte 1 Bit 2 (Int Bit 10) is Latitude. 0 = South, 1 = North.
+    # Byte 1 Bit 3 (Int Bit 11) is Longitude. 0 = East, 1 = West.
     
-    # Padding for LBS (8 bytes) to satisfy len >= 30 check
+    # To represent South East:
+    # Bit 10 (Lat) = 0.
+    # Bit 11 (Lon) = 0.
+    # Bit 12 (GPS) = 1 (Valid).
+    # Value: 0x1000 (Bit 12 set, Bits 10,11 zero).
+    course_status_south_east = struct.pack('>H', 0x1000)
+    
+    # Padding for LBS (8 bytes)
     padding = b'\x00' * 8
     
-    # Full packet construction
-    # 78 78 [Len] 12 [Dt] [Sat] [Lat] [Lon] [Speed] [Course] [LBS] [Serial] [CRC] 0D 0A
-    # Data = 18 bytes. LBS = 8 bytes.
-    # Content for CRC = [Len] + [Prot] + [Data] + [LBS] + [Serial]
-    # Length byte value = Prot(1) + Data(18) + LBS(8) + Serial(2) + CRC(2)? No, usually Length is (PacketLen - 4) or similar.
-    # Code says: expected_length = length + 5.
-    # So Length = Total - 5.
-    # Total components: Header(2) + Len(1) + Prot(1) + Data(18) + LBS(8) + Serial(2) + CRC(2) + Stop(2) = 36 bytes.
-    # Length Value = 36 - 5 = 31 (0x1F).
-    
+    # Length calculation: 36 total - 5 = 31
     length_val = 31
     length_byte = struct.pack('B', length_val)
     
     # CRC Input: Length + Prot + Data + LBS + Serial
-    crc_input = length_byte + b'\x12' + dt + sat + lat + lon + speed + course_status_south + padding + b'\x00\x01'
+    crc_input = length_byte + b'\x12' + dt + sat + lat + lon + speed + course_status_south_east + padding + b'\x00\x01'
     crc = parser.calculate_crc(crc_input)
     
     packet = b'\x78\x78' + crc_input + struct.pack('>H', crc) + b'\x0D\x0A'
     
-    print(f"Testing Packet with CourseStatus=0x0800 (South=True, Course=0)")
+    print(f"Testing Packet with CourseStatus=0x1000 (Bits 10,11=0 -> South, East)")
     result = parser.parse_packet(packet)
     
     if result and result['type'] == 'location':
         print(f"Latitude: {result['latitude']}")
+        print(f"Longitude: {result['longitude']}")
+        
         if result['latitude'] < 0:
             print("SUCCESS: Latitude is Negative (South)")
         else:
             print("FAILURE: Latitude is Positive (North)")
+            
+        if result['longitude'] > 0:
+             print("SUCCESS: Longitude is Positive (East)")
+        else:
+             print("FAILURE: Longitude is Negative (West)")
     else:
         print("Failed to parse packet")
 
-    # Scenario 2: Course 16 (Bit 4 set), North (Bit 11=0)
-    # Course = 16 (0x0010). Status = 0.
-    # Total = 0x0010.
-    # Should be North.
-    # Current code: reads Bit 4 (1) -> thinks it is South.
+    # Scenario 2: North West
+    # Bit 10 (Lat) = 1 (North).
+    # Bit 11 (Lon) = 1 (West).
+    # Bit 12 (GPS) = 1.
+    # Value: 0x1C00 (Bits 12, 11, 10 set).
     
-    course_status_fake_south = struct.pack('>H', 0x0010)
+    course_status_north_west = struct.pack('>H', 0x1C00)
     
     # Reconstruct packet 2
-    crc_input2 = length_byte + b'\x12' + dt + sat + lat + lon + speed + course_status_fake_south + padding + b'\x00\x02'
+    crc_input2 = length_byte + b'\x12' + dt + sat + lat + lon + speed + course_status_north_west + padding + b'\x00\x02'
     crc2 = parser.calculate_crc(crc_input2)
     packet2 = b'\x78\x78' + crc_input2 + struct.pack('>H', crc2) + b'\x0D\x0A'
     
-    print(f"\nTesting Packet with CourseStatus=0x0010 (South=False, Course=16; Bit 4 is 1)")
+    print(f"\nTesting Packet with CourseStatus=0x1C00 (Bits 10,11=1 -> North, West)")
     result2 = parser.parse_packet(packet2)
     
     if result2 and result2['type'] == 'location':
         print(f"Latitude: {result2['latitude']}")
+        print(f"Longitude: {result2['longitude']}")
+        
         if result2['latitude'] > 0:
             print("SUCCESS: Latitude is Positive (North)")
         else:
-            print("FAILURE: Latitude is Negative (South) - False Positive from Course Bits")
+            print("FAILURE: Latitude is Negative (South)")
+            
+        if result2['longitude'] < 0:
+            print("SUCCESS: Longitude is Negative (West)")
+        else:
+            print("FAILURE: Longitude is Positive (East)")
+
+if __name__ == "__main__":
+    test_parsing()
 
 if __name__ == "__main__":
     test_parsing()

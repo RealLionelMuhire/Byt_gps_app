@@ -33,6 +33,9 @@ class Settings(BaseSettings):
     
     # Logging
     LOG_LEVEL: str = "INFO"
+
+    # Hemisphere Correction
+    FORCE_SOUTHERN_HEMISPHERE: bool = True  # Set to True for Rwanda/Southern Africa if device reports North
     
     class Config:
         env_file = ".env"

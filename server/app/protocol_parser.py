@@ -7,6 +7,7 @@ import struct
 from datetime import datetime
 from typing import Optional, Dict, Any
 import logging
+from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -191,18 +192,27 @@ class ProtocolParser:
             # Bit 13-15: Reserved
             course_status = struct.unpack('>H', packet[idx:idx+2])[0]
             
-            # Correct bit extraction based on standard GT06 protocol and comments above
+            # Correct bit extraction based on provided Protocol Document (Section 5.2.1.9)
+            # BYTE_1 Bit 2 (Int Bit 10): Latitude (1=North, 0=South)
+            # BYTE_1 Bit 3 (Int Bit 11): Longitude (0=East, 1=West)
             course = course_status & 0x03FF             # Bits 0-9 for course
-            lon_hemisphere = (course_status >> 10) & 0x01  # Bit 10: 0=E, 1=W
-            lat_hemisphere = (course_status >> 11) & 0x01  # Bit 11: 0=N, 1=S
-            gps_real = (course_status >> 12) & 0x01      # Bit 12: GPS positioned
+            lat_bit = (course_status >> 10) & 0x01      # Bit 10: Lat
+            lon_bit = (course_status >> 11) & 0x01      # Bit 11: Lon
+            gps_real = (course_status >> 12) & 0x01     # Bit 12: GPS positioned
             
             idx += 2
             
             # Apply hemisphere corrections
-            if lat_hemisphere == 1:  # South
+            # Document says: Bit 2 is 1 for North. So 0 matches South.
+            if lat_bit == 0:  # South
                 latitude = -latitude
-            if lon_hemisphere == 1:  # West
+            elif settings.FORCE_SOUTHERN_HEMISPHERE and latitude > 0:
+                # Still keep force option just in case, but the protocol fix should resolve it
+                logger.warning(f"Forcing Southern Hemisphere (Config): {latitude} -> {-latitude}")
+                latitude = -latitude
+                
+            # Document says: Bit 3 is 0 for East, 1 matches West (implied).
+            if lon_bit == 1:  # West
                 longitude = -longitude
             
             # LBS info (Mobile station info) - optional

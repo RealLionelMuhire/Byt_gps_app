@@ -12,6 +12,9 @@ import re
 import requests
 from datetime import datetime
 
+# Configuration
+FORCE_SOUTHERN_HEMISPHERE = True  # Set to True for Rwanda/Southern Africa if device reports North
+
 class BatteryMonitorASCII:
     """Monitor battery status from ASCII status messages"""
     
@@ -89,12 +92,18 @@ class BatteryMonitorASCII:
                     info['gps_locked'] = int(match.group(1)) == 1
                 elif field == 'gps_data':
                     # GPS:lat,lon,satellites format
-                    info['latitude'] = float(match.group(1))
+                    lat = float(match.group(1))
+                    if FORCE_SOUTHERN_HEMISPHERE and lat > 0:
+                        lat = -lat
+                    info['latitude'] = lat
                     info['longitude'] = float(match.group(2))
                     info['satellites'] = int(match.group(3))
                     info['gps_locked'] = True
                 elif field == 'lat':
-                    info['latitude'] = float(match.group(1))
+                    lat = float(match.group(1))
+                    if FORCE_SOUTHERN_HEMISPHERE and lat > 0:
+                        lat = -lat
+                    info['latitude'] = lat
                 elif field == 'lon':
                     info['longitude'] = float(match.group(1))
                 elif field == 'speed':
@@ -152,8 +161,12 @@ class BatteryMonitorASCII:
                     )
                     if response.status_code == 200:
                         location = response.json()
+                        lat = location.get('latitude')
+                        if lat is not None and FORCE_SOUTHERN_HEMISPHERE and lat > 0:
+                            lat = -lat
+                            
                         return {
-                            'latitude': location.get('latitude'),
+                            'latitude': lat,
                             'longitude': location.get('longitude'),
                             'speed_kmh': location.get('speed', 0),
                             'course_deg': location.get('course', 0),
