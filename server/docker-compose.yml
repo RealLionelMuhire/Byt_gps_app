@@ -9,8 +9,9 @@ services:
       POSTGRES_USER: gps_user
       POSTGRES_PASSWORD: gps_password
       POSTGRES_DB: gps_tracking
-    ports:
-      - "5432:5432"
+    # Don't expose 5432 externally - only accessible within Docker network
+    # ports:
+    #   - "5432:5432"
     volumes:
       - postgres_data:/var/lib/postgresql/data
       - ./init_db.sql:/docker-entrypoint-initdb.d/init.sql

@@ -190,10 +190,13 @@ class ProtocolParser:
             # Bit 12: GPS positioned (1=valid, 0=invalid)
             # Bit 13-15: Reserved
             course_status = struct.unpack('>H', packet[idx:idx+2])[0]
-            course = (course_status >> 6) & 0x03FF  # Bits 6-15 for course
-            lon_hemisphere = (course_status >> 5) & 0x01  # Bit 5: 0=E, 1=W
-            lat_hemisphere = (course_status >> 4) & 0x01  # Bit 4: 0=N, 1=S
-            gps_real = (course_status >> 3) & 0x01  # Bit 3: GPS positioned
+            
+            # Correct bit extraction based on standard GT06 protocol and comments above
+            course = course_status & 0x03FF             # Bits 0-9 for course
+            lon_hemisphere = (course_status >> 10) & 0x01  # Bit 10: 0=E, 1=W
+            lat_hemisphere = (course_status >> 11) & 0x01  # Bit 11: 0=N, 1=S
+            gps_real = (course_status >> 12) & 0x01      # Bit 12: GPS positioned
+            
             idx += 2
             
             # Apply hemisphere corrections
