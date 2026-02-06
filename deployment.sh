@@ -2,8 +2,16 @@
 
 # GPS Tracking Server - Zero-Downtime Deployment Script
 # This script pulls latest code, builds new images, and deploys with minimal downtime
+# Usage: ./deployment.sh [--no-cache]
 
 set -e  # Exit on any error
+
+# Check for --no-cache flag
+NO_CACHE=""
+if [[ "$1" == "--no-cache" ]]; then
+    NO_CACHE="--no-cache"
+    echo "Running with --no-cache (clean build)"
+fi
 
 # Colors for output
 RED='\033[0;31m'
@@ -60,8 +68,8 @@ echo ""
 echo -e "${YELLOW}[3/6]${NC} Building new Docker images..."
 cd "$SERVER_DIR"
 
-# Build images without stopping old containers
-$DOCKER_COMPOSE build --no-cache
+# Build images without stopping old containers (uses cache for faster builds)
+$DOCKER_COMPOSE build $NO_CACHE
 
 if [ $? -eq 0 ]; then
     echo -e "${GREEN}✓${NC} New images built successfully"
@@ -132,6 +140,9 @@ echo ""
 echo -e "To view logs:    ${BLUE}$DOCKER_COMPOSE logs -f${NC}"
 echo -e "To check status: ${BLUE}$DOCKER_COMPOSE ps${NC}"
 echo -e "To restart:      ${BLUE}$DOCKER_COMPOSE restart${NC}"
+echo ""
+echo -e "For clean rebuild: ${BLUE}./deployment.sh --no-cache${NC}"
+echo ""
 echo ""
 echo -e "API Docs:        ${BLUE}http://localhost:8000/docs${NC}"
 echo -e "Dashboard:       ${BLUE}http://localhost:8000/dashboard${NC}"
