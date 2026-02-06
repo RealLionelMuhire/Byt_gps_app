@@ -63,7 +63,8 @@ app = FastAPI(
     title=settings.APP_NAME,
     version=settings.APP_VERSION,
     description="GPS Tracking Server for managing GPS tracker devices",
-    lifespan=lifespan
+    lifespan=lifespan,
+    redirect_slashes=False  # Disable automatic trailing slash redirects for mobile compatibility
 )
 
 # Add CORS middleware

@@ -107,12 +107,15 @@ docker-compose down && docker-compose up -d
 
 **Base URL:** `http://164.92.212.186:8000`
 
-**Auth:** Not implemented yet (add JWT later)
+**Auth:** Clerk authentication with `X-Clerk-User-Id` header
 
 **Key Endpoints:**
-- `/api/devices/` - Device list
-- `/api/locations/{id}/latest` - Current location
-- `/api/locations/{id}/history` - Historical data
+- `POST /api/auth/sync` - Sync Clerk user
+- `GET /api/devices` - Device list (filtered by user)
+- `GET /api/locations/{id}/latest` - Current location
+- `GET /api/locations/{id}/history` - Historical data
+
+**⚠️ Important for Mobile:** All endpoints work **with or without** trailing slashes (e.g., both `/api/devices` and `/api/devices/` work). FastAPI's automatic redirect is disabled for mobile compatibility.
 
 **Full Docs:** http://164.92.212.186:8000/docs
 
