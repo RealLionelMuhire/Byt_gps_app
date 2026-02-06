@@ -19,6 +19,17 @@ SERVER_DIR="$PROJECT_DIR/server"
 GIT_REMOTE="origin"
 GIT_BRANCH="main"
 
+# Detect Docker Compose command (v2 uses 'docker compose', v1 uses 'docker-compose')
+if docker compose version &>/dev/null; then
+    DOCKER_COMPOSE="docker compose"
+elif docker-compose version &>/dev/null; then
+    DOCKER_COMPOSE="docker-compose"
+else
+    echo -e "${RED}✗${NC} Docker Compose not found!"
+    echo -e "${YELLOW}→${NC} Please install Docker Compose: https://docs.docker.com/compose/install/"
+    exit 1
+fi
+
 echo -e "${BLUE}========================================${NC}"
 echo -e "${BLUE}GPS Tracking Server Deployment${NC}"
 echo -e "${BLUE}========================================${NC}"
@@ -50,7 +61,7 @@ echo -e "${YELLOW}[3/6]${NC} Building new Docker images..."
 cd "$SERVER_DIR"
 
 # Build images without stopping old containers
-docker-compose build --no-cache
+$DOCKER_COMPOSE build --no-cache
 
 if [ $? -eq 0 ]; then
     echo -e "${GREEN}✓${NC} New images built successfully"
@@ -63,7 +74,7 @@ echo ""
 
 # Step 4: Check current container status
 echo -e "${YELLOW}[4/6]${NC} Checking current container status..."
-docker-compose ps
+$DOCKER_COMPOSE ps
 echo ""
 
 # Step 5: Deploy new containers (this will gracefully replace old ones)
@@ -78,13 +89,13 @@ echo ""
 # Use --no-deps to avoid recreating postgres if only app changed
 # Use --force-recreate to ensure new images are used
 # Use --remove-orphans to clean up old containers
-docker-compose up -d --force-recreate --remove-orphans
+$DOCKER_COMPOSE up -d --force-recreate --remove-orphans
 
 if [ $? -eq 0 ]; then
     echo -e "${GREEN}✓${NC} New containers deployed successfully"
 else
     echo -e "${RED}✗${NC} Deployment failed!"
-    echo -e "${YELLOW}→${NC} Check logs: docker-compose logs"
+    echo -e "${YELLOW}→${NC} Check logs: $DOCKER_COMPOSE logs"
     exit 1
 fi
 echo ""
@@ -94,7 +105,7 @@ echo -e "${YELLOW}[6/6]${NC} Verifying deployment..."
 sleep 3  # Wait for containers to fully start
 
 echo -e "${BLUE}→${NC} Container status:"
-docker-compose ps
+$DOCKER_COMPOSE ps
 echo ""
 
 echo -e "${BLUE}→${NC} Health check:"
@@ -118,9 +129,9 @@ echo -e "${GREEN}========================================${NC}"
 echo -e "${GREEN}Deployment Complete!${NC}"
 echo -e "${GREEN}========================================${NC}"
 echo ""
-echo -e "To view logs:    ${BLUE}docker-compose logs -f${NC}"
-echo -e "To check status: ${BLUE}docker-compose ps${NC}"
-echo -e "To restart:      ${BLUE}docker-compose restart${NC}"
+echo -e "To view logs:    ${BLUE}$DOCKER_COMPOSE logs -f${NC}"
+echo -e "To check status: ${BLUE}$DOCKER_COMPOSE ps${NC}"
+echo -e "To restart:      ${BLUE}$DOCKER_COMPOSE restart${NC}"
 echo ""
 echo -e "API Docs:        ${BLUE}http://localhost:8000/docs${NC}"
 echo -e "Dashboard:       ${BLUE}http://localhost:8000/dashboard${NC}"
