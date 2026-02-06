@@ -1,7 +1,7 @@
 """Location API endpoints"""
 
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Header
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 from pydantic import BaseModel
@@ -9,8 +9,33 @@ from pydantic import BaseModel
 from app.core.database import get_db
 from app.models.location import Location
 from app.models.device import Device
+from app.models.user import User
 
 router = APIRouter()
+
+
+def get_user_from_clerk_id(clerk_user_id: Optional[str], db: Session) -> Optional[User]:
+    """Helper function to get user by Clerk ID"""
+    if not clerk_user_id:
+        return None
+    user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
+    return user
+
+
+def verify_device_access(device_id: int, clerk_user_id: Optional[str], db: Session) -> Device:
+    """Verify user has access to the device"""
+    device = db.query(Device).filter(Device.id == device_id).first()
+    
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    
+    # If clerk_user_id provided, verify ownership
+    if clerk_user_id:
+        user = get_user_from_clerk_id(clerk_user_id, db)
+        if user and device.user_id != user.id:
+            raise HTTPException(status_code=403, detail="Access denied to this device")
+    
+    return device
 
 
 # Pydantic schemas
@@ -41,8 +66,19 @@ class LocationHistoryResponse(BaseModel):
 
 
 @router.get("/{device_id}/latest", response_model=LocationResponse)
-async def get_latest_location(device_id: int, db: Session = Depends(get_db)):
-    """Get latest location for a device"""
+async def get_latest_location(
+    device_id: int,
+    x_clerk_user_id: Optional[str] = Header(None, alias="X-Clerk-User-Id"),
+    db: Session = Depends(get_db)
+):
+    """
+    Get latest location for a device
+    
+    If X-Clerk-User-Id header is provided, verifies user has access to the device.
+    """
+    # Verify device access
+    verify_device_access(device_id, x_clerk_user_id, db)
+    
     location = db.query(Location).filter(
         Location.device_id == device_id
     ).order_by(Location.timestamp.desc()).first()
@@ -59,13 +95,16 @@ async def get_location_history(
     start_time: Optional[datetime] = Query(None, description="Start time (UTC)"),
     end_time: Optional[datetime] = Query(None, description="End time (UTC)"),
     limit: int = Query(1000, ge=1, le=10000, description="Maximum number of points"),
+    x_clerk_user_id: Optional[str] = Header(None, alias="X-Clerk-User-Id"),
     db: Session = Depends(get_db)
 ):
-    """Get location history for a device"""
-    # Get device
-    device = db.query(Device).filter(Device.id == device_id).first()
-    if not device:
-        raise HTTPException(status_code=404, detail="Device not found")
+    """
+    Get location history for a device
+    
+    If X-Clerk-User-Id header is provided, verifies user has access to the device.
+    """
+    # Verify device access
+    device = verify_device_access(device_id, x_clerk_user_id, db)
     
     # Build query
     query = db.query(Location).filter(Location.device_id == device_id)
@@ -102,12 +141,16 @@ async def get_device_route(
     start_time: Optional[datetime] = Query(None),
     end_time: Optional[datetime] = Query(None),
     simplify: bool = Query(False, description="Simplify route to reduce points"),
+    x_clerk_user_id: Optional[str] = Header(None, alias="X-Clerk-User-Id"),
     db: Session = Depends(get_db)
 ):
-    """Get device route (optimized for map display)"""
-    device = db.query(Device).filter(Device.id == device_id).first()
-    if not device:
-        raise HTTPException(status_code=404, detail="Device not found")
+    """
+    Get device route (optimized for map display)
+    
+    If X-Clerk-User-Id header is provided, verifies user has access to the device.
+    """
+    # Verify device access
+    device = verify_device_access(device_id, x_clerk_user_id, db)
     
     query = db.query(Location).filter(
         Location.device_id == device_id,

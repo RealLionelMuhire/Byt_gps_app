@@ -12,6 +12,54 @@ A complete GPS tracking solution for TK903ELE GPS trackers with real-time monito
 - **Location History** - Store and query historical GPS data
 - **Docker Deployment** - One-command setup with Docker Compose
 - **USB Configuration** - Configure devices via USB connection
+- **🆕 Clerk Authentication** - Multi-user support with Clerk authentication integration
+
+## 🔐 NEW: Clerk Authentication Integration
+
+**Status:** ✅ **COMPLETE AND READY FOR DEPLOYMENT**
+
+The backend now supports **Clerk authentication** for mobile apps with complete user management and access control.
+
+### Key Features
+- ✅ User sync endpoint for Clerk authentication
+- ✅ Device ownership and filtering by user
+- ✅ Access control on location data
+- ✅ Header-based authentication (`X-Clerk-User-Id`)
+- ✅ Backward compatible with existing system
+
+### Quick Links
+- **[Implementation Summary](CLERK_IMPLEMENTATION_SUMMARY.md)** - Overview and mobile integration
+- **[Complete Documentation](server/CLERK_AUTH_IMPLEMENTATION.md)** - Full API specification
+- **[Quick Setup Guide](server/QUICK_SETUP.md)** - Deployment instructions
+- **[Deployment Checklist](DEPLOYMENT_CHECKLIST.md)** - Step-by-step deployment
+- **[Architecture Diagrams](server/ARCHITECTURE_DIAGRAM.md)** - Visual flow diagrams
+- **[Test Suite](server/test_clerk_auth.py)** - Automated tests
+
+### New API Endpoints
+```
+POST /api/auth/sync              - Sync Clerk user to database
+GET  /api/auth/user/{clerk_id}   - Get user by Clerk ID
+POST /api/devices/{id}/assign    - Assign device to user
+```
+
+### Mobile App Integration
+```javascript
+// Sync user after Clerk sign-in
+await fetch('http://164.92.212.186:8000/api/auth/sync', {
+  method: 'POST',
+  headers: { 'Content-Type': 'application/json' },
+  body: JSON.stringify({
+    clerk_user_id: user.id,
+    email: user.emailAddresses[0].emailAddress,
+    name: user.fullName,
+  }),
+});
+
+// Add header to all API requests
+await fetch('http://164.92.212.186:8000/api/devices', {
+  headers: { 'X-Clerk-User-Id': clerkUserId },
+});
+```
 
 ## 📁 Project Structure
 

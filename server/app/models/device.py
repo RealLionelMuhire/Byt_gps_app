@@ -1,6 +1,6 @@
 """Device model"""
 
-from sqlalchemy import Column, Integer, String, DateTime, Float, Boolean
+from sqlalchemy import Column, Integer, String, DateTime, Float, Boolean, ForeignKey
 from sqlalchemy.orm import relationship
 from datetime import datetime
 
@@ -15,6 +15,9 @@ class Device(Base):
     imei = Column(String(20), unique=True, index=True, nullable=False)
     name = Column(String(100), nullable=False)
     description = Column(String(500), nullable=True)
+    
+    # User ownership
+    user_id = Column(Integer, ForeignKey('users.id'), nullable=True, index=True)
     
     # Status
     status = Column(String(20), default='offline')  # online, offline, inactive
@@ -34,6 +37,7 @@ class Device(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
     # Relationships
+    user = relationship("User", backref="devices")
     locations = relationship("Location", back_populates="device", cascade="all, delete-orphan")
     
     def __repr__(self):
