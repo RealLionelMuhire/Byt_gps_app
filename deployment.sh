@@ -12,8 +12,9 @@ YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
 NC='\033[0m' # No Color
 
-# Configuration
-PROJECT_DIR="/home/leo/BYThron/Byt_gps_app"
+# Configuration - Auto-detect project directory
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PROJECT_DIR="$SCRIPT_DIR"
 SERVER_DIR="$PROJECT_DIR/server"
 GIT_REMOTE="origin"
 GIT_BRANCH="main"
