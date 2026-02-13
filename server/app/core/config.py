@@ -36,6 +36,10 @@ class Settings(BaseSettings):
 
     # Hemisphere Correction
     FORCE_SOUTHERN_HEMISPHERE: bool = True  # Set to True for Rwanda/Southern Africa if device reports North
+
+    # Device data freshness
+    DEVICE_SENDING_STALE_SECONDS: int = 120  # Consider "stale" if no packet within this window
+    DEVICE_OFFLINE_TIMEOUT_SECONDS: int = 300  # Consider "offline" if no packet within this window
     
     class Config:
         env_file = ".env"

@@ -326,6 +326,20 @@
                         </div>
                     </div>
 
+                    <!-- Sending Status -->
+                    <div class="info-row">
+                        <div class="info-icon">📡</div>
+                        <div class="info-content">
+                            <div class="info-label">Sending Status</div>
+                            <div class="info-value">{{ device.sending_status }}</div>
+                            {% if device.last_seen %}
+                            <div style="font-size: 13px; color: #666; margin-top: 4px;">
+                                Last packet: {{ device.last_seen_duration }}
+                            </div>
+                            {% endif %}
+                        </div>
+                    </div>
+
                     <!-- GPS -->
                     <div class="info-row">
                         <div class="info-icon">🛰️</div>
@@ -377,9 +391,9 @@
                     </div>
                 </div>
 
-                {% if device.last_update %}
+                {% if device.last_seen %}
                 <div class="last-update">
-                    Last update: <span id="update-{{ device.id }}">{{ device.last_update.strftime('%Y-%m-%d %H:%M:%S') }} UTC</span>
+                    Last update: <span id="update-{{ device.id }}">{{ device.last_seen.strftime('%Y-%m-%d %H:%M:%S') }} UTC</span>
                 </div>
                 {% endif %}
             </div>

@@ -7,6 +7,8 @@ from datetime import datetime
 
 from app.core.database import get_db
 from app.models.device import Device
+from app.models.location import Location
+from app.core.config import settings
 from app.models.user import User
 from pydantic import BaseModel
 
@@ -42,6 +44,26 @@ class DeviceResponse(DeviceBase):
     
     class Config:
         from_attributes = True
+
+
+class LocationIntervalStats(BaseModel):
+    samples: int
+    avg_seconds: Optional[float]
+    min_seconds: Optional[float]
+    max_seconds: Optional[float]
+    last_interval_seconds: Optional[float]
+
+
+class DeviceDiagnosticsResponse(BaseModel):
+    device_id: int
+    imei: str
+    status: str
+    last_connect: Optional[datetime]
+    last_update: Optional[datetime]
+    last_location_timestamp: Optional[datetime]
+    seconds_since_last_update: Optional[int]
+    sending_status: str
+    location_intervals: LocationIntervalStats
 
 
 def get_user_from_clerk_id(clerk_user_id: Optional[str], db: Session) -> Optional[User]:
@@ -238,3 +260,73 @@ async def get_device_status(device_id: int, db: Session = Depends(get_db)):
             "longitude": device.last_longitude
         } if device.last_latitude and device.last_longitude else None
     }
+
+
+@router.get("/{device_id}/diagnostics", response_model=DeviceDiagnosticsResponse)
+async def get_device_diagnostics(
+    device_id: int,
+    samples: int = Query(20, ge=2, le=200, description="Number of recent location points to analyze"),
+    db: Session = Depends(get_db)
+):
+    """
+    Diagnostics for a device, including recent location packet intervals.
+
+    Note: interval stats are based on location packets only (heartbeats are not persisted).
+    """
+    device = db.query(Device).filter(Device.id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    # Determine last seen and sending status
+    last_seen = device.last_update or device.last_connect
+    if last_seen:
+        seconds_since_last_update = int((datetime.utcnow() - last_seen).total_seconds())
+    else:
+        seconds_since_last_update = None
+
+    if seconds_since_last_update is None:
+        sending_status = "No data"
+    elif seconds_since_last_update <= settings.DEVICE_SENDING_STALE_SECONDS:
+        sending_status = "Sending"
+    elif seconds_since_last_update <= settings.DEVICE_OFFLINE_TIMEOUT_SECONDS:
+        sending_status = "Stale"
+    else:
+        sending_status = "Offline (timed out)"
+
+    # Fetch recent locations for interval analysis
+    locations = db.query(Location).filter(
+        Location.device_id == device_id
+    ).order_by(Location.timestamp.desc()).limit(samples).all()
+
+    last_location_timestamp = locations[0].timestamp if locations else None
+
+    intervals = []
+    for i in range(len(locations) - 1):
+        dt = locations[i].timestamp - locations[i + 1].timestamp
+        intervals.append(abs(dt.total_seconds()))
+
+    if intervals:
+        avg_seconds = sum(intervals) / len(intervals)
+        min_seconds = min(intervals)
+        max_seconds = max(intervals)
+        last_interval_seconds = intervals[0]
+    else:
+        avg_seconds = min_seconds = max_seconds = last_interval_seconds = None
+
+    return DeviceDiagnosticsResponse(
+        device_id=device.id,
+        imei=device.imei,
+        status=device.status,
+        last_connect=device.last_connect,
+        last_update=device.last_update,
+        last_location_timestamp=last_location_timestamp,
+        seconds_since_last_update=seconds_since_last_update,
+        sending_status=sending_status,
+        location_intervals=LocationIntervalStats(
+            samples=len(intervals),
+            avg_seconds=avg_seconds,
+            min_seconds=min_seconds,
+            max_seconds=max_seconds,
+            last_interval_seconds=last_interval_seconds
+        )
+    )
