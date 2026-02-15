@@ -90,6 +90,8 @@ class RouteLineStringResponse(BaseModel):
     type: str
     coordinates: List[List[float]]
     timestamps: List[str]
+    speeds: List[float]
+    courses: List[int]
     properties: dict
 
 
@@ -312,14 +314,20 @@ async def get_device_route_line(
 
     coordinates = []
     timestamps = []
+    speeds = []
+    courses = []
     for loc in locations:
         coordinates.append([loc.longitude, loc.latitude])
         timestamps.append(loc.timestamp.isoformat())
+        speeds.append(loc.speed)
+        courses.append(loc.course)
 
     return {
         "type": "LineString",
         "coordinates": coordinates,
         "timestamps": timestamps,
+        "speeds": speeds,
+        "courses": courses,
         "properties": {
             "device_id": device.id,
             "device_name": device.name,
