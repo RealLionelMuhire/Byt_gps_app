@@ -86,6 +86,13 @@ class DistanceResponse(BaseModel):
     total_distance_km: float
 
 
+class RouteLineStringResponse(BaseModel):
+    type: str
+    coordinates: List[List[float]]
+    timestamps: List[str]
+    properties: dict
+
+
 @router.get("/{device_id}/latest", response_model=LocationResponse)
 async def get_latest_location(
     device_id: int,
@@ -268,6 +275,60 @@ async def get_device_distance(
         point_count=len(locations),
         total_distance_km=round(total_distance, 3)
     )
+
+
+@router.get("/{device_id}/route-line", response_model=RouteLineStringResponse)
+async def get_device_route_line(
+    device_id: int,
+    start_time: Optional[datetime] = Query(None, description="Start time (UTC)"),
+    end_time: Optional[datetime] = Query(None, description="End time (UTC)"),
+    x_clerk_user_id: Optional[str] = Header(None, alias="X-Clerk-User-Id"),
+    db: Session = Depends(get_db)
+):
+    """
+    Get device route as a LineString with timestamps aligned to coordinates.
+
+    Returns GeoJSON-like structure with coordinates and timestamps arrays.
+    """
+    device = verify_device_access(device_id, x_clerk_user_id, db)
+
+    query = db.query(Location).filter(
+        Location.device_id == device_id,
+        Location.gps_valid == True
+    )
+
+    if start_time:
+        query = query.filter(Location.timestamp >= start_time)
+    else:
+        start_time = datetime.utcnow() - timedelta(hours=24)
+        query = query.filter(Location.timestamp >= start_time)
+
+    if end_time:
+        query = query.filter(Location.timestamp <= end_time)
+    else:
+        end_time = datetime.utcnow()
+
+    locations = query.order_by(Location.timestamp.asc()).all()
+
+    coordinates = []
+    timestamps = []
+    for loc in locations:
+        coordinates.append([loc.longitude, loc.latitude])
+        timestamps.append(loc.timestamp.isoformat())
+
+    return {
+        "type": "LineString",
+        "coordinates": coordinates,
+        "timestamps": timestamps,
+        "properties": {
+            "device_id": device.id,
+            "device_name": device.name,
+            "device_imei": device.imei,
+            "start_time": start_time.isoformat(),
+            "end_time": end_time.isoformat(),
+            "point_count": len(coordinates)
+        }
+    }
 
 
 @router.get("/{device_id}/alarms", response_model=List[LocationResponse])
