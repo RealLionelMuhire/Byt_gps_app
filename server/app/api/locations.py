@@ -5,6 +5,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Header
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 from pydantic import BaseModel
+from math import radians, cos, sin, asin, sqrt
 
 from app.core.database import get_db
 from app.models.location import Location
@@ -20,6 +21,16 @@ def get_user_from_clerk_id(clerk_user_id: Optional[str], db: Session) -> Optiona
         return None
     user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
     return user
+
+
+def haversine_km(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
+    """Calculate great-circle distance between two points in kilometers"""
+    lon1, lat1, lon2, lat2 = map(radians, [lon1, lat1, lon2, lat2])
+    dlon = lon2 - lon1
+    dlat = lat2 - lat1
+    a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
+    c = 2 * asin(sqrt(a))
+    return 6371 * c
 
 
 def verify_device_access(device_id: int, clerk_user_id: Optional[str], db: Session) -> Device:
@@ -63,6 +74,16 @@ class LocationHistoryResponse(BaseModel):
     device_imei: str
     total_points: int
     locations: List[LocationResponse]
+
+
+class DistanceResponse(BaseModel):
+    device_id: int
+    device_name: str
+    device_imei: str
+    start_time: datetime
+    end_time: datetime
+    point_count: int
+    total_distance_km: float
 
 
 @router.get("/{device_id}/latest", response_model=LocationResponse)
@@ -196,6 +217,57 @@ async def get_device_route(
             "point_count": len(features)
         }
     }
+
+
+@router.get("/{device_id}/distance", response_model=DistanceResponse)
+async def get_device_distance(
+    device_id: int,
+    start_time: Optional[datetime] = Query(None, description="Start time (UTC)"),
+    end_time: Optional[datetime] = Query(None, description="End time (UTC)"),
+    x_clerk_user_id: Optional[str] = Header(None, alias="X-Clerk-User-Id"),
+    db: Session = Depends(get_db)
+):
+    """
+    Get total distance covered by a device within a time range.
+
+    Distance is calculated using the Haversine formula across consecutive GPS points.
+    Only GPS-valid points are used.
+    """
+    device = verify_device_access(device_id, x_clerk_user_id, db)
+
+    query = db.query(Location).filter(
+        Location.device_id == device_id,
+        Location.gps_valid == True
+    )
+
+    if start_time:
+        query = query.filter(Location.timestamp >= start_time)
+    else:
+        start_time = datetime.utcnow() - timedelta(hours=24)
+        query = query.filter(Location.timestamp >= start_time)
+
+    if end_time:
+        query = query.filter(Location.timestamp <= end_time)
+    else:
+        end_time = datetime.utcnow()
+
+    locations = query.order_by(Location.timestamp.asc()).all()
+
+    total_distance = 0.0
+    for i in range(1, len(locations)):
+        prev = locations[i - 1]
+        curr = locations[i]
+        total_distance += haversine_km(prev.longitude, prev.latitude, curr.longitude, curr.latitude)
+
+    return DistanceResponse(
+        device_id=device.id,
+        device_name=device.name,
+        device_imei=device.imei,
+        start_time=start_time,
+        end_time=end_time,
+        point_count=len(locations),
+        total_distance_km=round(total_distance, 3)
+    )
 
 
 @router.get("/{device_id}/alarms", response_model=List[LocationResponse])
