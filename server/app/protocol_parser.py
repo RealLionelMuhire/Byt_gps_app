@@ -1,6 +1,11 @@
 """
 GPS Tracker Binary Protocol Parser
-Parses binary packets from GPS trackers (0x7878...0x0D0A format)
+
+Parses binary packets from GPS trackers per the official protocol:
+- Start 0x78 0x78, Stop 0x0D 0x0A
+- Packet length = Protocol + Information Content + Serial Number + Error Check (5+N bytes)
+- CRC-ITU from Packet Length through Information Serial Number (doc §4.6, Appendix A)
+- Protocol numbers: 0x01 Login, 0x12 Location, 0x13 Heartbeat (status), 0x16 Alarm, 0x80 Command response
 """
 
 import struct
@@ -19,6 +24,7 @@ class ProtocolParser:
     PACKET_LOGIN = 0x01
     PACKET_LOCATION = 0x12
     PACKET_HEARTBEAT = 0x13
+    PACKET_STRING_INFO = 0x15
     PACKET_ALARM = 0x16
     PACKET_COMMAND = 0x80
     
@@ -101,6 +107,8 @@ class ProtocolParser:
                 return self.parse_location(packet)
             elif protocol_number == self.PACKET_HEARTBEAT:
                 return self.parse_heartbeat(packet)
+            elif protocol_number == self.PACKET_STRING_INFO:
+                return self.parse_command_response(packet)
             elif protocol_number == self.PACKET_ALARM:
                 return self.parse_alarm(packet)
             else:
@@ -164,10 +172,10 @@ class ProtocolParser:
             except ValueError:
                 dt = datetime.utcnow()
             
-            # GPS info (1 byte: satellite count)
+            # GPS info (Protocol doc 5.2.1.5: high nibble = length of GPS info, low nibble = satellite count; e.g. 0xCB = length 12, 11 satellites)
             gps_info = packet[idx]
-            gps_length = gps_info & 0x0F
-            satellite_count = (gps_info >> 4) & 0x0F
+            gps_length = (gps_info >> 4) & 0x0F
+            satellite_count = gps_info & 0x0F
             idx += 1
             
             # Latitude (4 bytes)
@@ -239,32 +247,48 @@ class ProtocolParser:
             return None
     
     def parse_heartbeat(self, packet: bytes) -> Dict[str, Any]:
-        """Parse heartbeat packet (0x13)"""
+        """Parse heartbeat packet (0x13, Protocol doc §5.4)"""
         try:
-            # Heartbeat structure: 78 78 [length] 13 [terminal info 1 byte] [voltage 2 bytes] 
-            # [GSM signal 1 byte] [alarm 1 byte] [language 1 byte] [serial 2 bytes] [CRC] 0D 0A
+            # Heartbeat layout (doc §5.4.1):
+            # [0-1] Start 0x7878
+            # [2]   Packet Length
+            # [3]   Protocol 0x13
+            # [4]   Terminal Information  (1 byte)
+            # [5]   Voltage Level         (1 byte, 0-6)
+            # [6]   GSM Signal Strength   (1 byte, 0-4)
+            # [7-8] Alarm/Language        (2 bytes: alarm, language)
+            # [9-10] Serial Number        (2 bytes)
+            # [11-12] CRC                 (2 bytes)
+            # [13-14] Stop 0x0D0A
+            # Total: 15 bytes
             
-            if len(packet) < 14:
+            if len(packet) < 15:
                 return None
             
             terminal_info = packet[4]
-            voltage = struct.unpack('>H', packet[5:7])[0]
-            gsm_signal = packet[7]
-            alarm_info = packet[8]
+            voltage_level = packet[5]
+            gsm_signal = packet[6]
+            alarm_info = packet[7]
+            language = packet[8]
             
-            # Decode terminal info
-            oil_electric_connected = bool(terminal_info & 0x01)
-            gps_tracking = bool(terminal_info & 0x02)
-            alarm_status = (terminal_info >> 2) & 0x03
-            charging_status = (terminal_info >> 4) & 0x03
-            acc_status = bool(terminal_info & 0x40)
-            defense_activated = bool(terminal_info & 0x80)
+            # Decode terminal info (doc §5.4.1.4)
+            # Bit 0: 1=Activated, 0=Deactivated
+            # Bit 1: 1=ACC high, 0=ACC low
+            # Bit 2: 1=Charge on, 0=Charge off
+            # Bit 3-5: Alarm (000 Normal, 001 Shock, 010 Power cut, 011 Low battery, 100 SOS)
+            # Bit 6: 1=GPS tracking on, 0=off
+            # Bit 7: 1=Oil/electricity disconnected, 0=connected
+            activated = bool(terminal_info & 0x01)
+            acc_status = bool(terminal_info & 0x02)
+            charging_status = bool(terminal_info & 0x04)
+            alarm_status = (terminal_info >> 3) & 0x07
+            gps_tracking = bool(terminal_info & 0x40)
+            oil_elec_disconnected = bool(terminal_info & 0x80)
             
-            # Voltage level (0x00 - 0x06)
-            voltage_level = (voltage >> 8) & 0xFF
+            # Voltage level (doc §5.4.1.5): 0-6
             battery_info = self.BATTERY_LEVELS.get(voltage_level, {"level": "Unknown", "percent": 50})
             
-            # GSM signal strength
+            # GSM signal (doc §5.4.1.6): 0x00-0x04
             gsm_level = min(gsm_signal, 4)
             signal_info = self.GSM_SIGNAL_LEVELS.get(gsm_level, {"level": "Unknown", "bars": 0})
             
@@ -282,7 +306,7 @@ class ProtocolParser:
                 'signal_bars': signal_info['bars'],
                 'gps_tracking': gps_tracking,
                 'acc_status': acc_status,
-                'charging': charging_status > 0,
+                'charging': charging_status,
                 'alarm_status': alarm_status,
                 'serial_number': serial_number
             }
@@ -292,29 +316,62 @@ class ProtocolParser:
             return None
     
     def parse_alarm(self, packet: bytes) -> Dict[str, Any]:
-        """Parse alarm packet (0x16)"""
+        """Parse alarm packet (0x16, Protocol doc §5.3).
+        
+        Layout after protocol byte:
+          Date(6) + GPS_info(1) + Lat(4) + Lon(4) + Speed(1) + Course(2) = 18 bytes of GPS (same as location)
+          LBS_Length(1) + MCC(2) + MNC(1) + LAC(2) + Cell_ID(3)         = 9 bytes of LBS
+          Terminal_Info(1) + Voltage(1) + GSM(1) + Alarm(1) + Language(1) = 5 bytes of status
+          Serial(2) + CRC(2)                                             = 4 bytes
+        Alarm byte is at offset 4 + 18 + 9 + 3 = 34 from packet start (after Terminal, Voltage, GSM).
+        But LBS_Length can vary; use it to compute offset dynamically.
+        """
         try:
-            # Alarm packet is similar to location packet but with alarm flags
             location_data = self.parse_location(packet)
             
             if location_data:
                 location_data['type'] = 'alarm'
                 location_data['protocol'] = self.PACKET_ALARM
                 
-                # Parse alarm type if available
-                if len(packet) > 20:
-                    alarm_type = packet[20]
-                    alarm_names = {
-                        0x00: "Normal",
-                        0x01: "SOS",
-                        0x02: "Power cut",
-                        0x03: "Vibration",
-                        0x04: "Enter fence",
-                        0x05: "Exit fence",
-                        0x06: "Over speed",
-                        0x07: "Displacement"
-                    }
-                    location_data['alarm_type'] = alarm_names.get(alarm_type, f"Unknown (0x{alarm_type:02X})")
+                # After GPS fields (18 bytes from offset 4), there's the LBS block.
+                # LBS Length byte is at offset 22 (= 4 + 18); its value includes itself
+                # (e.g. 0x09 = 1 byte length + 8 bytes MCC/MNC/LAC/Cell).
+                # Status fields start at: 22 + lbs_length
+                if len(packet) > 23:
+                    lbs_length = packet[22]
+                    status_offset = 22 + lbs_length
+                    # Status: Terminal_Info(1), Voltage(1), GSM(1), then Alarm/Language(2)
+                    alarm_offset = status_offset + 3  # skip Terminal_Info, Voltage, GSM
+                    
+                    if len(packet) > alarm_offset:
+                        alarm_byte = packet[alarm_offset]
+                        alarm_names = {
+                            0x00: "Normal",
+                            0x01: "SOS",
+                            0x02: "Power cut",
+                            0x03: "Shock",
+                            0x04: "Enter fence",
+                            0x05: "Exit fence",
+                            0x06: "Over speed",
+                            0x07: "Ignition on",
+                            0x08: "Ignition off",
+                            0x09: "AC on",
+                            0x0A: "AC off",
+                        }
+                        location_data['alarm_type'] = alarm_names.get(alarm_byte, f"Unknown (0x{alarm_byte:02X})")
+                    
+                        # Also extract terminal info for ACC, battery, etc.
+                        terminal_info = packet[status_offset]
+                        location_data['acc_status'] = bool(terminal_info & 0x02)
+                        location_data['gps_tracking'] = bool(terminal_info & 0x40)
+                        
+                        voltage_level = packet[status_offset + 1]
+                        battery_info = self.BATTERY_LEVELS.get(voltage_level, {"level": "Unknown", "percent": 50})
+                        location_data['battery_percent'] = battery_info['percent']
+                        
+                        gsm_signal = packet[status_offset + 2]
+                        signal_info = self.GSM_SIGNAL_LEVELS.get(min(gsm_signal, 4), {"level": "Unknown", "bars": 0})
+                        location_data['signal_bars'] = signal_info['bars']
             
             return location_data
         
@@ -336,4 +393,73 @@ class ProtocolParser:
         
         except Exception as e:
             logger.error(f"Error creating response: {e}")
+            return None
+    
+    def create_command_packet(self, command: str, serial_number: int,
+                              server_flag: int = 1) -> bytes:
+        """Build a Protocol 0x80 command packet to send to the terminal (doc §6.1).
+
+        Verified against Appendix B (DYD example). The server→device packet has
+        no Language field (the terminal's 0x15 reply does include one).
+
+        Layout:
+          Start(2) + Length(1) + Protocol 0x80(1) + CmdLength(1) + ServerFlag(4)
+          + CommandContent(M) + Serial(2) + CRC(2) + Stop(2)
+
+        CmdLength = 4 + M  (ServerFlag + Command bytes)
+        PacketLength = 1(protocol) + 1(cmdlen) + 4(flag) + M + 2(serial) + 2(crc) = 10 + M
+        """
+        try:
+            cmd_bytes = command.encode('ascii')
+            cmd_length = 4 + len(cmd_bytes)
+            packet_length = 10 + len(cmd_bytes)
+
+            data = bytearray()
+            data.append(packet_length)                          # Packet Length
+            data.append(self.PACKET_COMMAND)                    # Protocol 0x80
+            data.append(cmd_length)                             # Length of Command
+            data.extend(struct.pack('>I', server_flag))         # Server Flag (4 bytes)
+            data.extend(cmd_bytes)                              # Command Content (ASCII)
+            data.extend(struct.pack('>H', serial_number))       # Serial Number
+
+            crc = self.calculate_crc(bytes(data))
+
+            packet = self.START_BIT + bytes(data) + struct.pack('>H', crc) + self.STOP_BIT
+            return packet
+
+        except Exception as e:
+            logger.error(f"Error creating command packet: {e}")
+            return None
+    
+    def parse_command_response(self, packet: bytes) -> Optional[Dict[str, Any]]:
+        """Parse a 0x15 command response from the terminal (doc §6.2).
+
+        Layout (same as server command but protocol = 0x15):
+          Start(2) + Length(1) + Protocol 0x15(1) + CmdLength(1) + ServerFlag(4)
+          + CommandContent(M) + Language(2) + Serial(2) + CRC(2) + Stop(2)
+        """
+        try:
+            if len(packet) < 17:
+                return None
+
+            cmd_length = packet[4]
+            server_flag = struct.unpack('>I', packet[5:9])[0]
+            content_length = cmd_length - 4
+            if content_length < 0 or len(packet) < 9 + content_length:
+                return None
+
+            command_content = packet[9:9 + content_length].decode('ascii', errors='replace')
+            serial_number = struct.unpack('>H', packet[-6:-4])[0]
+
+            return {
+                'type': 'command_response',
+                'protocol': self.PACKET_STRING_INFO,
+                'server_flag': server_flag,
+                'content': command_content,
+                'serial_number': serial_number,
+                'timestamp': datetime.utcnow()
+            }
+
+        except Exception as e:
+            logger.error(f"Error parsing command response: {e}")
             return None

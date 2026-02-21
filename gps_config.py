@@ -98,7 +98,7 @@ class GPSConfigurator:
         if apn:
             commands.append(f"AT+ZDR=apn{password} {apn} {apn_user} {apn_pass}")
         
-        # Set upload interval (20s moving, 60min stopped)
+        # Set upload interval: 20s when moving, 60 seconds when stopped (060m = 60 sec on this device)
         commands.append(f"AT+ZDR=fix020s060m***n{password}")
         
         # Set admin phone if provided

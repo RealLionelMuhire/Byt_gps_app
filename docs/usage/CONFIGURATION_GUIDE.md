@@ -92,7 +92,7 @@ apn123456 internet.carrier.com username password
 fix020s060m***n123456
 ```
 - Upload every 20 seconds when moving
-- Upload every 60 minutes when stopped
+- Upload every 60 seconds when stopped
 
 #### Set Admin Phone Number
 ```
@@ -298,9 +298,9 @@ resume123456
 
 | Command | Description |
 |---------|-------------|
-| `fix020s060m***n123456` | 20s moving, 60min stopped |
-| `fix010s030m***n123456` | 10s moving, 30min stopped |
-| `fix030s120m***n123456` | 30s moving, 120min stopped |
+| `fix020s060m***n123456` | 20s moving, 60s stopped |
+| `fix010s030m***n123456` | 10s moving, 30s stopped |
+| `fix030s120m***n123456` | 30s moving, 120s stopped |
 
 ### Alarm Commands
 

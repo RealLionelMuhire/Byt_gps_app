@@ -32,6 +32,8 @@ class GPSTrackerConnection:
         self.authenticated = False
         self.buffer = bytearray()
         self.last_activity = datetime.utcnow()
+        self._command_serial = 0xA000
+        self._pending_response: asyncio.Future = None
         
         logger.info(f"New connection from {address}")
     
@@ -119,8 +121,11 @@ class GPSTrackerConnection:
                 await self.handle_heartbeat(parsed)
             elif parsed['type'] == 'alarm':
                 await self.handle_alarm(parsed)
+            elif parsed['type'] == 'command_response':
+                await self.handle_command_response(parsed)
+                return
             
-            # Send response
+            # Send response (not for command_response — terminal doesn't expect one)
             response = self.parser.create_response(parsed['protocol'], parsed.get('serial_number', 0))
             if response:
                 await self.send_data(response)
@@ -291,6 +296,39 @@ class GPSTrackerConnection:
         except Exception as e:
             logger.error(f"Error handling alarm: {e}", exc_info=True)
     
+    async def handle_command_response(self, data: Dict):
+        """Handle 0x15 command response from terminal"""
+        content = data.get('content', '')
+        logger.info(f"Command response from {self.device_imei}: {content}")
+        if self._pending_response and not self._pending_response.done():
+            self._pending_response.set_result(data)
+    
+    async def send_command(self, command: str, timeout: float = 10.0) -> Dict:
+        """Send an ASCII command to the device (Protocol 0x80) and wait for the 0x15 response."""
+        self._command_serial = (self._command_serial + 1) & 0xFFFF
+        packet = self.parser.create_command_packet(command, self._command_serial)
+        if not packet:
+            return {"success": False, "error": "Failed to build command packet"}
+
+        loop = asyncio.get_event_loop()
+        self._pending_response = loop.create_future()
+
+        await self.send_data(packet)
+        logger.info(f"Sent command to {self.device_imei}: {command}")
+
+        try:
+            result = await asyncio.wait_for(self._pending_response, timeout=timeout)
+            return {
+                "success": True,
+                "response": result.get('content', ''),
+                "server_flag": result.get('server_flag'),
+            }
+        except asyncio.TimeoutError:
+            logger.warning(f"Command timed out for {self.device_imei}: {command}")
+            return {"success": True, "response": None, "note": "Command sent but device did not reply within timeout. It may still take effect."}
+        finally:
+            self._pending_response = None
+    
     async def send_data(self, data: bytes):
         """Send data to GPS tracker"""
         try:
@@ -381,10 +419,9 @@ class TCPServer:
         # Will be implemented with WebSocket support
         pass
     
-    async def send_command_to_device(self, imei: str, command: bytes) -> bool:
-        """Send command to specific device"""
+    async def send_command_to_device(self, imei: str, command: str, timeout: float = 10.0) -> Dict:
+        """Send an ASCII command to a connected device and return the response."""
         connection = self.device_connections.get(imei)
-        if connection:
-            await connection.send_data(command)
-            return True
-        return False
+        if not connection:
+            return {"success": False, "error": "Device not connected"}
+        return await connection.send_command(command, timeout=timeout)

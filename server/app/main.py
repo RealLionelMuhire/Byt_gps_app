@@ -13,7 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
 from app.core.database import init_db
 from app.tcp_server import TCPServer
-from app.api import devices, locations, auth
+from app.api import devices, locations, auth, commands
 from app import dashboard
 
 # Configure logging
@@ -79,6 +79,7 @@ app.add_middleware(
 # Include routers
 app.include_router(auth.router, prefix="/api/auth", tags=["authentication"])
 app.include_router(devices.router, prefix="/api/devices", tags=["devices"])
+app.include_router(commands.router, prefix="/api/devices", tags=["commands"])
 app.include_router(locations.router, prefix="/api/locations", tags=["locations"])
 app.include_router(dashboard.router, tags=["dashboard"])
 
