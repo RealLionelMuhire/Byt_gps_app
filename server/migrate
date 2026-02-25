@@ -1,0 +1,97 @@
+#!/usr/bin/env python3
+"""
+Run database migrations for BYThron GPS server.
+
+Usage:
+    ./migrate              # Run all migrations
+    ./migrate --dry-run    # Show what would be run without executing
+
+Requires: psql (PostgreSQL client) in PATH, or set DATABASE_URL in .env
+"""
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+# Ensure we can import app config (run from server dir)
+SERVER_DIR = Path(__file__).resolve().parent
+os.chdir(SERVER_DIR)
+sys.path.insert(0, str(SERVER_DIR))
+
+try:
+    from app.core.config import settings
+except ImportError as e:
+    print("Error: Could not load app config. Run from server directory.", file=sys.stderr)
+    print(f"  {e}", file=sys.stderr)
+    sys.exit(1)
+
+MIGRATIONS_DIR = SERVER_DIR / "migrations"
+
+
+def get_migration_files():
+    """Return migration files sorted by name (001, 002, ...)."""
+    if not MIGRATIONS_DIR.exists():
+        return []
+    files = sorted(MIGRATIONS_DIR.glob("*.sql"))
+    return [f for f in files if f.name.endswith(".sql")]
+
+
+def run_migration(db_url: str, migration_file: Path, dry_run: bool) -> bool:
+    """Run a single migration file. Returns True on success."""
+    if dry_run:
+        print(f"  [dry-run] Would run: {migration_file.name}")
+        return True
+
+    try:
+        result = subprocess.run(
+            ["psql", db_url, "-v", "ON_ERROR_STOP=1", "-f", str(migration_file)],
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+        if result.returncode != 0:
+            print(f"  FAILED: {migration_file.name}", file=sys.stderr)
+            if result.stderr:
+                print(result.stderr, file=sys.stderr)
+            return False
+        print(f"  OK: {migration_file.name}")
+        return True
+    except FileNotFoundError:
+        print("  Error: psql not found. Install PostgreSQL client (e.g. postgresql-client).", file=sys.stderr)
+        return False
+    except subprocess.TimeoutExpired:
+        print(f"  FAILED: {migration_file.name} (timeout)", file=sys.stderr)
+        return False
+
+
+def main():
+    dry_run = "--dry-run" in sys.argv or "-n" in sys.argv
+
+    db_url = settings.DATABASE_URL
+    if not db_url:
+        print("Error: DATABASE_URL not set.", file=sys.stderr)
+        sys.exit(1)
+
+    migrations = get_migration_files()
+    if not migrations:
+        print("No migration files found in migrations/")
+        sys.exit(0)
+
+    print(f"Running migrations from {MIGRATIONS_DIR}")
+    if dry_run:
+        print("(dry-run mode - no changes will be made)")
+
+    failed = False
+    for m in migrations:
+        if not run_migration(db_url, m, dry_run):
+            failed = True
+            break
+
+    if failed:
+        sys.exit(1)
+    print("Done.")
+
+
+if __name__ == "__main__":
+    main()

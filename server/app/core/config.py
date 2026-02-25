@@ -40,7 +40,12 @@ class Settings(BaseSettings):
     # Device data freshness
     DEVICE_SENDING_STALE_SECONDS: int = 120  # Consider "stale" if no packet within this window
     DEVICE_OFFLINE_TIMEOUT_SECONDS: int = 300  # Consider "offline" if no packet within this window
-    
+
+    # Nominatim (OpenStreetMap) reverse geocoding
+    NOMINATIM_USER_AGENT: str = "BYThron-GPS/1.0 (contact@bythron.com)"
+    NOMINATIM_BASE_URL: str = "https://nominatim.openstreetmap.org"
+    NOMINATIM_TIMEOUT_SECONDS: float = 5.0
+
     class Config:
         env_file = ".env"
         case_sensitive = True

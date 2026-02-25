@@ -49,6 +49,69 @@ def verify_device_access(device_id: int, clerk_user_id: Optional[str], db: Sessi
     return device
 
 
+def compute_distance_for_device_time_range(
+    device_id: int, start_time: datetime, end_time: datetime, db: Session
+) -> tuple[float, List[Location]]:
+    """
+    Compute total distance for device in time range. Reusable by trips API.
+    Returns (total_distance_km, locations). Only GPS-valid points are used.
+    """
+    query = db.query(Location).filter(
+        Location.device_id == device_id,
+        Location.gps_valid == True
+    )
+    query = query.filter(Location.timestamp >= start_time)
+    query = query.filter(Location.timestamp <= end_time)
+    locations = query.order_by(Location.timestamp.asc()).all()
+
+    total_distance = 0.0
+    for i in range(1, len(locations)):
+        prev = locations[i - 1]
+        curr = locations[i]
+        total_distance += haversine_km(prev.longitude, prev.latitude, curr.longitude, curr.latitude)
+
+    return round(total_distance, 3), locations
+
+
+def fetch_route_line_for_range(
+    device_id: int, start_time: datetime, end_time: datetime, db: Session
+) -> dict:
+    """
+    Fetch route line structure for device in time range. Reusable by trips API.
+    Returns dict with type, coordinates, timestamps, speeds, courses, properties.
+    """
+    query = db.query(Location).filter(
+        Location.device_id == device_id,
+        Location.gps_valid == True
+    )
+    query = query.filter(Location.timestamp >= start_time)
+    query = query.filter(Location.timestamp <= end_time)
+    locations = query.order_by(Location.timestamp.asc()).all()
+
+    coordinates = []
+    timestamps = []
+    speeds = []
+    courses = []
+    for loc in locations:
+        coordinates.append([loc.longitude, loc.latitude])
+        timestamps.append(loc.timestamp.isoformat())
+        speeds.append(loc.speed)
+        courses.append(loc.course)
+
+    return {
+        "type": "LineString",
+        "coordinates": coordinates,
+        "timestamps": timestamps,
+        "speeds": speeds,
+        "courses": courses,
+        "properties": {
+            "start_time": start_time.isoformat(),
+            "end_time": end_time.isoformat(),
+            "point_count": len(coordinates)
+        }
+    }
+
+
 # Pydantic schemas
 class LocationResponse(BaseModel):
     id: int
@@ -244,29 +307,14 @@ async def get_device_distance(
     """
     device = verify_device_access(device_id, x_clerk_user_id, db)
 
-    query = db.query(Location).filter(
-        Location.device_id == device_id,
-        Location.gps_valid == True
-    )
-
-    if start_time:
-        query = query.filter(Location.timestamp >= start_time)
-    else:
+    if not start_time:
         start_time = datetime.utcnow() - timedelta(hours=24)
-        query = query.filter(Location.timestamp >= start_time)
-
-    if end_time:
-        query = query.filter(Location.timestamp <= end_time)
-    else:
+    if not end_time:
         end_time = datetime.utcnow()
 
-    locations = query.order_by(Location.timestamp.asc()).all()
-
-    total_distance = 0.0
-    for i in range(1, len(locations)):
-        prev = locations[i - 1]
-        curr = locations[i]
-        total_distance += haversine_km(prev.longitude, prev.latitude, curr.longitude, curr.latitude)
+    total_distance, locations = compute_distance_for_device_time_range(
+        device_id, start_time, end_time, db
+    )
 
     return DistanceResponse(
         device_id=device.id,
@@ -275,7 +323,7 @@ async def get_device_distance(
         start_time=start_time,
         end_time=end_time,
         point_count=len(locations),
-        total_distance_km=round(total_distance, 3)
+        total_distance_km=total_distance
     )
 
 
@@ -294,49 +342,16 @@ async def get_device_route_line(
     """
     device = verify_device_access(device_id, x_clerk_user_id, db)
 
-    query = db.query(Location).filter(
-        Location.device_id == device_id,
-        Location.gps_valid == True
-    )
-
-    if start_time:
-        query = query.filter(Location.timestamp >= start_time)
-    else:
+    if not start_time:
         start_time = datetime.utcnow() - timedelta(hours=24)
-        query = query.filter(Location.timestamp >= start_time)
-
-    if end_time:
-        query = query.filter(Location.timestamp <= end_time)
-    else:
+    if not end_time:
         end_time = datetime.utcnow()
 
-    locations = query.order_by(Location.timestamp.asc()).all()
-
-    coordinates = []
-    timestamps = []
-    speeds = []
-    courses = []
-    for loc in locations:
-        coordinates.append([loc.longitude, loc.latitude])
-        timestamps.append(loc.timestamp.isoformat())
-        speeds.append(loc.speed)
-        courses.append(loc.course)
-
-    return {
-        "type": "LineString",
-        "coordinates": coordinates,
-        "timestamps": timestamps,
-        "speeds": speeds,
-        "courses": courses,
-        "properties": {
-            "device_id": device.id,
-            "device_name": device.name,
-            "device_imei": device.imei,
-            "start_time": start_time.isoformat(),
-            "end_time": end_time.isoformat(),
-            "point_count": len(coordinates)
-        }
-    }
+    result = fetch_route_line_for_range(device_id, start_time, end_time, db)
+    result["properties"]["device_id"] = device.id
+    result["properties"]["device_name"] = device.name
+    result["properties"]["device_imei"] = device.imei
+    return result
 
 
 @router.get("/{device_id}/alarms", response_model=List[LocationResponse])
