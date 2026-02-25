@@ -3,12 +3,12 @@ Simple Web Dashboard for GPS Tracking - BYThron GPS Service
 Shows device list, info, battery, location, and last activity
 """
 
-from fastapi import APIRouter, Request
+from fastapi import APIRouter, Request, Depends
 from fastapi.responses import HTMLResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
-from app.core.database import SessionLocal
+from app.core.database import get_db
 from app.core.config import settings
 from app.models.device import Device
 from app.models.location import Location
@@ -19,15 +19,6 @@ router = APIRouter()
 # Templates directory
 templates_dir = os.path.join(os.path.dirname(__file__), "templates")
 templates = Jinja2Templates(directory=templates_dir)
-
-
-def get_db():
-    """Get database session"""
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
 
 
 def get_last_movement(device_id: int, db: Session) -> dict:
@@ -114,9 +105,9 @@ def get_signal_bars(csq: int) -> str:
 
 
 @router.get("/dashboard", response_class=HTMLResponse)
-async def dashboard(request: Request):
+@router.get("/dashboard/", response_class=HTMLResponse)
+async def dashboard(request: Request, db: Session = Depends(get_db)):
     """Main dashboard page"""
-    db = next(get_db())
     
     # Get all devices
     devices = db.query(Device).all()
