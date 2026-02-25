@@ -36,7 +36,7 @@ def get_db():
 def init_db():
     """Initialize database - create all tables"""
     # Import all models here
-    from app.models import device, location, user, geofence, trip
+    from app.models import device, location, user, geofence, trip, trip_settings
     
     # Create tables
     Base.metadata.create_all(bind=engine)

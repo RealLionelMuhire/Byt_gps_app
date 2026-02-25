@@ -10,6 +10,7 @@ from pydantic import BaseModel, field_validator, model_validator
 
 from app.core.database import get_db
 from app.models.trip import Trip
+from app.models.trip_settings import TripSettings
 from app.api.locations import (
     verify_device_access,
     get_user_from_clerk_id,
@@ -17,12 +18,18 @@ from app.api.locations import (
     fetch_route_line_for_range,
 )
 from app.services.geocoding import build_trip_display_name
+from app.services.trip_detection import detect_trip_segments, SuggestedTrip
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # Max time for geocoding (2 calls × ~5s + 1s delay + buffer); fallback if exceeded
 GEOCODING_TIMEOUT_SECONDS = 15
+
+# Default trip settings (used when user has none)
+DEFAULT_STOP_SPLITS_MINUTES = 60
+DEFAULT_MIN_TRIP_MINUTES = 5
+DEFAULT_STOP_SPEED_KMH = 5.0
 
 
 def require_authenticated_user(x_clerk_user_id: Optional[str], db: Session):
@@ -35,7 +42,70 @@ def require_authenticated_user(x_clerk_user_id: Optional[str], db: Session):
     return user
 
 
+def get_or_create_trip_settings(user_id: int, db: Session) -> TripSettings:
+    """Get user's trip settings, or create defaults."""
+    settings = db.query(TripSettings).filter(TripSettings.user_id == user_id).first()
+    if not settings:
+        settings = TripSettings(
+            user_id=user_id,
+            stop_splits_trip_after_minutes=DEFAULT_STOP_SPLITS_MINUTES,
+            minimum_trip_duration_minutes=DEFAULT_MIN_TRIP_MINUTES,
+            stop_speed_threshold_kmh=DEFAULT_STOP_SPEED_KMH,
+        )
+        db.add(settings)
+        db.commit()
+        db.refresh(settings)
+    return settings
+
+
 # --- Schemas ---
+
+
+class TripSettingsResponse(BaseModel):
+    stop_splits_trip_after_minutes: int
+    minimum_trip_duration_minutes: int
+    stop_speed_threshold_kmh: float
+
+    class Config:
+        from_attributes = True
+
+
+class TripSettingsUpdate(BaseModel):
+    stop_splits_trip_after_minutes: Optional[int] = None
+    minimum_trip_duration_minutes: Optional[int] = None
+    stop_speed_threshold_kmh: Optional[float] = None
+
+    @field_validator("stop_splits_trip_after_minutes")
+    @classmethod
+    def stop_splits_valid(cls, v):
+        if v is not None and (v < 1 or v > 10080):  # 1 min to 1 week
+            raise ValueError("Must be between 1 and 10080 minutes")
+        return v
+
+    @field_validator("minimum_trip_duration_minutes")
+    @classmethod
+    def min_trip_valid(cls, v):
+        if v is not None and (v < 0 or v > 1440):  # 0 to 24h
+            raise ValueError("Must be between 0 and 1440 minutes")
+        return v
+
+    @field_validator("stop_speed_threshold_kmh")
+    @classmethod
+    def speed_valid(cls, v):
+        if v is not None and (v < 0 or v > 200):
+            raise ValueError("Must be between 0 and 200 km/h")
+        return v
+
+
+class SuggestedTripResponse(BaseModel):
+    start_time: datetime
+    end_time: datetime
+    point_count: int
+    total_distance_km: float
+    start_lat: float
+    start_lon: float
+    end_lat: float
+    end_lon: float
 
 
 class TripCreate(BaseModel):
@@ -81,6 +151,86 @@ class TripDetailResponse(TripResponse):
 
 
 # --- Endpoints ---
+# Note: /settings and /suggested must be defined before /{trip_id}
+
+
+@router.get("/settings", response_model=TripSettingsResponse)
+async def get_trip_settings(
+    x_clerk_user_id: Optional[str] = Header(None, alias="X-Clerk-User-Id"),
+    db: Session = Depends(get_db),
+):
+    """Get current user's trip segmentation settings."""
+    user = require_authenticated_user(x_clerk_user_id, db)
+    settings = get_or_create_trip_settings(user.id, db)
+    return TripSettingsResponse(
+        stop_splits_trip_after_minutes=settings.stop_splits_trip_after_minutes,
+        minimum_trip_duration_minutes=settings.minimum_trip_duration_minutes,
+        stop_speed_threshold_kmh=settings.stop_speed_threshold_kmh,
+    )
+
+
+@router.put("/settings", response_model=TripSettingsResponse)
+async def update_trip_settings(
+    body: TripSettingsUpdate,
+    x_clerk_user_id: Optional[str] = Header(None, alias="X-Clerk-User-Id"),
+    db: Session = Depends(get_db),
+):
+    """Update current user's trip segmentation settings."""
+    user = require_authenticated_user(x_clerk_user_id, db)
+    settings = get_or_create_trip_settings(user.id, db)
+    if body.stop_splits_trip_after_minutes is not None:
+        settings.stop_splits_trip_after_minutes = body.stop_splits_trip_after_minutes
+    if body.minimum_trip_duration_minutes is not None:
+        settings.minimum_trip_duration_minutes = body.minimum_trip_duration_minutes
+    if body.stop_speed_threshold_kmh is not None:
+        settings.stop_speed_threshold_kmh = body.stop_speed_threshold_kmh
+    db.commit()
+    db.refresh(settings)
+    return TripSettingsResponse(
+        stop_splits_trip_after_minutes=settings.stop_splits_trip_after_minutes,
+        minimum_trip_duration_minutes=settings.minimum_trip_duration_minutes,
+        stop_speed_threshold_kmh=settings.stop_speed_threshold_kmh,
+    )
+
+
+@router.get("/suggested", response_model=List[SuggestedTripResponse])
+async def get_suggested_trips(
+    device_id: int = Query(..., description="Device ID"),
+    start_time: Optional[datetime] = Query(None, description="Start of time range (UTC)"),
+    end_time: Optional[datetime] = Query(None, description="End of time range (UTC)"),
+    x_clerk_user_id: Optional[str] = Header(None, alias="X-Clerk-User-Id"),
+    db: Session = Depends(get_db),
+):
+    """
+    Get suggested trip segments based on user's settings.
+
+    Segments location history by stop duration: a stop longer than
+    stop_splits_trip_after_minutes splits into a new trip.
+    """
+    user = require_authenticated_user(x_clerk_user_id, db)
+    device = verify_device_access(device_id, x_clerk_user_id, db)
+    settings = get_or_create_trip_settings(user.id, db)
+
+    if not start_time:
+        from datetime import timedelta
+        start_time = datetime.utcnow() - timedelta(hours=24)
+    if not end_time:
+        end_time = datetime.utcnow()
+
+    segments = detect_trip_segments(device_id, start_time, end_time, settings, db)
+    return [
+        SuggestedTripResponse(
+            start_time=s.start_time,
+            end_time=s.end_time,
+            point_count=s.point_count,
+            total_distance_km=s.total_distance_km,
+            start_lat=s.start_lat,
+            start_lon=s.start_lon,
+            end_lat=s.end_lat,
+            end_lon=s.end_lon,
+        )
+        for s in segments
+    ]
 
 
 @router.post("", response_model=TripResponse, status_code=201)

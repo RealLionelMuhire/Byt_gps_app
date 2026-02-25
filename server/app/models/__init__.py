@@ -5,5 +5,6 @@ from app.models.location import Location
 from app.models.user import User
 from app.models.geofence import Geofence
 from app.models.trip import Trip
+from app.models.trip_settings import TripSettings
 
-__all__ = ['Device', 'Location', 'User', 'Geofence', 'Trip']
+__all__ = ['Device', 'Location', 'User', 'Geofence', 'Trip', 'TripSettings']
