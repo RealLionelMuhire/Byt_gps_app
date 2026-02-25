@@ -16,6 +16,9 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application
 COPY app/ ./app/
+COPY migrations/ ./migrations/
+COPY migrate ./migrate
+RUN chmod +x ./migrate
 
 # Expose ports
 EXPOSE 8000 7018

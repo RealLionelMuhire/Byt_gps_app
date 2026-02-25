@@ -3,11 +3,17 @@
 Run database migrations for BYThron GPS server.
 
 Usage:
-    ./migrate              # Run all migrations
-    ./migrate --dry-run    # Show what would be run without executing
+  # When DB runs in Docker (recommended):
+  docker compose exec gps_server ./migrate
+
+  # When DB is on host (e.g. port 5432 exposed):
+  ./migrate
+
+  # Dry-run (show what would run):
+  ./migrate --dry-run
 
 Requires: psql (PostgreSQL client) in PATH
-Uses: DATABASE_URL from .env or environment (default: postgresql://gps_user:gps_password@localhost:5432/gps_tracking)
+Uses: DATABASE_URL from .env or environment
 """
 
 import os
