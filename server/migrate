@@ -6,7 +6,8 @@ Usage:
     ./migrate              # Run all migrations
     ./migrate --dry-run    # Show what would be run without executing
 
-Requires: psql (PostgreSQL client) in PATH, or set DATABASE_URL in .env
+Requires: psql (PostgreSQL client) in PATH
+Uses: DATABASE_URL from .env or environment (default: postgresql://gps_user:gps_password@localhost:5432/gps_tracking)
 """
 
 import os
@@ -14,19 +15,27 @@ import subprocess
 import sys
 from pathlib import Path
 
-# Ensure we can import app config (run from server dir)
 SERVER_DIR = Path(__file__).resolve().parent
 os.chdir(SERVER_DIR)
-sys.path.insert(0, str(SERVER_DIR))
-
-try:
-    from app.core.config import settings
-except ImportError as e:
-    print("Error: Could not load app config. Run from server directory.", file=sys.stderr)
-    print(f"  {e}", file=sys.stderr)
-    sys.exit(1)
-
 MIGRATIONS_DIR = SERVER_DIR / "migrations"
+
+DEFAULT_DATABASE_URL = "postgresql://gps_user:gps_password@localhost:5432/gps_tracking"
+
+
+def load_database_url() -> str:
+    """Load DATABASE_URL from .env or environment. No app dependencies."""
+    env_file = SERVER_DIR / ".env"
+    if env_file.exists():
+        with open(env_file) as f:
+            for line in f:
+                line = line.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    key, _, value = line.partition("=")
+                    key = key.strip()
+                    value = value.strip().strip("'\"")
+                    if key == "DATABASE_URL":
+                        return value
+    return os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL)
 
 
 def get_migration_files():
@@ -68,7 +77,7 @@ def run_migration(db_url: str, migration_file: Path, dry_run: bool) -> bool:
 def main():
     dry_run = "--dry-run" in sys.argv or "-n" in sys.argv
 
-    db_url = settings.DATABASE_URL
+    db_url = load_database_url()
     if not db_url:
         print("Error: DATABASE_URL not set.", file=sys.stderr)
         sys.exit(1)
