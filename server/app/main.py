@@ -6,6 +6,7 @@ GPS Tracking Server
 import asyncio
 import logging
 from contextlib import asynccontextmanager
+from datetime import datetime
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -27,30 +28,79 @@ logger = logging.getLogger(__name__)
 tcp_server = None
 
 
+async def _trip_stale_checker():
+    """Background task: end active trips when device stops sending (stale last_update)."""
+    from datetime import timedelta
+    from sqlalchemy import or_, and_
+    from app.core.database import SessionLocal
+    from app.models.trip import Trip
+    from app.models.device import Device
+    from app.services.trip_service import end_active_trips_for_device
+
+    while True:
+        try:
+            await asyncio.sleep(60)  # Run every 60 seconds
+            cutoff = datetime.utcnow() - timedelta(seconds=settings.TRIP_AUTO_END_STALE_SECONDS)
+            db = SessionLocal()
+            try:
+                # Devices with active trips and stale last_update (or last_connect if no update yet)
+                subq = db.query(Trip.device_id).filter(Trip.end_time.is_(None)).distinct()
+                stale_devices = (
+                    db.query(Device.id)
+                    .filter(
+                        Device.id.in_(subq),
+                        or_(
+                            Device.last_update < cutoff,
+                            and_(Device.last_update.is_(None), Device.last_connect < cutoff),
+                        ),
+                    )
+                    .all()
+                )
+                for (device_id,) in stale_devices:
+                    ended = end_active_trips_for_device(device_id, db)
+                    if ended:
+                        logger.info("Auto-ended %d trip(s) for device %s (no update for %ds)",
+                                    ended, device_id, settings.TRIP_AUTO_END_STALE_SECONDS)
+            finally:
+                db.close()
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.warning("Trip stale checker error: %s", e)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan manager"""
     global tcp_server
-    
+
     # Startup
     logger.info(f"Starting {settings.APP_NAME} v{settings.APP_VERSION}")
-    
+
     # Initialize database
     logger.info("Initializing database...")
     init_db()
-    
+
     # Start TCP server in background
     logger.info(f"Starting TCP server on port {settings.TCP_PORT}...")
     tcp_server = TCPServer(host=settings.HOST, port=settings.TCP_PORT)
     app.state.tcp_server = tcp_server
-    
+
     # Run TCP server in background task
     tcp_task = asyncio.create_task(tcp_server.start())
-    
+
+    # Run trip stale checker: end active trips when device stops sending
+    trip_stale_task = asyncio.create_task(_trip_stale_checker())
+
     yield
-    
+
     # Shutdown
     logger.info("Shutting down...")
+    trip_stale_task.cancel()
+    try:
+        await trip_stale_task
+    except asyncio.CancelledError:
+        pass
     tcp_task.cancel()
     try:
         await tcp_task

@@ -344,13 +344,18 @@ class GPSTrackerConnection:
             if self.device_imei:
                 self.server.unregister_device(self.device_imei)
                 
-                # Update device status
+                # Update device status and end any active trips
                 db = SessionLocal()
                 try:
                     device = db.query(Device).filter(Device.imei == self.device_imei).first()
                     if device:
                         device.status = 'offline'
                         db.commit()
+                        # Auto-end active trips when device stops sending
+                        from app.services.trip_service import end_active_trips_for_device
+                        ended = end_active_trips_for_device(device.id, db)
+                        if ended:
+                            logger.info("Auto-ended %d trip(s) for device %s (disconnected)", ended, self.device_imei)
                 finally:
                     db.close()
             

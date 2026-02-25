@@ -8,6 +8,8 @@ from datetime import datetime
 from app.core.database import get_db
 from app.models.device import Device
 from app.models.location import Location
+from app.models.trip import Trip
+from app.api.trips import TripResponse
 from app.core.config import settings
 from app.models.user import User
 from pydantic import BaseModel
@@ -80,6 +82,21 @@ async def list_devices(
     
     devices = query.offset(skip).limit(limit).all()
     return devices
+
+
+@router.get("/{device_id}/trips", response_model=List[TripResponse])
+async def list_device_trips(device_id: int, db: Session = Depends(get_db)):
+    """List trips for a device. Access trips via device_id."""
+    device = db.query(Device).filter(Device.id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    trips = (
+        db.query(Trip)
+        .filter(Trip.device_id == device_id)
+        .order_by(Trip.created_at.desc())
+        .all()
+    )
+    return trips
 
 
 @router.get("/{device_id}", response_model=DeviceResponse)

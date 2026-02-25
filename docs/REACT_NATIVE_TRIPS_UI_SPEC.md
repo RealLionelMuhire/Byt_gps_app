@@ -25,7 +25,7 @@ interface Trip {
   name: string;
   display_name: string | null;  // Human-readable from geocoding, e.g. "KG 217 Street → KG 17 Avenue"
   start_time: string;          // ISO 8601
-  end_time: string;
+  end_time: string | null;     // null = active trip (auto-ended when device stops)
   total_distance_km: number;
   created_at: string;
 }
@@ -77,7 +77,9 @@ interface SuggestedTrip {
 
 ### 3.1 Trip List Screen
 
-**Endpoint:** `GET /api/trips?device_id={id}` (device_id optional)
+**Endpoints:** (device_id required — one can have many devices)
+- `GET /api/trips?device_id={id}` — list trips for device
+- `GET /api/devices/{device_id}/trips` — list trips for device (alternative)
 
 **UI:**
 - List of saved trips (card or list item per trip)
@@ -89,13 +91,13 @@ interface SuggestedTrip {
 
 ### 3.2 Trip Detail Screen
 
-**Endpoint:** `GET /api/trips/{trip_id}`
+**Endpoint:** `GET /api/trips/{trip_id}?device_id={id}` (device_id required)
 
 **UI:**
 - Map with route polyline (use `route.coordinates` — format is `[lon, lat]`)
 - Trip info: name, display_name, device_name, start/end time, distance
 - Optional: playback / animate along route using `timestamps` and `speeds`
-- Delete button → `DELETE /api/trips/{trip_id}`
+- Delete button → `DELETE /api/trips/{trip_id}?device_id={id}`
 
 ### 3.3 Create Trip Screen / Flow
 
@@ -143,11 +145,13 @@ interface SuggestedTrip {
 
 | Method | Endpoint | Purpose |
 |--------|----------|---------|
-| GET | `/api/trips` | List user's trips |
-| GET | `/api/trips?device_id=1` | List trips for device |
-| GET | `/api/trips/{id}` | Trip detail + route |
+| GET | `/api/trips?device_id=1` | List trips for device (device_id required) |
+| GET | `/api/devices/{device_id}/trips` | List trips for device (alternative) |
+| GET | `/api/trips/{id}?device_id=1` | Trip detail + route (device_id required) |
 | POST | `/api/trips` | Create trip |
-| DELETE | `/api/trips/{id}` | Delete trip |
+| POST | `/api/trips/start` | Start active trip (auto-ended when device stops) |
+| POST | `/api/trips/{id}/end?device_id=1` | Manually end active trip |
+| DELETE | `/api/trips/{id}?device_id=1` | Delete trip (device_id required) |
 | GET | `/api/trips/settings` | Get trip settings |
 | PUT | `/api/trips/settings` | Update trip settings |
 | GET | `/api/trips/suggested?device_id=1` | Get suggested segments |

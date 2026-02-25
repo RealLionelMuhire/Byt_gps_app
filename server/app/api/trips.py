@@ -134,6 +134,19 @@ class TripCreate(BaseModel):
         return self
 
 
+class TripStartRequest(BaseModel):
+    device_id: int
+    name: str
+
+    @field_validator("name")
+    @classmethod
+    def name_not_empty(cls, v: str) -> str:
+        v = v.strip()
+        if not v:
+            raise ValueError("name cannot be empty")
+        return v
+
+
 class TripResponse(BaseModel):
     id: int
     device_id: int
@@ -141,7 +154,7 @@ class TripResponse(BaseModel):
     name: str
     display_name: Optional[str] = None
     start_time: datetime
-    end_time: datetime
+    end_time: Optional[datetime] = None  # None = active trip
     total_distance_km: float
     created_at: datetime
 
@@ -233,6 +246,37 @@ async def get_suggested_trips(
     ]
 
 
+@router.post("/start", response_model=TripResponse, status_code=201)
+async def start_trip(body: TripStartRequest, db: Session = Depends(get_db)):
+    """
+    Start an active trip. Trip ends automatically when device stops sending (disconnects).
+    """
+    user = get_default_user(db)
+    verify_device_access(body.device_id, None, db)
+    # Check no other active trip for this device
+    existing = db.query(Trip).filter(
+        Trip.device_id == body.device_id,
+        Trip.end_time.is_(None),
+    ).first()
+    if existing:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Device already has an active trip (id={existing.id}). End it first.",
+        )
+    trip = Trip(
+        device_id=body.device_id,
+        user_id=user.id,
+        name=body.name,
+        start_time=datetime.utcnow(),
+        end_time=None,
+        total_distance_km=0.0,
+    )
+    db.add(trip)
+    db.commit()
+    db.refresh(trip)
+    return trip
+
+
 @router.post("", response_model=TripResponse, status_code=201)
 async def create_trip(body: TripCreate, db: Session = Depends(get_db)):
     """
@@ -298,35 +342,49 @@ async def create_trip(body: TripCreate, db: Session = Depends(get_db)):
 
 @router.get("", response_model=List[TripResponse])
 async def list_trips(
-    device_id: Optional[int] = Query(None, description="Filter by device"),
+    device_id: int = Query(..., description="Device ID (required - one can have many devices)"),
     db: Session = Depends(get_db),
 ):
     """
-    List saved trips. Optional device_id filter.
+    List saved trips for a device. device_id required.
     """
-    user = get_default_user(db)
-    query = db.query(Trip).filter(Trip.user_id == user.id)
-
-    if device_id is not None:
-        verify_device_access(device_id, None, db)
-        query = query.filter(Trip.device_id == device_id)
-
-    trips = query.order_by(Trip.created_at.desc()).all()
+    verify_device_access(device_id, None, db)
+    trips = (
+        db.query(Trip)
+        .filter(Trip.device_id == device_id)
+        .order_by(Trip.created_at.desc())
+        .all()
+    )
     return trips
 
 
 @router.get("/{trip_id}", response_model=TripDetailResponse)
-async def get_trip(trip_id: int, db: Session = Depends(get_db)):
+async def get_trip(
+    trip_id: int,
+    device_id: int = Query(..., description="Device ID (required for context)"),
+    db: Session = Depends(get_db),
+):
     """
-    Get trip metadata and route geometry.
+    Get trip metadata and route geometry. device_id required.
     """
-    trip = db.query(Trip).filter(Trip.id == trip_id).first()
+    trip = db.query(Trip).filter(Trip.id == trip_id, Trip.device_id == device_id).first()
     if not trip:
         raise HTTPException(status_code=404, detail="Trip not found")
 
-    # Reuse route-line logic
+    end_time = trip.end_time
+    if end_time is None:
+        # Active trip: use last location or now
+        from app.models.location import Location
+        last_loc = (
+            db.query(Location)
+            .filter(Location.device_id == trip.device_id, Location.gps_valid == True)
+            .order_by(Location.timestamp.desc())
+            .first()
+        )
+        end_time = last_loc.timestamp if last_loc else datetime.utcnow()
+
     route = fetch_route_line_for_range(
-        trip.device_id, trip.start_time, trip.end_time, db
+        trip.device_id, trip.start_time, end_time, db
     )
     route["properties"]["device_id"] = trip.device.id
     route["properties"]["device_name"] = trip.device.name
@@ -348,12 +406,37 @@ async def get_trip(trip_id: int, db: Session = Depends(get_db)):
     )
 
 
+@router.post("/{trip_id}/end", response_model=TripResponse)
+async def end_trip_manually(
+    trip_id: int,
+    device_id: int = Query(..., description="Device ID"),
+    db: Session = Depends(get_db),
+):
+    """
+    Manually end an active trip (e.g. before device disconnects).
+    """
+    from app.services.trip_service import end_active_trips_for_device
+    trip = db.query(Trip).filter(Trip.id == trip_id, Trip.device_id == device_id).first()
+    if not trip:
+        raise HTTPException(status_code=404, detail="Trip not found")
+    if trip.end_time is not None:
+        return trip  # Already ended
+    verify_device_access(device_id, None, db)
+    end_active_trips_for_device(device_id, db)
+    db.refresh(trip)
+    return trip
+
+
 @router.delete("/{trip_id}", status_code=204)
-async def delete_trip(trip_id: int, db: Session = Depends(get_db)):
+async def delete_trip(
+    trip_id: int,
+    device_id: int = Query(..., description="Device ID"),
+    db: Session = Depends(get_db),
+):
     """
-    Delete a saved trip. Location data is not affected.
+    Delete a saved trip. device_id required. Location data is not affected.
     """
-    trip = db.query(Trip).filter(Trip.id == trip_id).first()
+    trip = db.query(Trip).filter(Trip.id == trip_id, Trip.device_id == device_id).first()
     if not trip:
         raise HTTPException(status_code=404, detail="Trip not found")
 

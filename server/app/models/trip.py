@@ -18,7 +18,7 @@ class Trip(Base):
     name = Column(String(255), nullable=False)
     display_name = Column(String(512), nullable=True)  # Human-readable from reverse geocoding
     start_time = Column(DateTime, nullable=False)
-    end_time = Column(DateTime, nullable=False)
+    end_time = Column(DateTime, nullable=True)  # Null = active trip (auto-ended when device stops)
     total_distance_km = Column(Float, nullable=False, default=0.0)
 
     # Optional: first/last location references

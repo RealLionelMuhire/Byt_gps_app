@@ -41,6 +41,9 @@ class Settings(BaseSettings):
     DEVICE_SENDING_STALE_SECONDS: int = 120  # Consider "stale" if no packet within this window
     DEVICE_OFFLINE_TIMEOUT_SECONDS: int = 300  # Consider "offline" if no packet within this window
 
+    # Trip auto-end: end active trips if device stops sending for this long (seconds)
+    TRIP_AUTO_END_STALE_SECONDS: int = 300  # Same as offline timeout; end trip if no update
+
     # Nominatim (OpenStreetMap) reverse geocoding
     NOMINATIM_USER_AGENT: str = "BYThron-GPS/1.0 (contact@bythron.com)"
     NOMINATIM_BASE_URL: str = "https://nominatim.openstreetmap.org"
