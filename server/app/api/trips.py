@@ -4,16 +4,16 @@ import asyncio
 import logging
 from typing import List, Optional
 from datetime import datetime
-from fastapi import APIRouter, Depends, HTTPException, Query, Header
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, field_validator, model_validator
 
 from app.core.database import get_db
 from app.models.trip import Trip
 from app.models.trip_settings import TripSettings
+from app.models.user import User
 from app.api.locations import (
     verify_device_access,
-    get_user_from_clerk_id,
     compute_distance_for_device_time_range,
     fetch_route_line_for_range,
 )
@@ -32,13 +32,18 @@ DEFAULT_MIN_TRIP_MINUTES = 5
 DEFAULT_STOP_SPEED_KMH = 5.0
 
 
-def require_authenticated_user(x_clerk_user_id: Optional[str], db: Session):
-    """Require Clerk auth; return User or raise 401."""
-    if not x_clerk_user_id:
-        raise HTTPException(status_code=401, detail="Authentication required (X-Clerk-User-Id)")
-    user = get_user_from_clerk_id(x_clerk_user_id, db)
+def get_default_user(db: Session) -> User:
+    """Get or create default user (no Clerk auth)."""
+    user = db.query(User).first()
     if not user:
-        raise HTTPException(status_code=401, detail="User not found. Ensure user is synced from Clerk.")
+        user = User(
+            clerk_user_id="default",
+            email="default@local",
+            name="Default User",
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
     return user
 
 
@@ -155,12 +160,9 @@ class TripDetailResponse(TripResponse):
 
 
 @router.get("/settings", response_model=TripSettingsResponse)
-async def get_trip_settings(
-    x_clerk_user_id: Optional[str] = Header(None, alias="X-Clerk-User-Id"),
-    db: Session = Depends(get_db),
-):
-    """Get current user's trip segmentation settings."""
-    user = require_authenticated_user(x_clerk_user_id, db)
+async def get_trip_settings(db: Session = Depends(get_db)):
+    """Get trip segmentation settings (uses default user)."""
+    user = get_default_user(db)
     settings = get_or_create_trip_settings(user.id, db)
     return TripSettingsResponse(
         stop_splits_trip_after_minutes=settings.stop_splits_trip_after_minutes,
@@ -172,11 +174,10 @@ async def get_trip_settings(
 @router.put("/settings", response_model=TripSettingsResponse)
 async def update_trip_settings(
     body: TripSettingsUpdate,
-    x_clerk_user_id: Optional[str] = Header(None, alias="X-Clerk-User-Id"),
     db: Session = Depends(get_db),
 ):
-    """Update current user's trip segmentation settings."""
-    user = require_authenticated_user(x_clerk_user_id, db)
+    """Update trip segmentation settings (uses default user)."""
+    user = get_default_user(db)
     settings = get_or_create_trip_settings(user.id, db)
     if body.stop_splits_trip_after_minutes is not None:
         settings.stop_splits_trip_after_minutes = body.stop_splits_trip_after_minutes
@@ -198,17 +199,16 @@ async def get_suggested_trips(
     device_id: int = Query(..., description="Device ID"),
     start_time: Optional[datetime] = Query(None, description="Start of time range (UTC)"),
     end_time: Optional[datetime] = Query(None, description="End of time range (UTC)"),
-    x_clerk_user_id: Optional[str] = Header(None, alias="X-Clerk-User-Id"),
     db: Session = Depends(get_db),
 ):
     """
-    Get suggested trip segments based on user's settings.
+    Get suggested trip segments based on settings.
 
     Segments location history by stop duration: a stop longer than
     stop_splits_trip_after_minutes splits into a new trip.
     """
-    user = require_authenticated_user(x_clerk_user_id, db)
-    device = verify_device_access(device_id, x_clerk_user_id, db)
+    user = get_default_user(db)
+    device = verify_device_access(device_id, None, db)
     settings = get_or_create_trip_settings(user.id, db)
 
     if not start_time:
@@ -234,20 +234,12 @@ async def get_suggested_trips(
 
 
 @router.post("", response_model=TripResponse, status_code=201)
-async def create_trip(
-    body: TripCreate,
-    x_clerk_user_id: Optional[str] = Header(None, alias="X-Clerk-User-Id"),
-    db: Session = Depends(get_db),
-):
+async def create_trip(body: TripCreate, db: Session = Depends(get_db)):
     """
     Create a saved trip from a device's location history.
-
-    Requires authentication. Validates device ownership, time range, and presence of location data.
     """
-    user = require_authenticated_user(x_clerk_user_id, db)
-
-    # Verify device access
-    device = verify_device_access(body.device_id, x_clerk_user_id, db)
+    user = get_default_user(db)
+    verify_device_access(body.device_id, None, db)
 
     # Compute distance and ensure locations exist
     total_distance, locations = compute_distance_for_device_time_range(
@@ -307,21 +299,16 @@ async def create_trip(
 @router.get("", response_model=List[TripResponse])
 async def list_trips(
     device_id: Optional[int] = Query(None, description="Filter by device"),
-    x_clerk_user_id: Optional[str] = Header(None, alias="X-Clerk-User-Id"),
     db: Session = Depends(get_db),
 ):
     """
-    List saved trips for the authenticated user.
-
-    Optional device_id filter.
+    List saved trips. Optional device_id filter.
     """
-    user = require_authenticated_user(x_clerk_user_id, db)
-
+    user = get_default_user(db)
     query = db.query(Trip).filter(Trip.user_id == user.id)
 
     if device_id is not None:
-        # Verify user has access to this device
-        verify_device_access(device_id, x_clerk_user_id, db)
+        verify_device_access(device_id, None, db)
         query = query.filter(Trip.device_id == device_id)
 
     trips = query.order_by(Trip.created_at.desc()).all()
@@ -329,22 +316,13 @@ async def list_trips(
 
 
 @router.get("/{trip_id}", response_model=TripDetailResponse)
-async def get_trip(
-    trip_id: int,
-    x_clerk_user_id: Optional[str] = Header(None, alias="X-Clerk-User-Id"),
-    db: Session = Depends(get_db),
-):
+async def get_trip(trip_id: int, db: Session = Depends(get_db)):
     """
     Get trip metadata and route geometry.
     """
-    user = require_authenticated_user(x_clerk_user_id, db)
-
     trip = db.query(Trip).filter(Trip.id == trip_id).first()
     if not trip:
         raise HTTPException(status_code=404, detail="Trip not found")
-
-    if trip.user_id != user.id:
-        raise HTTPException(status_code=403, detail="Access denied to this trip")
 
     # Reuse route-line logic
     route = fetch_route_line_for_range(
@@ -371,23 +349,13 @@ async def get_trip(
 
 
 @router.delete("/{trip_id}", status_code=204)
-async def delete_trip(
-    trip_id: int,
-    x_clerk_user_id: Optional[str] = Header(None, alias="X-Clerk-User-Id"),
-    db: Session = Depends(get_db),
-):
+async def delete_trip(trip_id: int, db: Session = Depends(get_db)):
     """
-    Delete a saved trip. Only the trip owner can delete.
-    Location data is not affected.
+    Delete a saved trip. Location data is not affected.
     """
-    user = require_authenticated_user(x_clerk_user_id, db)
-
     trip = db.query(Trip).filter(Trip.id == trip_id).first()
     if not trip:
         raise HTTPException(status_code=404, detail="Trip not found")
-
-    if trip.user_id != user.id:
-        raise HTTPException(status_code=403, detail="Access denied to this trip")
 
     db.delete(trip)
     db.commit()

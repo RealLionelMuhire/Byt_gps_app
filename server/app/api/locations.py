@@ -1,7 +1,7 @@
 """Location API endpoints"""
 
 from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Query, Header
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 from pydantic import BaseModel
@@ -10,17 +10,8 @@ from math import radians, cos, sin, asin, sqrt
 from app.core.database import get_db
 from app.models.location import Location
 from app.models.device import Device
-from app.models.user import User
 
 router = APIRouter()
-
-
-def get_user_from_clerk_id(clerk_user_id: Optional[str], db: Session) -> Optional[User]:
-    """Helper function to get user by Clerk ID"""
-    if not clerk_user_id:
-        return None
-    user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
-    return user
 
 
 def haversine_km(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
@@ -34,18 +25,10 @@ def haversine_km(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
 
 
 def verify_device_access(device_id: int, clerk_user_id: Optional[str], db: Session) -> Device:
-    """Verify user has access to the device"""
+    """Verify device exists. Ownership check disabled (no Clerk auth)."""
     device = db.query(Device).filter(Device.id == device_id).first()
-    
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
-    
-    # If clerk_user_id provided, verify ownership
-    if clerk_user_id:
-        user = get_user_from_clerk_id(clerk_user_id, db)
-        if user and device.user_id != user.id:
-            raise HTTPException(status_code=403, detail="Access denied to this device")
-    
     return device
 
 
@@ -159,18 +142,9 @@ class RouteLineStringResponse(BaseModel):
 
 
 @router.get("/{device_id}/latest", response_model=LocationResponse)
-async def get_latest_location(
-    device_id: int,
-    x_clerk_user_id: Optional[str] = Header(None, alias="X-Clerk-User-Id"),
-    db: Session = Depends(get_db)
-):
-    """
-    Get latest location for a device
-    
-    If X-Clerk-User-Id header is provided, verifies user has access to the device.
-    """
-    # Verify device access
-    verify_device_access(device_id, x_clerk_user_id, db)
+async def get_latest_location(device_id: int, db: Session = Depends(get_db)):
+    """Get latest location for a device."""
+    verify_device_access(device_id, None, db)
     
     location = db.query(Location).filter(
         Location.device_id == device_id
@@ -188,16 +162,10 @@ async def get_location_history(
     start_time: Optional[datetime] = Query(None, description="Start time (UTC)"),
     end_time: Optional[datetime] = Query(None, description="End time (UTC)"),
     limit: int = Query(1000, ge=1, le=10000, description="Maximum number of points"),
-    x_clerk_user_id: Optional[str] = Header(None, alias="X-Clerk-User-Id"),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
-    """
-    Get location history for a device
-    
-    If X-Clerk-User-Id header is provided, verifies user has access to the device.
-    """
-    # Verify device access
-    device = verify_device_access(device_id, x_clerk_user_id, db)
+    """Get location history for a device."""
+    device = verify_device_access(device_id, None, db)
     
     # Build query
     query = db.query(Location).filter(Location.device_id == device_id)
@@ -234,16 +202,10 @@ async def get_device_route(
     start_time: Optional[datetime] = Query(None),
     end_time: Optional[datetime] = Query(None),
     simplify: bool = Query(False, description="Simplify route to reduce points"),
-    x_clerk_user_id: Optional[str] = Header(None, alias="X-Clerk-User-Id"),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
-    """
-    Get device route (optimized for map display)
-    
-    If X-Clerk-User-Id header is provided, verifies user has access to the device.
-    """
-    # Verify device access
-    device = verify_device_access(device_id, x_clerk_user_id, db)
+    """Get device route (optimized for map display)."""
+    device = verify_device_access(device_id, None, db)
     
     query = db.query(Location).filter(
         Location.device_id == device_id,
@@ -296,8 +258,7 @@ async def get_device_distance(
     device_id: int,
     start_time: Optional[datetime] = Query(None, description="Start time (UTC)"),
     end_time: Optional[datetime] = Query(None, description="End time (UTC)"),
-    x_clerk_user_id: Optional[str] = Header(None, alias="X-Clerk-User-Id"),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     """
     Get total distance covered by a device within a time range.
@@ -305,7 +266,7 @@ async def get_device_distance(
     Distance is calculated using the Haversine formula across consecutive GPS points.
     Only GPS-valid points are used.
     """
-    device = verify_device_access(device_id, x_clerk_user_id, db)
+    device = verify_device_access(device_id, None, db)
 
     if not start_time:
         start_time = datetime.utcnow() - timedelta(hours=24)
@@ -332,15 +293,12 @@ async def get_device_route_line(
     device_id: int,
     start_time: Optional[datetime] = Query(None, description="Start time (UTC)"),
     end_time: Optional[datetime] = Query(None, description="End time (UTC)"),
-    x_clerk_user_id: Optional[str] = Header(None, alias="X-Clerk-User-Id"),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     """
     Get device route as a LineString with timestamps aligned to coordinates.
-
-    Returns GeoJSON-like structure with coordinates and timestamps arrays.
     """
-    device = verify_device_access(device_id, x_clerk_user_id, db)
+    device = verify_device_access(device_id, None, db)
 
     if not start_time:
         start_time = datetime.utcnow() - timedelta(hours=24)

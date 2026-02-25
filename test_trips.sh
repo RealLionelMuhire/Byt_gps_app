@@ -1,14 +1,13 @@
 #!/bin/bash
 #
 # Test trip endpoints against the live server.
-# Prerequisites: User synced, device with location data, device assigned to user.
+# Prerequisites: At least one user in DB (sync creates default), device with location data.
 #
-# Usage: ./test_trips.sh [BASE_URL] [DEVICE_ID] [CLERK_USER_ID]
+# Usage: ./test_trips.sh [BASE_URL] [DEVICE_ID]
 #
 
 BASE_URL="${1:-http://164.92.212.186:8000}"
 DEVICE_ID="${2:-1}"
-CLERK_USER_ID="${3:-user_trip_test}"
 
 GREEN='\033[0;32m'
 RED='\033[0;31m'
@@ -20,7 +19,6 @@ echo "=============================================="
 echo " Trip API Tests"
 echo " Server:      $BASE_URL"
 echo " Device ID:   $DEVICE_ID"
-echo " Clerk User:  $CLERK_USER_ID"
 echo "=============================================="
 
 # ── Step 1: Sync user (required for trips) ─────────────────────────────
@@ -32,10 +30,9 @@ SYNC_RESP=$(curl -s -X POST "$BASE_URL/api/auth/sync" \
 echo "$SYNC_RESP" | python3 -m json.tool 2>/dev/null || echo "$SYNC_RESP"
 echo ""
 
-# ── Step 2: Assign device to user (if not already) ────────────────────
-echo -e "${CYAN}[2] Assigning device $DEVICE_ID to user...${NC}"
-ASSIGN_RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/api/devices/$DEVICE_ID/assign" \
-  -H "X-Clerk-User-Id: $CLERK_USER_ID")
+# ── Step 2: Assign device to default user (if not already) ────────────
+echo -e "${CYAN}[2] Assigning device $DEVICE_ID...${NC}"
+ASSIGN_RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/api/devices/$DEVICE_ID/assign")
 HTTP=$(echo "$ASSIGN_RESP" | tail -1)
 BODY=$(echo "$ASSIGN_RESP" | sed '$d')
 if [ "$HTTP" -ge 200 ] && [ "$HTTP" -lt 300 ]; then
@@ -93,7 +90,6 @@ echo -e "${CYAN}[4] Creating trip...${NC}"
 CREATE_BODY="{\"device_id\": $DEVICE_ID, \"name\": \"Test Trip\", \"start_time\": \"$START_TIME\", \"end_time\": \"$END_TIME\"}"
 CREATE_RESP=$(curl -s -w "\n%{http_code}" -X POST "$BASE_URL/api/trips" \
   -H "Content-Type: application/json" \
-  -H "X-Clerk-User-Id: $CLERK_USER_ID" \
   -d "$CREATE_BODY")
 HTTP=$(echo "$CREATE_RESP" | tail -1)
 BODY=$(echo "$CREATE_RESP" | sed '$d')
@@ -110,8 +106,7 @@ echo ""
 
 # ── Step 5: List trips ───────────────────────────────────────────────
 echo -e "${CYAN}[5] Listing trips...${NC}"
-LIST_RESP=$(curl -s -w "\n%{http_code}" "$BASE_URL/api/trips" \
-  -H "X-Clerk-User-Id: $CLERK_USER_ID")
+LIST_RESP=$(curl -s -w "\n%{http_code}" "$BASE_URL/api/trips")
 HTTP=$(echo "$LIST_RESP" | tail -1)
 BODY=$(echo "$LIST_RESP" | sed '$d')
 if [ "$HTTP" -ge 200 ] && [ "$HTTP" -lt 300 ]; then
@@ -126,8 +121,7 @@ echo ""
 # ── Step 6: Get trip detail (if we created one) ───────────────────────
 if [ -n "$TRIP_ID" ]; then
   echo -e "${CYAN}[6] Getting trip $TRIP_ID detail...${NC}"
-  DETAIL_RESP=$(curl -s -w "\n%{http_code}" "$BASE_URL/api/trips/$TRIP_ID" \
-    -H "X-Clerk-User-Id: $CLERK_USER_ID")
+  DETAIL_RESP=$(curl -s -w "\n%{http_code}" "$BASE_URL/api/trips/$TRIP_ID")
   HTTP=$(echo "$DETAIL_RESP" | tail -1)
   BODY=$(echo "$DETAIL_RESP" | sed '$d')
   if [ "$HTTP" -ge 200 ] && [ "$HTTP" -lt 300 ]; then
@@ -142,8 +136,7 @@ if [ -n "$TRIP_ID" ]; then
 
   # ── Step 7: Delete trip ───────────────────────────────────────────
   echo -e "${CYAN}[7] Deleting trip $TRIP_ID...${NC}"
-  DEL_RESP=$(curl -s -w "\n%{http_code}" -X DELETE "$BASE_URL/api/trips/$TRIP_ID" \
-    -H "X-Clerk-User-Id: $CLERK_USER_ID")
+  DEL_RESP=$(curl -s -w "\n%{http_code}" -X DELETE "$BASE_URL/api/trips/$TRIP_ID")
   HTTP=$(echo "$DEL_RESP" | tail -1)
   if [ "$HTTP" = "204" ]; then
     echo -e "     ${GREEN}HTTP 204 OK (deleted)${NC}"
@@ -155,8 +148,7 @@ fi
 # ── Step 8: Trip settings ──────────────────────────────────────────────
 echo ""
 echo -e "${CYAN}[8] Getting trip settings...${NC}"
-SETTINGS_RESP=$(curl -s -w "\n%{http_code}" "$BASE_URL/api/trips/settings" \
-  -H "X-Clerk-User-Id: $CLERK_USER_ID")
+SETTINGS_RESP=$(curl -s -w "\n%{http_code}" "$BASE_URL/api/trips/settings")
 HTTP=$(echo "$SETTINGS_RESP" | tail -1)
 BODY=$(echo "$SETTINGS_RESP" | sed '$d')
 if [ "$HTTP" -ge 200 ] && [ "$HTTP" -lt 300 ]; then
@@ -171,7 +163,6 @@ echo ""
 echo -e "${CYAN}[9] Updating trip settings (stop_splits=30min)...${NC}"
 UPDATE_RESP=$(curl -s -w "\n%{http_code}" -X PUT "$BASE_URL/api/trips/settings" \
   -H "Content-Type: application/json" \
-  -H "X-Clerk-User-Id: $CLERK_USER_ID" \
   -d '{"stop_splits_trip_after_minutes": 30}')
 HTTP=$(echo "$UPDATE_RESP" | tail -1)
 BODY=$(echo "$UPDATE_RESP" | sed '$d')
@@ -185,8 +176,7 @@ fi
 
 echo ""
 echo -e "${CYAN}[10] Getting suggested trips...${NC}"
-SUGGESTED_RESP=$(curl -s -w "\n%{http_code}" "$BASE_URL/api/trips/suggested?device_id=$DEVICE_ID" \
-  -H "X-Clerk-User-Id: $CLERK_USER_ID")
+SUGGESTED_RESP=$(curl -s -w "\n%{http_code}" "$BASE_URL/api/trips/suggested?device_id=$DEVICE_ID")
 HTTP=$(echo "$SUGGESTED_RESP" | tail -1)
 BODY=$(echo "$SUGGESTED_RESP" | sed '$d')
 if [ "$HTTP" -ge 200 ] && [ "$HTTP" -lt 300 ]; then

@@ -4,21 +4,13 @@ This document describes the UI updates needed in your React Native app to suppor
 
 **Base URL:** `http://164.92.212.186:8000` (or your server)
 
-**Auth:** All trip endpoints require `X-Clerk-User-Id` header (from Clerk auth).
+**Auth:** No authentication required. All endpoints are open.
 
 ---
 
 ## 1. API Client Setup
 
-Ensure your API client sends the Clerk user ID on every trip request:
-
-```typescript
-// Example: Add to your API client / fetch wrapper
-const headers = {
-  'Content-Type': 'application/json',
-  'X-Clerk-User-Id': clerkUserId,  // From Clerk: user.id
-};
-```
+No authentication headers required. Use standard `Content-Type: application/json` for POST/PUT requests.
 
 ---
 
@@ -194,9 +186,7 @@ Tabs / Drawer
 
 ## 7. Error Handling
 
-- **401:** Missing or invalid `X-Clerk-User-Id` → redirect to sign-in
-- **403:** User doesn't own the trip/device
-- **404:** Trip not found
+- **404:** Trip or device not found
 - **400:** No location data in time range (create trip) — show user-friendly message
 
 ---
