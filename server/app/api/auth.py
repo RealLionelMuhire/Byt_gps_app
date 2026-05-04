@@ -38,6 +38,7 @@ class UserResponse(BaseModel):
     clerk_user_id: str
     email: str
     name: Optional[str]
+    is_admin: bool
     created_at: datetime
     updated_at: datetime
     
@@ -83,11 +84,14 @@ async def sync_user(
             user.updated_at = datetime.utcnow()
         else:
             # Create new user
-            logger.info(f"Creating new user: {user_data.clerk_user_id}")
+            is_first_user = db.query(User).count() == 0
+            
+            logger.info(f"Creating new user: {user_data.clerk_user_id}. First user admin: {is_first_user}")
             user = User(
                 clerk_user_id=user_data.clerk_user_id,
                 email=user_data.email,
                 name=user_data.name,
+                is_admin=is_first_user,
                 created_at=datetime.utcnow(),
                 updated_at=datetime.utcnow()
             )

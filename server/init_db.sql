@@ -7,6 +7,7 @@ CREATE TABLE IF NOT EXISTS users (
     clerk_user_id VARCHAR(255) UNIQUE NOT NULL,
     email VARCHAR(255) NOT NULL,
     name VARCHAR(255),
+    is_admin BOOLEAN DEFAULT FALSE NOT NULL,
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW()
 );
