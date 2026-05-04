@@ -24,6 +24,10 @@ The backend has been successfully updated to support Clerk authentication and us
   - Creates or updates users from Clerk data
   - Validates required fields
   - Returns user data with timestamps
+- **POST `/api/auth/admin-create-user`** - Admin user creation
+  - Programmatically creates a user in Clerk (sets password)
+  - Auto-syncs the new user to the local Postgres database
+  - Requires `x-admin-secret` header matching `ADMIN_SECRET` in `.env`
 - **GET `/api/auth/user/{clerk_user_id}`** - Get user by Clerk ID
 
 ### 4. **Device Model** ([server/app/models/device.py](server/app/models/device.py))
@@ -73,8 +77,42 @@ curl -X POST http://164.92.212.186:8000/api/auth/sync \
   "clerk_user_id": "user_2abc123xyz456def",
   "email": "user@example.com",
   "name": "John Doe",
+  "is_admin": true,
   "created_at": "2026-02-06T10:00:00Z",
   "updated_at": "2026-02-06T10:00:00Z"
+}
+```
+
+#### **POST /api/auth/admin-create-user**
+Create a new user entirely from the backend (creates in Clerk and syncs to DB).
+
+**Required Headers:**
+- `x-admin-secret`: Admin token (matches `ADMIN_SECRET` in `.env`)
+- `Content-Type: application/json`
+
+**Request:**
+```bash
+curl -X POST http://164.92.212.186:8000/api/auth/admin-create-user \
+  -H "Content-Type: application/json" \
+  -H "x-admin-secret: my_super_secret_token_123" \
+  -d '{
+    "email": "newuser@example.com",
+    "password": "StrongPassword123!",
+    "first_name": "John",
+    "last_name": "Doe"
+  }'
+```
+
+**Response (201 Created):**
+```json
+{
+  "id": 2,
+  "clerk_user_id": "user_3DHEr8vBKs7uNUS7pCJkBGe78ij",
+  "email": "newuser@example.com",
+  "name": "John Doe",
+  "is_admin": false,
+  "created_at": "2026-05-04T21:39:50Z",
+  "updated_at": "2026-05-04T21:39:50Z"
 }
 ```
 
@@ -164,6 +202,11 @@ curl -X GET "http://164.92.212.186:8000/api/locations/1/route" \
   2. Filters data to only that user's devices
   3. Verifies access permissions
 
+### First-User Admin Privileges
+- The **first user** to ever be created in the database (either via `/api/auth/sync` or `/api/auth/admin-create-user`) is automatically granted **Administrator privileges** (`is_admin: true`).
+- All subsequent users are created as standard users (`is_admin: false`).
+- The `is_admin` flag is used by the frontend to conditionally render admin dashboards and management features.
+
 ### Backward Compatibility
 - All endpoints work **without** the header (returns all data)
 - Allows gradual migration from old to new authentication
@@ -185,6 +228,7 @@ CREATE TABLE users (
     clerk_user_id VARCHAR(255) UNIQUE NOT NULL,
     email VARCHAR(255) NOT NULL,
     name VARCHAR(255),
+    is_admin BOOLEAN DEFAULT FALSE NOT NULL,
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW()
 );
