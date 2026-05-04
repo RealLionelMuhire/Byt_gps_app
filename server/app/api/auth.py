@@ -1,7 +1,8 @@
 """Authentication API endpoints - Clerk user sync"""
 
 from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Header
+import httpx
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
 from datetime import datetime
@@ -9,6 +10,7 @@ from pydantic import BaseModel, EmailStr
 import logging
 
 from app.core.database import get_db
+from app.core.config import settings
 from app.models.user import User
 
 logger = logging.getLogger(__name__)
@@ -28,6 +30,24 @@ class UserSyncRequest(BaseModel):
                 "clerk_user_id": "user_2abc123xyz456def",
                 "email": "user@example.com",
                 "name": "John Doe"
+            }
+        }
+
+
+class AdminCreateUserRequest(BaseModel):
+    """Request body for creating a user via admin endpoint"""
+    email: EmailStr
+    password: str
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "email": "user@example.com",
+                "password": "StrongPassword123!",
+                "first_name": "John",
+                "last_name": "Doe"
             }
         }
 
@@ -146,3 +166,96 @@ async def get_user(
         )
     
     return user
+
+
+@router.post("/admin-create-user", response_model=UserResponse, status_code=201)
+async def admin_create_user(
+    user_data: AdminCreateUserRequest,
+    x_admin_secret: Optional[str] = Header(None),
+    db: Session = Depends(get_db)
+):
+    """
+    Create a new user in Clerk and sync to local database.
+    Requires ADMIN_SECRET in headers and CLERK_SECRET_KEY in environment.
+    """
+    # 1. Security Check
+    if not settings.ADMIN_SECRET:
+        logger.warning("ADMIN_SECRET is not set. Admin user creation endpoint is unsecured!")
+    elif x_admin_secret != settings.ADMIN_SECRET:
+        raise HTTPException(status_code=401, detail="Unauthorized: Invalid admin secret")
+
+    if not settings.CLERK_SECRET_KEY:
+        raise HTTPException(status_code=500, detail="CLERK_SECRET_KEY is not configured on the server")
+
+    # 2. Create user in Clerk
+    try:
+        async with httpx.AsyncClient() as client:
+            payload = {
+                "email_address": [user_data.email],
+                "password": user_data.password,
+            }
+            if user_data.first_name:
+                payload["first_name"] = user_data.first_name
+            if user_data.last_name:
+                payload["last_name"] = user_data.last_name
+
+            response = await client.post(
+                "https://api.clerk.com/v1/users",
+                json=payload,
+                headers={
+                    "Authorization": f"Bearer {settings.CLERK_SECRET_KEY}",
+                    "Content-Type": "application/json"
+                },
+                timeout=10.0
+            )
+            
+            if response.status_code != 200:
+                logger.error(f"Clerk API error: {response.text}")
+                raise HTTPException(
+                    status_code=response.status_code,
+                    detail=f"Failed to create user in Clerk: {response.text}"
+                )
+            
+            clerk_data = response.json()
+            clerk_user_id = clerk_data.get("id")
+            
+            if not clerk_user_id:
+                raise HTTPException(status_code=500, detail="Clerk API did not return an ID")
+
+    except httpx.RequestError as e:
+        logger.error(f"Request to Clerk API failed: {str(e)}")
+        raise HTTPException(status_code=500, detail="Failed to communicate with Clerk API")
+
+    # 3. Sync to local database
+    try:
+        # Check if user already exists in DB (just in case)
+        existing_user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
+        if existing_user:
+            return existing_user
+
+        full_name = None
+        if user_data.first_name or user_data.last_name:
+            parts = [p for p in (user_data.first_name, user_data.last_name) if p]
+            full_name = " ".join(parts)
+
+        is_first_user = db.query(User).count() == 0
+
+        user = User(
+            clerk_user_id=clerk_user_id,
+            email=user_data.email,
+            name=full_name,
+            is_admin=is_first_user,
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow()
+        )
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+
+        logger.info(f"Admin created new user successfully: {user.clerk_user_id} (ID: {user.id})")
+        return user
+
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"Database error during admin user creation: {str(e)}")
+        raise HTTPException(status_code=500, detail="Database error occurred")

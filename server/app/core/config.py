@@ -5,6 +5,7 @@ Configuration settings for GPS Tracking Server
 import os
 from pydantic_settings import BaseSettings
 from functools import lru_cache
+from typing import Optional
 
 
 class Settings(BaseSettings):
@@ -27,6 +28,8 @@ class Settings(BaseSettings):
     SECRET_KEY: str = "your-secret-key-change-this-in-production"
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+    CLERK_SECRET_KEY: Optional[str] = None
+    ADMIN_SECRET: Optional[str] = None
     
     # CORS
     CORS_ORIGINS: list = ["*"]
