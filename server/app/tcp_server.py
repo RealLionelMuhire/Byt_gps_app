@@ -6,7 +6,7 @@ Handles binary protocol communication
 
 import asyncio
 import logging
-from typing import Dict, Set
+from typing import Dict, Optional, Set
 from datetime import datetime
 import struct
 
@@ -369,14 +369,17 @@ class GPSTrackerConnection:
 
 class TCPServer:
     """TCP server for GPS trackers"""
-    
+
     def __init__(self, host: str = '0.0.0.0', port: int = 7018):
         self.host = host
         self.port = port
         self.server = None
         self.connections: Set[GPSTrackerConnection] = set()
         self.device_connections: Dict[str, GPSTrackerConnection] = {}
+        # Legacy set kept for compatibility; real WS management is in ws_manager
         self.websocket_clients: Set = set()
+        # Injected from app.state after startup (see main.py lifespan)
+        self.ws_manager: Optional[object] = None
     
     async def start(self):
         """Start TCP server"""
@@ -415,14 +418,38 @@ class TCPServer:
             logger.info(f"Unregistered device: {imei} (total: {len(self.device_connections)})")
     
     async def broadcast_location_update(self, device_id: int, data: Dict):
-        """Broadcast location update to WebSocket clients"""
-        # Will be implemented with WebSocket support
-        pass
-    
+        """Broadcast location update to all WebSocket subscribers of this device."""
+        if self.ws_manager is None:
+            return
+
+        ts = data.get("timestamp")
+        payload = {
+            "type": "location",
+            "device_id": device_id,
+            "latitude": data.get("latitude"),
+            "longitude": data.get("longitude"),
+            "speed": data.get("speed"),
+            "course": data.get("course"),
+            "timestamp": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
+            "gps_valid": data.get("gps_valid", True),
+        }
+        await self.ws_manager.broadcast(device_id, payload)
+
     async def broadcast_alarm(self, device_id: int, data: Dict):
-        """Broadcast alarm to WebSocket clients"""
-        # Will be implemented with WebSocket support
-        pass
+        """Broadcast alarm event to all WebSocket subscribers of this device."""
+        if self.ws_manager is None:
+            return
+
+        ts = data.get("timestamp")
+        payload = {
+            "type": "alarm",
+            "device_id": device_id,
+            "alarm_type": data.get("alarm_type"),
+            "latitude": data.get("latitude"),
+            "longitude": data.get("longitude"),
+            "timestamp": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
+        }
+        await self.ws_manager.broadcast(device_id, payload)
     
     async def send_command_to_device(self, imei: str, command: str, timeout: float = 10.0) -> Dict:
         """Send an ASCII command to a connected device and return the response."""

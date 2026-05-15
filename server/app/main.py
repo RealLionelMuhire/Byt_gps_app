@@ -15,6 +15,7 @@ from app.core.config import settings
 from app.core.database import init_db
 from app.tcp_server import TCPServer
 from app.api import devices, locations, auth, commands, trips
+from app.api import ws as ws_module
 from app import dashboard
 
 # Configure logging
@@ -86,6 +87,11 @@ async def lifespan(app: FastAPI):
     tcp_server = TCPServer(host=settings.HOST, port=settings.TCP_PORT)
     app.state.tcp_server = tcp_server
 
+    # Attach the WebSocket connection manager so the TCP server can push
+    # location updates to mobile clients in real time
+    app.state.ws_manager = ws_module.manager
+    tcp_server.ws_manager = ws_module.manager
+
     # Run TCP server in background task
     tcp_task = asyncio.create_task(tcp_server.start())
 
@@ -132,6 +138,7 @@ app.include_router(devices.router, prefix="/api/devices", tags=["devices"])
 app.include_router(commands.router, prefix="/api/devices", tags=["commands"])
 app.include_router(locations.router, prefix="/api/locations", tags=["locations"])
 app.include_router(trips.router, prefix="/api/trips", tags=["trips"])
+app.include_router(ws_module.router, tags=["websocket"])
 app.include_router(dashboard.router, tags=["dashboard"])
 
 
