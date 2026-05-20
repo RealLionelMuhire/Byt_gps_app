@@ -6,6 +6,7 @@ from pydantic import BaseModel
 import logging
 
 from app.core.database import get_db
+from app.core.auth import require_auth
 from app.models.device import Device
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,7 @@ async def send_raw_command(
     body: CommandRequest,
     request: Request,
     db: Session = Depends(get_db),
+    _: str = Depends(require_auth),
 ):
     """Send any SMS-compatible command to a connected device over TCP.
 
@@ -82,6 +84,7 @@ async def toggle_vibration_alarm(
     body: AlarmToggleRequest,
     request: Request,
     db: Session = Depends(get_db),
+    _: str = Depends(require_auth),
 ):
     """Enable or disable the vibration/shock alarm."""
     cmd = "vibrate123456 1" if body.enabled else "vibrate123456 0"
@@ -94,6 +97,7 @@ async def toggle_low_battery_alarm(
     body: AlarmToggleRequest,
     request: Request,
     db: Session = Depends(get_db),
+    _: str = Depends(require_auth),
 ):
     """Enable or disable the low battery alarm."""
     cmd = "lowbattery123456 on" if body.enabled else "lowbattery123456 off"
@@ -106,6 +110,7 @@ async def toggle_acc_alarm(
     body: AlarmToggleRequest,
     request: Request,
     db: Session = Depends(get_db),
+    _: str = Depends(require_auth),
 ):
     """Enable or disable the ACC (ignition) on/off alarm."""
     cmd = "acc123456" if body.enabled else "noacc123456"
@@ -118,6 +123,7 @@ async def toggle_overspeed_alarm(
     body: SpeedLimitRequest,
     request: Request,
     db: Session = Depends(get_db),
+    _: str = Depends(require_auth),
 ):
     """Enable or disable the overspeed alarm. Set speed_kmh for the threshold."""
     cmd = f"speed123456 {body.speed_kmh:03d}" if body.enabled else "nospeed123456"
@@ -130,6 +136,7 @@ async def toggle_displacement_alarm(
     body: MovementAlarmRequest,
     request: Request,
     db: Session = Depends(get_db),
+    _: str = Depends(require_auth),
 ):
     """Enable or disable the displacement/movement alarm. Set radius_meters for the trigger radius."""
     cmd = f"move123456 {body.radius_meters:04d}" if body.enabled else "nomove123456"
@@ -142,6 +149,7 @@ async def configure_sos_alarm(
     body: AlarmToggleRequest,
     request: Request,
     db: Session = Depends(get_db),
+    _: str = Depends(require_auth),
 ):
     """Configure SOS alarm mode. 0=off, 1=GPRS only, 2=GPRS+SMS, 3=GPRS+SMS+Call."""
     level = "1" if body.enabled else "0"
@@ -154,6 +162,7 @@ async def cut_fuel(
     device_id: int,
     request: Request,
     db: Session = Depends(get_db),
+    _: str = Depends(require_auth),
 ):
     """Cut oil/electricity (immobilize vehicle). Only works when speed < 20 km/h and GPS is on (doc §6.4)."""
     return await _send(device_id, "DYD,000000#", "cut fuel", request, db)
@@ -164,6 +173,7 @@ async def restore_fuel(
     device_id: int,
     request: Request,
     db: Session = Depends(get_db),
+    _: str = Depends(require_auth),
 ):
     """Restore oil/electricity (re-enable vehicle) (doc §6.5)."""
     return await _send(device_id, "HFYD,000000#", "restore fuel", request, db)
@@ -174,6 +184,7 @@ async def query_location(
     device_id: int,
     request: Request,
     db: Session = Depends(get_db),
+    _: str = Depends(require_auth),
 ):
     """Query current location from device (doc §6.3). Returns lat/lon/speed/course/datetime."""
     return await _send(device_id, "DWXX#", "query location", request, db)

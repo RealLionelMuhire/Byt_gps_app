@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from datetime import datetime
 
 from app.core.database import get_db
+from app.core.auth import require_auth
 from app.models.device import Device
 from app.models.location import Location
 from app.models.trip import Trip
@@ -74,18 +75,23 @@ async def list_devices(
     limit: int = Query(100, ge=1, le=1000),
     status: Optional[str] = Query(None, description="Filter by status: online, offline"),
     db: Session = Depends(get_db),
+    _: str = Depends(require_auth),
 ):
     """List GPS tracker devices."""
     query = db.query(Device)
     if status:
         query = query.filter(Device.status == status)
-    
+
     devices = query.offset(skip).limit(limit).all()
     return devices
 
 
 @router.get("/{device_id}/trips", response_model=List[TripResponse])
-async def list_device_trips(device_id: int, db: Session = Depends(get_db)):
+async def list_device_trips(
+    device_id: int,
+    db: Session = Depends(get_db),
+    _: str = Depends(require_auth),
+):
     """List trips for a device. Access trips via device_id."""
     device = db.query(Device).filter(Device.id == device_id).first()
     if not device:
@@ -100,34 +106,42 @@ async def list_device_trips(device_id: int, db: Session = Depends(get_db)):
 
 
 @router.get("/{device_id}", response_model=DeviceResponse)
-async def get_device(device_id: int, db: Session = Depends(get_db)):
+async def get_device(
+    device_id: int,
+    db: Session = Depends(get_db),
+    _: str = Depends(require_auth),
+):
     """Get device by ID"""
     device = db.query(Device).filter(Device.id == device_id).first()
-    
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
-    
     return device
 
 
 @router.get("/imei/{imei}", response_model=DeviceResponse)
-async def get_device_by_imei(imei: str, db: Session = Depends(get_db)):
+async def get_device_by_imei(
+    imei: str,
+    db: Session = Depends(get_db),
+    _: str = Depends(require_auth),
+):
     """Get device by IMEI"""
     device = db.query(Device).filter(Device.imei == imei).first()
-    
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
-    
     return device
 
 
 @router.post("/", response_model=DeviceResponse, status_code=201)
-async def create_device(device_data: DeviceCreate, db: Session = Depends(get_db)):
+async def create_device(
+    device_data: DeviceCreate,
+    db: Session = Depends(get_db),
+    _: str = Depends(require_auth),
+):
     """Create new device (manual registration)."""
     existing = db.query(Device).filter(Device.imei == device_data.imei).first()
     if existing:
         raise HTTPException(status_code=400, detail="Device with this IMEI already exists")
-    
+
     device = Device(
         imei=device_data.imei,
         name=device_data.name,
@@ -135,11 +149,11 @@ async def create_device(device_data: DeviceCreate, db: Session = Depends(get_db)
         user_id=None,
         status='offline'
     )
-    
+
     db.add(device)
     db.commit()
     db.refresh(device)
-    
+
     return device
 
 
@@ -147,36 +161,37 @@ async def create_device(device_data: DeviceCreate, db: Session = Depends(get_db)
 async def update_device(
     device_id: int,
     device_data: DeviceUpdate,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    _: str = Depends(require_auth),
 ):
     """Update device information"""
     device = db.query(Device).filter(Device.id == device_id).first()
-    
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
-    
+
     device.name = device_data.name
     if device_data.description is not None:
         device.description = device_data.description
     device.updated_at = datetime.utcnow()
-    
+
     db.commit()
     db.refresh(device)
-    
+
     return device
 
 
 @router.delete("/{device_id}", status_code=204)
-async def delete_device(device_id: int, db: Session = Depends(get_db)):
+async def delete_device(
+    device_id: int,
+    db: Session = Depends(get_db),
+    _: str = Depends(require_auth),
+):
     """Delete device"""
     device = db.query(Device).filter(Device.id == device_id).first()
-    
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
-    
     db.delete(device)
     db.commit()
-    
     return None
 
 
@@ -230,7 +245,8 @@ async def get_device_status(device_id: int, db: Session = Depends(get_db)):
 async def get_device_diagnostics(
     device_id: int,
     samples: int = Query(20, ge=2, le=200, description="Number of recent location points to analyze"),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    _: str = Depends(require_auth),
 ):
     """
     Diagnostics for a device, including recent location packet intervals.

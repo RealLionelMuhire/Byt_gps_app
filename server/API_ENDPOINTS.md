@@ -1,50 +1,102 @@
 # API Endpoints Documentation
 ## BYThron GPS Tracking Server
 
-**Base URL:** `http://your-server-address:port`  
-**API Version:** As defined in settings  
-**Last Updated:** February 8, 2026
+**Base URL:** `https://byatron.tech`
+**API Version:** 1.0.0
+**Last Updated:** May 2026
+
+> **Breaking change (May 2026):** All device, location, command, and trip endpoints now require a valid Clerk session token in the `Authorization` header. See [Authentication](#authentication) below.
 
 ---
 
 ## Table of Contents
 
-1. [Core Endpoints](#core-endpoints)
-2. [Authentication Endpoints](#authentication-endpoints)
-3. [Device Management Endpoints](#device-management-endpoints)
-4. [Location Tracking Endpoints](#location-tracking-endpoints)
-5. [Dashboard Endpoints](#dashboard-endpoints)
+1. [Authentication](#authentication)
+2. [Core / Health Endpoints](#core--health-endpoints)
+3. [Authentication Endpoints](#authentication-endpoints)
+4. [Device Management Endpoints](#device-management-endpoints)
+5. [Location & Tracking Endpoints](#location--tracking-endpoints)
+6. [Device Commands](#device-commands)
+7. [Trip Endpoints](#trip-endpoints)
+8. [WebSocket — Real-time Location Stream](#websocket--real-time-location-stream)
+9. [Dashboard (Web UI)](#dashboard-web-ui)
+10. [Error Reference](#error-reference)
+11. [Developer Notes](#developer-notes)
 
 ---
 
-## Core Endpoints
+## Authentication
 
-### 1. Root Endpoint
-**`GET /`**
+### How to Authenticate
 
-Returns basic server information and status.
+All **device**, **location**, **command**, and **trip** endpoints require a Clerk session JWT in the request header:
 
-**Response:**
+```
+Authorization: Bearer <clerk-session-token>
+```
+
+#### Getting the token
+
+**Mobile (React Native + Clerk):**
+```typescript
+const { getToken } = useAuth();
+const token = await getToken();
+// then attach:
+headers: { "Authorization": `Bearer ${token}` }
+```
+
+**Web (Clerk JS):**
+```javascript
+const token = await Clerk.session.getToken();
+```
+
+#### What happens without a token
+
+```
+HTTP 401 Unauthorized
+{ "detail": "Missing Authorization header. Expected: Bearer <clerk-token>" }
+```
+
+### Open Endpoints (no token required)
+
+| Endpoint | Reason |
+|---|---|
+| `GET /` | Health check |
+| `GET /health` | Health check |
+| `GET /dashboard` | Internal web UI |
+| `POST /api/auth/sync` | Bootstrap — called before a token is stored |
+| `POST /api/auth/admin-create-user` | Protected by `X-Admin-Secret` header instead |
+
+### Dev / Local Mode
+
+If `CLERK_SECRET_KEY` is not set in the server's `.env`, token verification is **skipped** and all requests are accepted. This is intentional to keep local development simple.
+
+---
+
+## Core / Health Endpoints
+
+### `GET /`
+
+Returns basic server information. No auth required.
+
+**Response (200):**
 ```json
 {
   "app": "GPS Tracking Server",
   "version": "1.0.0",
   "status": "running",
-  "tcp_port": 8000,
-  "http_port": 8080
+  "tcp_port": 7018,
+  "http_port": 8000
 }
 ```
 
-**Role:** System health check and information endpoint for clients to verify server connectivity and version.
-
 ---
 
-### 2. Health Check
-**`GET /health`**
+### `GET /health`
 
-Returns server health status and connection statistics.
+Server health and active connection counts. No auth required.
 
-**Response:**
+**Response (200):**
 ```json
 {
   "status": "healthy",
@@ -53,20 +105,17 @@ Returns server health status and connection statistics.
 }
 ```
 
-**Role:** Monitoring endpoint for load balancers and health check systems to verify server operation and get active connection counts.
-
 ---
 
 ## Authentication Endpoints
 
-All authentication endpoints are under `/api/auth` prefix.
+Prefix: `/api/auth`
 
-### 1. Sync User
-**`POST /api/auth/sync`**
+### `POST /api/auth/sync` *(open)*
 
-Creates or updates a user record based on Clerk authentication data.
+Creates or updates a user record from Clerk sign-in data. Called automatically by the mobile app after every sign-in.
 
-**Headers:** None required
+> **No `Authorization` header required.** This is the bootstrap call — a token has not yet been obtained when this is first called.
 
 **Request Body:**
 ```json
@@ -84,58 +133,71 @@ Creates or updates a user record based on Clerk authentication data.
   "clerk_user_id": "user_2abc123xyz456def",
   "email": "user@example.com",
   "name": "John Doe",
+  "is_admin": false,
   "created_at": "2026-02-08T10:00:00Z",
   "updated_at": "2026-02-08T10:00:00Z"
 }
 ```
 
-**Role:** Upsert operation that synchronizes Clerk-authenticated users to the local database. Called automatically when users sign in to the mobile app.
+> The **first user ever synced** to the database automatically receives `is_admin: true`.
 
 ---
 
-### 2. Get User
-**`GET /api/auth/user/{clerk_user_id}`**
+### `GET /api/auth/user/{clerk_user_id}` *(open)*
 
-Retrieves user information by Clerk user ID.
+Retrieves a user record by Clerk user ID.
 
 **Path Parameters:**
-- `clerk_user_id` (string): Clerk user identifier
+- `clerk_user_id` (string)
 
-**Response (200):**
+**Response (200):** Same shape as sync response above.
+
+**Errors:** `404` User not found
+
+---
+
+### `POST /api/auth/admin-create-user` *(admin only)*
+
+Creates a new user in Clerk and syncs them to the local database.
+
+**Required Header:**
+```
+X-Admin-Secret: <your-admin-secret>
+```
+
+**Request Body:**
 ```json
 {
-  "id": 1,
-  "clerk_user_id": "user_2abc123xyz456def",
-  "email": "user@example.com",
-  "name": "John Doe",
-  "created_at": "2026-02-08T10:00:00Z",
-  "updated_at": "2026-02-08T10:00:00Z"
+  "email": "newuser@example.com",
+  "password": "StrongPassword123!",
+  "first_name": "Jane",
+  "last_name": "Doe"
 }
 ```
 
-**Error Responses:**
-- `404`: User not found
+**Response (201):** Returns created user object.
 
-**Role:** Retrieve user profile information for display in mobile apps or admin interfaces.
+**Errors:**
+- `401` Invalid admin secret
+- `500` `CLERK_SECRET_KEY` not configured on server
 
 ---
 
 ## Device Management Endpoints
 
-All device endpoints are under `/api/devices` prefix.
+Prefix: `/api/devices`
+🔒 **All endpoints require `Authorization: Bearer <token>`**
 
-### 1. List Devices
-**`GET /api/devices/`**
+---
 
-Lists all GPS tracker devices with optional filtering.
+### `GET /api/devices/`
 
-**Headers (Optional):**
-- `X-Clerk-User-Id`: Filter devices by user ownership
+Lists all GPS tracker devices.
 
 **Query Parameters:**
-- `skip` (int, default: 0): Number of records to skip for pagination
-- `limit` (int, default: 100, max: 1000): Maximum number of records to return
-- `status` (string): Filter by status (`online`, `offline`)
+- `skip` (int, default: 0): Pagination offset
+- `limit` (int, default: 100, max: 1000): Page size
+- `status` (string, optional): Filter — `online` or `offline`
 
 **Response (200):**
 ```json
@@ -147,10 +209,10 @@ Lists all GPS tracker devices with optional filtering.
     "description": "Main delivery truck",
     "status": "online",
     "user_id": 1,
-    "last_connect": "2026-02-08T10:30:00Z",
-    "last_update": "2026-02-08T10:35:00Z",
-    "last_latitude": 40.7128,
-    "last_longitude": -74.0060,
+    "last_connect": "2026-05-20T10:30:00Z",
+    "last_update": "2026-05-20T10:35:00Z",
+    "last_latitude": -1.9403,
+    "last_longitude": 29.8739,
     "battery_level": 85,
     "gsm_signal": 25,
     "created_at": "2026-01-01T00:00:00Z"
@@ -158,147 +220,109 @@ Lists all GPS tracker devices with optional filtering.
 ]
 ```
 
-**Role:** Main device listing endpoint. Returns all devices or filters by user when authenticated. Used by mobile apps to show user's device list and by admin interfaces for fleet management.
-
 ---
 
-### 2. Get Device by ID
-**`GET /api/devices/{device_id}`**
+### `GET /api/devices/{device_id}`
 
-Retrieves detailed information about a specific device.
+Get a single device by ID.
 
 **Path Parameters:**
-- `device_id` (int): Device ID
+- `device_id` (int)
 
-**Response (200):** Same as single device object above
+**Response (200):** Single device object (same shape as above)
 
-**Error Responses:**
-- `404`: Device not found
-
-**Role:** Fetch detailed information about a specific device for device detail pages.
+**Errors:** `404`
 
 ---
 
-### 3. Get Device by IMEI
-**`GET /api/devices/imei/{imei}`**
+### `GET /api/devices/imei/{imei}`
 
-Retrieves device information using its IMEI number.
+Get a device by IMEI number.
 
 **Path Parameters:**
-- `imei` (string): Device IMEI number
+- `imei` (string): 15-digit IMEI
 
-**Response (200):** Same as device object
+**Response (200):** Single device object
 
-**Error Responses:**
-- `404`: Device not found
-
-**Role:** Alternative device lookup method using IMEI, useful for device registration workflows or when device ID is not yet known.
+**Errors:** `404`
 
 ---
 
-### 4. Create Device
-**`POST /api/devices/`**
+### `POST /api/devices/`
 
-Manually registers a new GPS tracker device.
-
-**Headers (Optional):**
-- `X-Clerk-User-Id`: Associates device with user
+Manually register a new GPS tracker device.
 
 **Request Body:**
 ```json
 {
   "imei": "123456789012345",
-  "name": "Company Vehicle 1",
+  "name": "Truck 01",
   "description": "Main delivery truck"
 }
 ```
 
-**Response (201):** Returns created device object
+**Response (201):** Created device object
 
-**Error Responses:**
-- `400`: Device with this IMEI already exists
-
-**Role:** Manual device registration. Allows users or admins to pre-register devices before first connection. Can automatically associate with user if authenticated.
+**Errors:** `400` IMEI already exists
 
 ---
 
-### 5. Update Device
-**`PUT /api/devices/{device_id}`**
+### `PUT /api/devices/{device_id}`
 
-Updates device information (name and description).
+Update device name or description.
 
 **Path Parameters:**
-- `device_id` (int): Device ID
+- `device_id` (int)
 
 **Request Body:**
 ```json
 {
-  "name": "Updated Vehicle Name",
+  "name": "Updated Name",
   "description": "Updated description"
 }
 ```
 
-**Response (200):** Returns updated device object
+**Response (200):** Updated device object
 
-**Error Responses:**
-- `404`: Device not found
-
-**Role:** Edit device metadata like friendly names and descriptions. Used in device settings pages.
+**Errors:** `404`
 
 ---
 
-### 6. Delete Device
-**`DELETE /api/devices/{device_id}`**
+### `DELETE /api/devices/{device_id}`
 
-Removes a device from the system.
+Permanently remove a device.
 
 **Path Parameters:**
-- `device_id` (int): Device ID
+- `device_id` (int)
 
 **Response (204):** No content
 
-**Error Responses:**
-- `404`: Device not found
+**Errors:** `404`
 
-**Role:** Permanent device removal. Use with caution as this may cascade delete location history depending on database constraints.
+> ⚠️ This may cascade-delete location history depending on database constraints.
 
 ---
 
-### 7. Assign Device to User
-**`POST /api/devices/{device_id}/assign`**
+### `POST /api/devices/{device_id}/assign`
 
-Associates a device with a specific user.
-
-**Path Parameters:**
-- `device_id` (int): Device ID
-
-**Headers (Required):**
-- `X-Clerk-User-Id`: User to assign device to
+Assign a device to the first available user in the database.
 
 **Response (200):**
 ```json
 {
   "message": "Device assigned successfully",
   "device_id": 1,
-  "user_id": 1,
-  "clerk_user_id": "user_2abc123xyz456def"
+  "user_id": 1
 }
 ```
 
-**Error Responses:**
-- `404`: Device or user not found
-
-**Role:** Device ownership management. Allows assigning unassigned devices to users or transferring device ownership.
+**Errors:** `404` Device or user not found
 
 ---
 
-### 8. Get Device Status
-**`GET /api/devices/{device_id}/status`**
+### `GET /api/devices/{device_id}/status`
 
-Retrieves current device status summary.
-
-**Path Parameters:**
-- `device_id` (int): Device ID
+Quick status summary — battery, signal, last position.
 
 **Response (200):**
 ```json
@@ -307,79 +331,103 @@ Retrieves current device status summary.
   "imei": "123456789012345",
   "name": "Company Vehicle 1",
   "status": "online",
-  "last_update": "2026-02-08T10:35:00Z",
+  "last_update": "2026-05-20T10:35:00Z",
   "battery_level": 85,
   "gsm_signal": 25,
   "location": {
-    "latitude": 40.7128,
-    "longitude": -74.0060
+    "latitude": -1.9403,
+    "longitude": 29.8739
   }
 }
 ```
 
-**Error Responses:**
-- `404`: Device not found
+---
 
-**Role:** Quick status check for devices. Returns essential operational data like battery, signal, and last known position. Useful for dashboard widgets.
+### `GET /api/devices/{device_id}/diagnostics`
+
+Detailed diagnostics including recent location packet timing statistics.
+
+**Query Parameters:**
+- `samples` (int, default: 20, max: 200): Number of recent location points to analyze
+
+**Response (200):**
+```json
+{
+  "device_id": 1,
+  "imei": "123456789012345",
+  "status": "online",
+  "last_connect": "2026-05-20T10:30:00Z",
+  "last_update": "2026-05-20T10:35:00Z",
+  "last_location_timestamp": "2026-05-20T10:34:58Z",
+  "seconds_since_last_update": 12,
+  "sending_status": "Sending",
+  "location_intervals": {
+    "samples": 19,
+    "avg_seconds": 30.2,
+    "min_seconds": 28.0,
+    "max_seconds": 35.5,
+    "last_interval_seconds": 29.8
+  }
+}
+```
+
+`sending_status` values:
+- `"Sending"` — packet received within `DEVICE_SENDING_STALE_SECONDS` (default 120s)
+- `"Stale"` — no packet for 120–300s
+- `"Offline (timed out)"` — no packet for over 300s
+- `"No data"` — device has never sent a packet
 
 ---
 
-## Location Tracking Endpoints
+### `GET /api/devices/{device_id}/trips`
 
-All location endpoints are under `/api/locations` prefix.
+List all trips for a device. See [Trip Endpoints](#trip-endpoints) for the full trip object shape.
 
-### 1. Get Latest Location
-**`GET /api/locations/{device_id}/latest`**
+---
 
-Retrieves the most recent location data for a device.
+## Location & Tracking Endpoints
 
-**Path Parameters:**
-- `device_id` (int): Device ID
+Prefix: `/api/locations`
+🔒 **All endpoints require `Authorization: Bearer <token>`**
 
-**Headers (Optional):**
-- `X-Clerk-User-Id`: Verifies user has access to device
+> **Note:** For live tracking, use the [WebSocket endpoint](#websocket--real-time-location-stream) instead of polling this API.
+
+---
+
+### `GET /api/locations/{device_id}/latest`
+
+Most recent location point for a device.
 
 **Response (200):**
 ```json
 {
   "id": 12345,
   "device_id": 1,
-  "latitude": 40.7128,
-  "longitude": -74.0060,
+  "latitude": -1.9403,
+  "longitude": 29.8739,
   "speed": 45.5,
   "course": 180,
   "satellites": 12,
   "gps_valid": true,
   "is_alarm": false,
   "alarm_type": null,
-  "timestamp": "2026-02-08T10:35:00Z",
-  "received_at": "2026-02-08T10:35:02Z"
+  "timestamp": "2026-05-20T10:35:00Z",
+  "received_at": "2026-05-20T10:35:02Z"
 }
 ```
 
-**Error Responses:**
-- `403`: Access denied to this device
-- `404`: Device or location data not found
-
-**Role:** Primary endpoint for real-time device location. Used by mobile apps and dashboards to show current device position on maps.
+**Errors:** `404` No location data found
 
 ---
 
-### 2. Get Location History
-**`GET /api/locations/{device_id}/history`**
+### `GET /api/locations/{device_id}/history`
 
-Retrieves historical location data for route playback and analysis.
-
-**Path Parameters:**
-- `device_id` (int): Device ID
-
-**Headers (Optional):**
-- `X-Clerk-User-Id`: Verifies user access
+Historical location points for route playback and analysis.
 
 **Query Parameters:**
-- `start_time` (datetime, optional): Start time in UTC (default: 24 hours ago)
-- `end_time` (datetime, optional): End time in UTC (default: now)
-- `limit` (int, default: 1000, max: 10000): Maximum points to return
+- `start_time` (datetime, optional, default: 24h ago): ISO 8601 UTC
+- `end_time` (datetime, optional, default: now): ISO 8601 UTC
+- `limit` (int, default: 1000, max: 10000)
 
 **Response (200):**
 ```json
@@ -388,285 +436,422 @@ Retrieves historical location data for route playback and analysis.
   "device_name": "Company Vehicle 1",
   "device_imei": "123456789012345",
   "total_points": 1500,
-  "locations": [
-    {
-      "id": 12345,
-      "device_id": 1,
-      "latitude": 40.7128,
-      "longitude": -74.0060,
-      "speed": 45.5,
-      "course": 180,
-      "satellites": 12,
-      "gps_valid": true,
-      "is_alarm": false,
-      "alarm_type": null,
-      "timestamp": "2026-02-08T10:35:00Z",
-      "received_at": "2026-02-08T10:35:02Z"
-    }
-  ]
+  "locations": [ /* array of location objects */ ]
 }
 ```
 
-**Error Responses:**
-- `403`: Access denied
-- `404`: Device not found
+---
 
-**Role:** Historical tracking data for route visualization, trip analysis, and reporting. Essential for fleet management and activity logs.
+### `GET /api/locations/{device_id}/route`
+
+Route as a **GeoJSON FeatureCollection** — ready for Mapbox, Leaflet, or Google Maps.
+
+**Query Parameters:**
+- `start_time` (datetime, optional, default: 24h ago)
+- `end_time` (datetime, optional, default: now)
+- `simplify` (bool, default: false): Reduce point count for large routes
+
+**Response (200):** GeoJSON FeatureCollection where each Feature is a GPS point.
 
 ---
 
-### 3. Get Device Route
-**`GET /api/locations/{device_id}/route`**
+### `GET /api/locations/{device_id}/route-line`
 
-Returns route data in GeoJSON format optimized for map display.
-
-**Path Parameters:**
-- `device_id` (int): Device ID
-
-**Headers (Optional):**
-- `X-Clerk-User-Id`: Verifies user access
+Route as a **GeoJSON LineString** with aligned timestamp/speed/course arrays. Useful for animated route playback.
 
 **Query Parameters:**
-- `start_time` (datetime, optional): Start time in UTC (default: 24 hours ago)
-- `end_time` (datetime, optional): End time in UTC (default: now)
-- `simplify` (bool, default: false): Simplify route to reduce points
+- `start_time` (datetime, optional, default: 24h ago)
+- `end_time` (datetime, optional, default: now)
 
 **Response (200):**
 ```json
 {
-  "type": "FeatureCollection",
-  "features": [
-    {
-      "type": "Feature",
-      "geometry": {
-        "type": "Point",
-        "coordinates": [-74.0060, 40.7128]
-      },
-      "properties": {
-        "timestamp": "2026-02-08T10:35:00Z",
-        "speed": 45.5,
-        "course": 180,
-        "is_alarm": false
-      }
-    }
-  ],
+  "type": "LineString",
+  "coordinates": [[-74.006, 40.7128], [-74.005, 40.7130]],
+  "timestamps": ["2026-05-20T10:00:00Z", "2026-05-20T10:00:30Z"],
+  "speeds": [45.5, 47.0],
+  "courses": [180, 182],
   "properties": {
     "device_id": 1,
     "device_name": "Company Vehicle 1",
-    "start_time": "2026-02-07T10:35:00Z",
-    "end_time": "2026-02-08T10:35:00Z",
-    "point_count": 1500
+    "device_imei": "123456789012345",
+    "start_time": "2026-05-20T09:00:00Z",
+    "end_time": "2026-05-20T10:35:00Z",
+    "point_count": 150
   }
 }
 ```
 
-**Error Responses:**
-- `403`: Access denied
-- `404`: Device not found
-
-**Role:** GeoJSON formatted route data for direct consumption by mapping libraries (Leaflet, Mapbox, Google Maps). Optimized for visualization.
-
 ---
 
-### 4. Get Device Alarms
-**`GET /api/locations/{device_id}/alarms`**
+### `GET /api/locations/{device_id}/distance`
 
-Retrieves alarm events (SOS, geofence violations, etc.) for a device.
-
-**Path Parameters:**
-- `device_id` (int): Device ID
+Total distance covered by a device in a given time range (Haversine formula, GPS-valid points only).
 
 **Query Parameters:**
-- `start_time` (datetime, optional): Start time in UTC (default: 7 days ago)
-- `end_time` (datetime, optional): End time in UTC (default: now)
-- `limit` (int, default: 100, max: 1000): Maximum alarms to return
-
-**Response (200):** Array of location objects where `is_alarm: true`
-
-**Role:** Security and alert monitoring. Shows SOS button presses, geofence breaches, and other alarm events. Critical for emergency response.
-
----
-
-### 5. Get Nearby Devices
-**`GET /api/locations/nearby`**
-
-Finds devices within a specified radius of a location.
-
-**Query Parameters:**
-- `latitude` (float, required): Center latitude (-90 to 90)
-- `longitude` (float, required): Center longitude (-180 to 180)
-- `radius_km` (float, default: 10, max: 100): Search radius in kilometers
+- `start_time` (datetime, optional, default: 24h ago)
+- `end_time` (datetime, optional, default: now)
 
 **Response (200):**
 ```json
 {
-  "center": {
-    "latitude": 40.7128,
-    "longitude": -74.0060
-  },
+  "device_id": 1,
+  "device_name": "Company Vehicle 1",
+  "device_imei": "123456789012345",
+  "start_time": "2026-05-20T09:00:00Z",
+  "end_time": "2026-05-20T10:35:00Z",
+  "point_count": 150,
+  "total_distance_km": 48.32
+}
+```
+
+---
+
+### `GET /api/locations/{device_id}/alarms`
+
+Alarm events (SOS, shock, low battery, overspeed, etc.) for a device.
+
+**Query Parameters:**
+- `start_time` (datetime, optional, default: 7 days ago)
+- `end_time` (datetime, optional, default: now)
+- `limit` (int, default: 100, max: 1000)
+
+**Response (200):** Array of location objects where `is_alarm: true` and `alarm_type` is set.
+
+---
+
+### `GET /api/locations/nearby` *(no auth required)*
+
+Find devices within a radius of a coordinate. Useful for dispatch or proximity search.
+
+**Query Parameters:**
+- `latitude` (float, required): Center latitude (-90 to 90)
+- `longitude` (float, required): Center longitude (-180 to 180)
+- `radius_km` (float, default: 10, max: 100)
+
+**Response (200):**
+```json
+{
+  "center": { "latitude": -1.94, "longitude": 29.87 },
   "radius_km": 10,
   "devices_found": 3,
   "devices": [
     {
       "device_id": 1,
-      "device_name": "Company Vehicle 1",
+      "device_name": "Truck 01",
       "imei": "123456789012345",
-      "latitude": 40.7130,
-      "longitude": -74.0062,
+      "latitude": -1.942,
+      "longitude": 29.875,
       "distance_km": 0.25,
-      "last_update": "2026-02-08T10:35:00Z"
+      "last_update": "2026-05-20T10:35:00Z"
     }
   ]
 }
 ```
 
-**Role:** Proximity search for fleet coordination. Find nearby vehicles for dispatch optimization or collaborative operations.
+---
+
+## Device Commands
+
+Prefix: `/api/devices`
+🔒 **All endpoints require `Authorization: Bearer <token>`**
+
+Commands are sent to the GPS device over the existing TCP connection using Protocol 0x80.
+No SMS balance is needed. The device replies via Protocol 0x15.
+
+> ⚠️ Fuel cut commands only work when speed < 20 km/h and GPS is active.
 
 ---
 
-## Dashboard Endpoints
+### `POST /api/devices/{device_id}/command`
 
-### 1. Web Dashboard
-**`GET /dashboard`**
+Send any raw SMS-compatible command string.
 
-Renders a web-based dashboard showing all devices with their status, location, and activity.
+**Request Body:**
+```json
+{ "command": "STATUS#" }
+```
 
-**Response:** HTML page
-
-**Features Displayed:**
-- Device list with names and IMEI numbers
-- Connection status (online/offline)
-- Battery levels with icons 🔋🪫
-- GSM signal strength with bars 📶
-- Last known location coordinates
-- Last update timestamp
-- Movement status (moving, stationary, never moved)
-- Current speed and satellite count
-- Total device count
-- Online device count
-
-**Role:** Human-readable web interface for monitoring fleet status. Accessible from any web browser without authentication (suitable for internal networks or add authentication as needed).
-
----
-
-## Authentication & Authorization
-
-### Clerk Integration
-
-The API uses Clerk for user authentication with the following pattern:
-
-1. **User Sync**: Mobile app calls `/api/auth/sync` after user signs in with Clerk
-2. **Header-Based Auth**: API endpoints accept optional `X-Clerk-User-Id` header
-3. **Access Control**: When header is provided, endpoints filter data by user ownership
-4. **Backward Compatibility**: Endpoints work without auth headers (returns all data)
-
-### Protected Resources
-
-Devices and locations can be filtered by user:
-- Devices: List and create operations respect `X-Clerk-User-Id`
-- Locations: Read operations verify device ownership when authenticated
-- Assignment: Devices can be explicitly assigned to users
-
----
-
-## Error Responses
-
-All endpoints follow standard HTTP status codes:
-
-- **200 OK**: Successful GET/PUT/POST
-- **201 Created**: Successful resource creation
-- **204 No Content**: Successful DELETE
-- **400 Bad Request**: Invalid request data
-- **403 Forbidden**: Access denied to resource
-- **404 Not Found**: Resource doesn't exist
-- **500 Internal Server Error**: Server-side error
-
-Error response format:
+**Response (200):**
 ```json
 {
-  "detail": "Error message describing what went wrong"
+  "device_id": 1,
+  "imei": "123456789012345",
+  "command_sent": "STATUS#",
+  "device_response": "Lat:...",
+  "note": null
+}
+```
+
+If the device doesn't reply within 10s, `device_response` will be `null` and `note` will explain the command was sent but not acknowledged.
+
+**Errors:** `409` Device not connected via TCP
+
+---
+
+### Convenience Command Endpoints
+
+| Method | Endpoint | Description |
+|---|---|---|
+| `POST` | `/{device_id}/alarm/vibration` | Toggle shock/vibration alarm |
+| `POST` | `/{device_id}/alarm/lowbattery` | Toggle low battery alarm |
+| `POST` | `/{device_id}/alarm/acc` | Toggle ACC (ignition) alarm |
+| `POST` | `/{device_id}/alarm/overspeed` | Toggle overspeed alarm |
+| `POST` | `/{device_id}/alarm/displacement` | Toggle movement/displacement alarm |
+| `POST` | `/{device_id}/alarm/sos` | Configure SOS alarm mode |
+| `POST` | `/{device_id}/fuel/cut` | Cut oil/electricity (immobilize) |
+| `POST` | `/{device_id}/fuel/restore` | Restore oil/electricity |
+| `POST` | `/{device_id}/query/location` | Request current location from device |
+| `POST` | `/{device_id}/query/status` | Request battery/GPS/GSM/ACC status |
+
+**Request body for toggle endpoints:**
+```json
+{ "enabled": true }
+```
+
+**Request body for overspeed:**
+```json
+{ "enabled": true, "speed_kmh": 100 }
+```
+
+**Request body for displacement alarm:**
+```json
+{ "enabled": true, "radius_meters": 200 }
+```
+
+---
+
+## Trip Endpoints
+
+Prefix: `/api/trips`
+🔒 **All endpoints require `Authorization: Bearer <token>`**
+
+Trips are automatically created when a device starts moving and ended when it stops (or disconnects).
+
+---
+
+### `GET /api/trips/`
+
+List all trips, newest first.
+
+**Query Parameters:**
+- `device_id` (int, optional): Filter by device
+- `skip` (int, default: 0)
+- `limit` (int, default: 50, max: 200)
+
+**Response (200):** Array of trip objects.
+
+---
+
+### `GET /api/trips/{trip_id}`
+
+Get a single trip by ID.
+
+---
+
+### `GET /api/trips/{trip_id}/route`
+
+Full route (LineString with timestamps) for a specific trip. Same shape as `/api/locations/{device_id}/route-line`.
+
+---
+
+### Trip Object Shape
+
+```json
+{
+  "id": 42,
+  "device_id": 1,
+  "start_time": "2026-05-20T08:00:00Z",
+  "end_time": "2026-05-20T09:15:00Z",
+  "start_latitude": -1.9403,
+  "start_longitude": 29.8739,
+  "end_latitude": -1.9870,
+  "end_longitude": 30.1040,
+  "distance_km": 28.4,
+  "duration_seconds": 4500,
+  "created_at": "2026-05-20T09:15:01Z"
 }
 ```
 
 ---
 
-## Rate Limiting
+## WebSocket — Real-time Location Stream
 
-Not currently implemented. Consider adding rate limiting for production deployments.
+**Endpoint:** `wss://byatron.tech/ws/locations/{device_id}?token=<clerk-session-token>`
+
+Connect to receive real-time GPS location pushes the moment a packet arrives from the device. **Replaces polling `/api/locations/{device_id}/latest`.**
+
+### Connection
+
+```
+wss://byatron.tech/ws/locations/1?token=<clerk-jwt>
+```
+
+The `token` query parameter is the same Clerk session JWT used for REST endpoints.
+
+### Messages from Server → Client
+
+**Location update** (sent on every GPS packet from the device):
+```json
+{
+  "type": "location",
+  "device_id": 1,
+  "latitude": -1.9403,
+  "longitude": 29.8739,
+  "speed": 45.5,
+  "course": 180,
+  "timestamp": "2026-05-20T10:35:00Z",
+  "gps_valid": true
+}
+```
+
+**Alarm event** (sent when the device triggers an alarm):
+```json
+{
+  "type": "alarm",
+  "device_id": 1,
+  "alarm_type": "SOS",
+  "latitude": -1.9403,
+  "longitude": 29.8739,
+  "timestamp": "2026-05-20T10:35:00Z"
+}
+```
+
+### Messages from Client → Server
+
+Send any text string as a keep-alive ping every ~25 seconds to prevent NAT/proxy timeouts:
+```
+ping
+```
+The server does not reply to pings.
+
+### Error Codes
+
+| Code | Reason |
+|---|---|
+| `4001` | Unauthorized — token missing or invalid |
+| `1000` | Normal closure |
+| `1001` | Server going away |
+
+### JavaScript / TypeScript Example
+
+```typescript
+const token = await clerkSession.getToken();
+const ws = new WebSocket(
+  `wss://byatron.tech/ws/locations/1?token=${encodeURIComponent(token)}`
+);
+
+ws.onmessage = (event) => {
+  const msg = JSON.parse(event.data);
+  if (msg.type === "location") {
+    console.log(`Device at ${msg.latitude}, ${msg.longitude} @ ${msg.speed} km/h`);
+  }
+  if (msg.type === "alarm") {
+    console.warn(`ALARM: ${msg.alarm_type}`);
+  }
+};
+
+// Keep-alive
+setInterval(() => { if (ws.readyState === WebSocket.OPEN) ws.send("ping"); }, 25_000);
+```
+
+### Nginx Configuration
+
+If running behind nginx, ensure WebSocket upgrade headers are proxied:
+
+```nginx
+location /ws/ {
+    proxy_pass http://127.0.0.1:8000;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header Host $host;
+    proxy_read_timeout 300s;
+}
+```
 
 ---
 
-## CORS Configuration
+## Dashboard (Web UI)
 
-CORS is enabled for all origins by default. Configure `CORS_ORIGINS` in settings for production.
+### `GET /dashboard`
 
----
+Browser-based fleet overview. No authentication required. Accessible from any web browser.
 
-## TCP Connection
-
-In addition to HTTP APIs, the server runs a TCP server on port 8000 (configurable) that:
-- Accepts connections from GPS tracker devices
-- Parses proprietary GPS protocols
-- Automatically creates/updates device records
-- Stores location data in real-time
-- Updates device status and last-seen timestamps
-
-The TCP server runs in the background alongside the HTTP API server.
+**Displays:**
+- All device names and IMEIs
+- Online/offline status
+- Battery level and GSM signal
+- Last known coordinates
+- Last update timestamp
+- Speed and satellite count
 
 ---
 
-## Notes for Developers
+## Error Reference
 
-1. **Database Sessions**: All endpoints use SQLAlchemy ORM with automatic session management via `Depends(get_db)`
+| HTTP Code | Meaning |
+|---|---|
+| `200 OK` | Success |
+| `201 Created` | Resource created |
+| `204 No Content` | Successful DELETE |
+| `400 Bad Request` | Invalid input data |
+| `401 Unauthorized` | Missing or invalid `Authorization` header |
+| `403 Forbidden` | Valid token but insufficient permissions |
+| `404 Not Found` | Resource does not exist |
+| `409 Conflict` | Command failed (e.g. device not connected) |
+| `422 Unprocessable Entity` | Malformed request body or missing required field |
+| `503 Service Unavailable` | TCP server not running |
+| `500 Internal Server Error` | Server-side error |
 
-2. **Timestamps**: All datetime values are in UTC and use ISO 8601 format
-
-3. **Pagination**: List endpoints support `skip` and `limit` for pagination
-
-4. **Optional Filtering**: Many endpoints accept optional query parameters for filtering
-
-5. **User Context**: Most endpoints can operate with or without user context for flexibility
-
-6. **Auto-Registration**: Devices auto-register when they first connect via TCP
-
-7. **Real-time Updates**: Device status, battery, and location are updated automatically by TCP server
-
-8. **GeoJSON Support**: Route endpoints return standard GeoJSON for easy map integration
+**Error body format:**
+```json
+{ "detail": "Human-readable error message" }
+```
 
 ---
 
-## Architecture Overview
+## Developer Notes
+
+1. **All timestamps are UTC** in ISO 8601 format (`2026-05-20T10:35:00Z`)
+
+2. **Pagination** — list endpoints support `skip` + `limit`
+
+3. **Devices auto-register** when a GPS tracker first connects over TCP — no manual registration needed for hardware devices
+
+4. **Real-time vs polling** — use the WebSocket endpoint for live tracking; the REST `/latest` endpoint is available for one-off reads
+
+5. **Token expiry** — Clerk tokens expire. Reconnect the WebSocket with a fresh token on `4001` close code. The mobile SDK handles REST token refresh automatically
+
+6. **CORS** — configured for all origins by default. Set `CORS_ORIGINS` in `.env` to restrict for production
+
+7. **Rate limiting** — not currently implemented
+
+---
+
+## Architecture
 
 ```
 Mobile App / Web Client
-        ↓
-   HTTP API Server (FastAPI)
-   ├── Authentication (/api/auth)
-   ├── Devices (/api/devices)
-   ├── Locations (/api/locations)
-   └── Dashboard (/dashboard)
-        ↓
-   PostgreSQL Database
-        ↑
-   TCP Server (Background)
-        ↑
-  GPS Tracker Devices
+        │
+        ├── REST (HTTPS)      →  FastAPI HTTP Server (port 8000)
+        │                          ├── /api/auth     (open)
+        │                          ├── /api/devices  🔒
+        │                          ├── /api/locations 🔒
+        │                          ├── /api/commands  🔒
+        │                          ├── /api/trips     🔒
+        │                          └── /dashboard     (open)
+        │
+        └── WebSocket (WSS)   →  /ws/locations/{device_id}?token=...  🔒
+                                         │
+                                         ▼
+                                  PostgreSQL Database
+                                         ▲
+                                  TCP Server (port 7018)
+                                         ▲
+                                  GPS Tracker Devices
 ```
 
 ---
 
-## Future Enhancements
-
-Potential additions not yet implemented:
-- WebSocket support for real-time location streaming
-- Geofence management endpoints
-- User management (CRUD operations beyond sync)
-- Notification/alert configuration
-- Trip/route analysis endpoints
-- Bulk device operations
-- Export capabilities (CSV, GPX)
-- Advanced analytics endpoints
-
----
-
-*This documentation reflects the current state of the API as of February 8, 2026.*
+*Last updated: May 2026 — reflects WebSocket streaming, Clerk JWT authentication on all protected routes, and trip endpoints.*

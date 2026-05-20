@@ -8,6 +8,7 @@ from pydantic import BaseModel
 from math import radians, cos, sin, asin, sqrt
 
 from app.core.database import get_db
+from app.core.auth import require_auth
 from app.models.location import Location
 from app.models.device import Device
 
@@ -142,17 +143,21 @@ class RouteLineStringResponse(BaseModel):
 
 
 @router.get("/{device_id}/latest", response_model=LocationResponse)
-async def get_latest_location(device_id: int, db: Session = Depends(get_db)):
+async def get_latest_location(
+    device_id: int,
+    db: Session = Depends(get_db),
+    _: str = Depends(require_auth),
+):
     """Get latest location for a device."""
     verify_device_access(device_id, None, db)
-    
+
     location = db.query(Location).filter(
         Location.device_id == device_id
     ).order_by(Location.timestamp.desc()).first()
-    
+
     if not location:
         raise HTTPException(status_code=404, detail="No location data found for device")
-    
+
     return location
 
 
@@ -163,6 +168,7 @@ async def get_location_history(
     end_time: Optional[datetime] = Query(None, description="End time (UTC)"),
     limit: int = Query(1000, ge=1, le=10000, description="Maximum number of points"),
     db: Session = Depends(get_db),
+    _: str = Depends(require_auth),
 ):
     """Get location history for a device."""
     device = verify_device_access(device_id, None, db)
@@ -203,6 +209,7 @@ async def get_device_route(
     end_time: Optional[datetime] = Query(None),
     simplify: bool = Query(False, description="Simplify route to reduce points"),
     db: Session = Depends(get_db),
+    _: str = Depends(require_auth),
 ):
     """Get device route (optimized for map display)."""
     device = verify_device_access(device_id, None, db)
@@ -259,6 +266,7 @@ async def get_device_distance(
     start_time: Optional[datetime] = Query(None, description="Start time (UTC)"),
     end_time: Optional[datetime] = Query(None, description="End time (UTC)"),
     db: Session = Depends(get_db),
+    _: str = Depends(require_auth),
 ):
     """
     Get total distance covered by a device within a time range.
@@ -294,6 +302,7 @@ async def get_device_route_line(
     start_time: Optional[datetime] = Query(None, description="Start time (UTC)"),
     end_time: Optional[datetime] = Query(None, description="End time (UTC)"),
     db: Session = Depends(get_db),
+    _: str = Depends(require_auth),
 ):
     """
     Get device route as a LineString with timestamps aligned to coordinates.
@@ -318,7 +327,8 @@ async def get_device_alarms(
     start_time: Optional[datetime] = Query(None),
     end_time: Optional[datetime] = Query(None),
     limit: int = Query(100, ge=1, le=1000),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    _: str = Depends(require_auth),
 ):
     """Get alarm events for a device"""
     query = db.query(Location).filter(
