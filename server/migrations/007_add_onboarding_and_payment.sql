@@ -1,10 +1,12 @@
--- Update users table with new onboarding and phone fields
-ALTER TABLE users ADD COLUMN IF NOT EXISTS phone VARCHAR(30);
+-- Update users table with new onboarding fields
+ALTER TABLE users ADD COLUMN IF NOT EXISTS first_name VARCHAR(255);
+ALTER TABLE users ADD COLUMN IF NOT EXISTS last_name VARCHAR(255);
 ALTER TABLE users ADD COLUMN IF NOT EXISTS role VARCHAR(20) NOT NULL DEFAULT 'owner';
 ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarding_step INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarding_complete BOOLEAN NOT NULL DEFAULT FALSE;
-ALTER TABLE users ALTER COLUMN email DROP NOT NULL;
-CREATE INDEX IF NOT EXISTS ix_users_phone ON users (phone);
+
+-- If 'name' column exists from old schema, drop it or rename it
+ALTER TABLE users DROP COLUMN IF EXISTS name;
 
 -- Create vehicles table
 CREATE TABLE IF NOT EXISTS vehicles (

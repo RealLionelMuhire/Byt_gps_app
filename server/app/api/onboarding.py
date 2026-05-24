@@ -42,10 +42,10 @@ PLAN_DAYS   = {"trial": 14, "basic": 30,  "fleet": 30}
 # ── Schemas ───────────────────────────────────────────────────────────────────
 
 class UserCreateRequest(BaseModel):
-    name:  str
-    phone: Optional[str] = None
-    email: Optional[str] = None
-    role:  Optional[str] = "owner"
+    firstName: str
+    lastName:  str
+    email:     str
+    role:      Optional[str] = "owner"
 
 
 class UserResponse(BaseModel):
@@ -108,18 +108,18 @@ async def create_or_update_user(
     Upsert user profile after OTP verification.
     Idempotent — safe to call multiple times (returns existing user without error).
     """
-    if not body.name:
-        raise HTTPException(status_code=400, detail="name is required")
+    if not body.firstName or not body.lastName or not body.email:
+        raise HTTPException(status_code=400, detail="firstName, lastName, and email are required")
 
     try:
         existing = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
 
         if existing:
             # Idempotent update
-            existing.name  = body.name
-            existing.phone = body.phone
-            existing.email = body.email or existing.email
-            existing.role  = body.role or "owner"
+            existing.first_name = body.firstName
+            existing.last_name  = body.lastName
+            existing.email      = body.email
+            existing.role       = body.role or "owner"
             existing.updated_at = datetime.utcnow()
             db.commit()
             db.refresh(existing)
@@ -131,9 +131,9 @@ async def create_or_update_user(
 
         user = User(
             clerk_user_id=clerk_user_id,
-            phone=body.phone,
+            first_name=body.firstName,
+            last_name=body.lastName,
             email=body.email,
-            name=body.name,
             role=body.role or "owner",
             is_admin=is_first,
             onboarding_step=4,

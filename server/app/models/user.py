@@ -13,8 +13,12 @@ class User(Base):
     id = Column(Integer, primary_key=True, index=True)
     clerk_user_id = Column(String(255), unique=True, nullable=False, index=True)
     email = Column(String(255), nullable=False, index=True)
-    name = Column(String(255), nullable=True)
+    first_name = Column(String(255), nullable=False)
+    last_name = Column(String(255), nullable=False)
+    role = Column(String(20), default="owner", nullable=False)
     is_admin = Column(Boolean, default=False, nullable=False)
+    onboarding_step = Column(Integer, default=0, nullable=False)
+    onboarding_complete = Column(Boolean, default=False, nullable=False)
     
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
