@@ -30,6 +30,7 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
     CLERK_SECRET_KEY: Optional[str] = None
     ADMIN_SECRET: Optional[str] = None
+    FLUTTERWAVE_SECRET_KEY: Optional[str] = None
     
     # CORS
     CORS_ORIGINS: list = ["*"]

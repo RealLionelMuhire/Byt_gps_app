@@ -115,7 +115,7 @@ manager = ConnectionManager()
 async def location_stream(
     device_id: int, 
     websocket: WebSocket,
-    token: str = Query(...)
+    token: Optional[str] = Query(None),
 ):
     """
     Stream real-time GPS location updates for a single device.
@@ -133,7 +133,9 @@ async def location_stream(
     - Client may send any text frame as a keep-alive ping (ignored by server).
     """
     # --- Authentication ---
-    if not token or not await _verify_clerk_token(token):
+    # In dev mode (no CLERK_SECRET_KEY), _verify_clerk_token always returns True.
+    # In production, a missing or invalid token closes with 4001.
+    if not await _verify_clerk_token(token or ""):
         await websocket.close(code=4001, reason="Unauthorized")
         logger.warning("WS: rejected unauthenticated connection for device %d", device_id)
         return

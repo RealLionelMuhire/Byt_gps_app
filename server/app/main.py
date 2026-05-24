@@ -16,6 +16,7 @@ from app.core.database import init_db
 from app.tcp_server import TCPServer
 from app.api import devices, locations, auth, commands, trips
 from app.api import ws as ws_module
+from app.api import onboarding
 from app import dashboard
 
 # Configure logging
@@ -133,13 +134,21 @@ app.add_middleware(
 )
 
 # Include routers
-app.include_router(auth.router, prefix="/api/auth", tags=["authentication"])
-app.include_router(devices.router, prefix="/api/devices", tags=["devices"])
-app.include_router(commands.router, prefix="/api/devices", tags=["commands"])
-app.include_router(locations.router, prefix="/api/locations", tags=["locations"])
-app.include_router(trips.router, prefix="/api/trips", tags=["trips"])
-app.include_router(ws_module.router, tags=["websocket"])
-app.include_router(dashboard.router, tags=["dashboard"])
+app.include_router(auth.router,       prefix="/api/auth",    tags=["authentication"])
+app.include_router(devices.router,    prefix="/api/devices", tags=["devices"])
+app.include_router(commands.router,   prefix="/api/devices", tags=["commands"])
+app.include_router(locations.router,  prefix="/api/locations", tags=["locations"])
+app.include_router(trips.router,      prefix="/api/trips",   tags=["trips"])
+app.include_router(ws_module.router,  tags=["websocket"])
+app.include_router(dashboard.router,  tags=["dashboard"])
+
+# Onboarding routes — device-level ones share /api/devices prefix
+# so the mobile app URLs match without change
+app.include_router(
+    onboarding.router,
+    prefix="/api",
+    tags=["onboarding"],
+)
 
 
 @app.get("/")
