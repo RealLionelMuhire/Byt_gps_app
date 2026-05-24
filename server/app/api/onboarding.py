@@ -43,7 +43,8 @@ PLAN_DAYS   = {"trial": 14, "basic": 30,  "fleet": 30}
 
 class UserCreateRequest(BaseModel):
     name:  str
-    phone: str
+    phone: Optional[str] = None
+    email: Optional[str] = None
     role:  Optional[str] = "owner"
 
 
@@ -107,8 +108,8 @@ async def create_or_update_user(
     Upsert user profile after OTP verification.
     Idempotent — safe to call multiple times (returns existing user without error).
     """
-    if not body.name or not body.phone:
-        raise HTTPException(status_code=400, detail="name and phone are required")
+    if not body.name:
+        raise HTTPException(status_code=400, detail="name is required")
 
     try:
         existing = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
@@ -117,6 +118,7 @@ async def create_or_update_user(
             # Idempotent update
             existing.name  = body.name
             existing.phone = body.phone
+            existing.email = body.email or existing.email
             existing.role  = body.role or "owner"
             existing.updated_at = datetime.utcnow()
             db.commit()
@@ -130,6 +132,7 @@ async def create_or_update_user(
         user = User(
             clerk_user_id=clerk_user_id,
             phone=body.phone,
+            email=body.email,
             name=body.name,
             role=body.role or "owner",
             is_admin=is_first,
