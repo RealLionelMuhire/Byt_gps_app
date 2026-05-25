@@ -21,6 +21,7 @@ import logging
 from typing import Optional
 
 import httpx
+from jose import jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 
@@ -32,9 +33,33 @@ logger = logging.getLogger(__name__)
 _bearer = HTTPBearer(auto_error=False)
 
 
+# Cache JWKS to avoid network requests on every route call
+_jwks_cache = None
+
+async def _get_jwks() -> Optional[dict]:
+    """Fetch the JSON Web Key Set from Clerk."""
+    global _jwks_cache
+    if _jwks_cache is not None:
+        return _jwks_cache
+
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            # The JWKS endpoint is standard for Clerk backend APIs
+            resp = await client.get(
+                "https://api.clerk.com/v1/jwks",
+                headers={"Authorization": f"Bearer {settings.CLERK_SECRET_KEY}"},
+            )
+            if resp.status_code == 200:
+                _jwks_cache = resp.json()
+                return _jwks_cache
+            logger.error("AUTH: Failed to fetch JWKS — HTTP %d: %s", resp.status_code, resp.text)
+    except Exception as exc:
+        logger.error("AUTH: Network error fetching JWKS — %s", exc)
+    return None
+
 async def _verify_clerk_token(token: str) -> Optional[str]:
     """
-    Verify a Clerk session JWT via the Clerk REST API.
+    Verify a Clerk session JWT using the Clerk JWKS.
 
     Returns the Clerk user ID string on success, or None on failure.
     Falls back to returning a placeholder on transient network errors
@@ -47,23 +72,33 @@ async def _verify_clerk_token(token: str) -> Optional[str]:
         )
         return "dev-user"
 
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(
-                "https://api.clerk.com/v1/me",
-                headers={"Authorization": f"Bearer {token}"},
-            )
-            if resp.status_code == 200:
-                data = resp.json()
-                return data.get("id")           # e.g. "user_2abc123xyz"
-            logger.warning(
-                "AUTH: Clerk rejected token — HTTP %d", resp.status_code
-            )
-            return None
-    except Exception as exc:
+    # 1. Fetch JWKS
+    jwks = await _get_jwks()
+    if not jwks:
         # Network error talking to Clerk — fail open so real users aren't blocked
-        logger.error("AUTH: token verification error — %s", exc)
+        # (Alternatively, you can fail closed if security is paramount)
+        logger.warning("AUTH: Could not fetch JWKS, allowing fallback")
         return "network-error-fallback"
+
+    # 2. Decode and verify the JWT signature
+    try:
+        # Clerk tokens usually use RS256. 
+        # We don't enforce `verify_aud` strictly unless configured.
+        payload = jwt.decode(
+            token,
+            jwks,
+            algorithms=["RS256"],
+            options={"verify_aud": False}
+        )
+        # Clerk puts the user_id in the 'sub' claim
+        return payload.get("sub")
+    
+    except jwt.ExpiredSignatureError:
+        logger.warning("AUTH: Clerk token expired")
+        return None
+    except jwt.JWTError as exc:
+        logger.warning("AUTH: Clerk rejected token — %s", exc)
+        return None
 
 
 async def require_auth(
