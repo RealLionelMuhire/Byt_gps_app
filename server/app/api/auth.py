@@ -11,6 +11,7 @@ import logging
 
 from app.core.database import get_db
 from app.core.config import settings
+from app.core.auth import require_auth
 from app.models.user import User
 
 logger = logging.getLogger(__name__)
@@ -59,6 +60,8 @@ class UserResponse(BaseModel):
     email: str
     name: Optional[str]
     is_admin: bool
+    onboarding_step: Optional[int] = 0
+    onboarding_complete: Optional[bool] = False
     created_at: datetime
     updated_at: datetime
     
@@ -166,6 +169,28 @@ async def get_user(
         )
     
     return user
+
+
+@router.get("/me", response_model=UserResponse)
+async def get_current_user(
+    clerk_user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db)
+):
+    """
+    Get current authenticated user profile
+    """
+    user = db.query(User).filter(
+        User.clerk_user_id == clerk_user_id
+    ).first()
+    
+    if not user:
+        raise HTTPException(
+            status_code=404,
+            detail="User not found"
+        )
+    
+    return user
+
 
 
 @router.post("/admin-create-user", response_model=UserResponse, status_code=201)
