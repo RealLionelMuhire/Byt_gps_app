@@ -37,6 +37,7 @@ router = APIRouter()
 
 PLAN_PRICES = {"trial": 0, "basic": 5000, "fleet": 15000}   # RWF
 PLAN_DAYS   = {"trial": 14, "basic": 30,  "fleet": 30}
+PLAN_VEHICLES = {"trial": 1, "basic": 3, "fleet": None} # None = unlimited
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
@@ -283,6 +284,23 @@ async def create_vehicle(
     ).first()
     if not device:
         raise HTTPException(status_code=403, detail="Device not paired to your account")
+
+    # Enforce plan limits
+    sub = db.query(Subscription).filter(
+        Subscription.clerk_user_id == clerk_user_id,
+        Subscription.status == "active"
+    ).first()
+    
+    current_plan = sub.plan_id if sub else "trial"
+    vehicle_limit = PLAN_VEHICLES.get(current_plan, 1)
+
+    if vehicle_limit is not None:
+        current_vehicles_count = db.query(Vehicle).filter(Vehicle.clerk_user_id == clerk_user_id).count()
+        if current_vehicles_count >= vehicle_limit:
+            raise HTTPException(
+                status_code=403, 
+                detail=f"Your {current_plan} plan only allows up to {vehicle_limit} vehicle(s). Please upgrade your plan."
+            )
 
     try:
         vehicle = Vehicle(
