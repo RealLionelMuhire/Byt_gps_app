@@ -96,6 +96,28 @@ class SubscriptionResponse(BaseModel):
     expiresAt:      datetime
 
 
+class SubscriptionUpgradeRequest(BaseModel):
+    planId: str
+    txRef: str
+
+
+class PaymentRecord(BaseModel):
+    txRef: str
+    planId: str
+    amount: float
+    status: str
+    createdAt: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class BillingResponse(BaseModel):
+    currentPlan: str
+    expiresAt: Optional[datetime]
+    payments: list[PaymentRecord]
+
+
 # ── Endpoint 1: POST /api/users  (Step 4) ────────────────────────────────────
 
 @router.post("/users", response_model=UserResponse, status_code=201)
@@ -418,6 +440,112 @@ async def create_subscription(
         db.rollback()
         logger.error("DB error creating subscription: %s", exc)
         raise HTTPException(status_code=500, detail="Database error")
+
+
+# ── Endpoint 7: POST /api/subscriptions/upgrade  ──────────────────────────────
+
+@router.post("/subscriptions/upgrade", response_model=SubscriptionResponse, status_code=201)
+async def upgrade_subscription(
+    body: SubscriptionUpgradeRequest,
+    clerk_user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    """
+    Upgrade an existing subscription to a higher tier.
+    Assumes /api/payments/verify was called successfully beforehand.
+    """
+    if body.planId not in PLAN_PRICES:
+        raise HTTPException(status_code=400, detail="Invalid planId")
+
+    # 1. Confirm payment record exists and is successful
+    payment = db.query(Payment).filter(
+        Payment.tx_ref == body.txRef,
+        Payment.clerk_user_id == clerk_user_id,
+        Payment.status == "successful"
+    ).first()
+    
+    if not payment:
+        raise HTTPException(status_code=402, detail="Payment not verified or not found")
+
+    # 2. Confirm upgrade (no downgrade allowed)
+    current_sub = db.query(Subscription).filter(
+        Subscription.clerk_user_id == clerk_user_id,
+        Subscription.status == "active"
+    ).first()
+
+    if current_sub and PLAN_PRICES[body.planId] <= PLAN_PRICES[current_sub.plan_id]:
+        raise HTTPException(status_code=400, detail="Cannot downgrade. Choose a higher plan.")
+
+    # 3. Cancel current, create new
+    try:
+        if current_sub:
+            current_sub.status = "cancelled"
+            current_sub.updated_at = datetime.utcnow()
+
+        expires_at = datetime.utcnow() + timedelta(days=PLAN_DAYS[body.planId])
+        
+        new_sub = Subscription(
+            clerk_user_id=clerk_user_id,
+            plan_id=body.planId,
+            status="active",
+            started_at=datetime.utcnow(),
+            expires_at=expires_at,
+        )
+        db.add(new_sub)
+
+        # Update user
+        user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
+        if user:
+            user.onboarding_step = 9
+            user.onboarding_complete = True
+            user.updated_at = datetime.utcnow()
+
+        db.commit()
+        db.refresh(new_sub)
+
+        logger.info("Subscription upgraded: planId=%s user=%s expires=%s", body.planId, clerk_user_id, expires_at.isoformat())
+        return SubscriptionResponse(subscriptionId=new_sub.id, expiresAt=expires_at)
+
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error("DB error upgrading subscription: %s", exc)
+        raise HTTPException(status_code=500, detail="Database error")
+
+
+# ── Endpoint 8: GET /api/billing ──────────────────────────────────────────────
+
+@router.get("/billing", response_model=BillingResponse)
+async def get_billing_history(
+    clerk_user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    """
+    Get current active plan and payment history for the user.
+    """
+    sub = db.query(Subscription).filter(
+        Subscription.clerk_user_id == clerk_user_id,
+        Subscription.status == "active"
+    ).first()
+
+    payments = db.query(Payment).filter(
+        Payment.clerk_user_id == clerk_user_id
+    ).order_by(Payment.created_at.desc()).limit(20).all()
+
+    payment_records = []
+    for p in payments:
+        payment_records.append(PaymentRecord(
+            txRef=p.tx_ref,
+            planId=p.plan_id,
+            amount=p.amount,
+            status=p.status,
+            createdAt=p.created_at
+        ))
+
+    return BillingResponse(
+        currentPlan=sub.plan_id if sub else "trial",
+        expiresAt=sub.expires_at if sub else None,
+        payments=payment_records
+    )
 
 
 # ── Bonus: GET /api/vehicles  (Dashboard) ─────────────────────────────────────
