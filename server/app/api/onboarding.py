@@ -418,13 +418,38 @@ async def create_subscription(
     if body.planId not in PLAN_PRICES:
         raise HTTPException(status_code=400, detail="Invalid planId")
 
-    # Prevent trial re-use
+    # Check if an active subscription already exists
+    existing_sub = db.query(Subscription).filter(
+        Subscription.clerk_user_id == clerk_user_id,
+        Subscription.status == "active",
+    ).first()
+
+    if existing_sub:
+        # Subscription already exists — do NOT reject.
+        # Just ensure the user record reflects onboarding_complete=True
+        # (it may have been missed if the app crashed after payment).
+        try:
+            user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
+            if user and not user.onboarding_complete:
+                user.onboarding_step     = 9
+                user.onboarding_complete = True
+                user.updated_at          = datetime.utcnow()
+                db.commit()
+                logger.info("Healed onboarding_complete for user %s (sub already existed)", clerk_user_id)
+        except SQLAlchemyError as exc:
+            db.rollback()
+            logger.warning("Could not heal onboarding_complete: %s", exc)
+
+        logger.info("Subscription already active for user %s — returning existing", clerk_user_id)
+        return SubscriptionResponse(subscriptionId=existing_sub.id, expiresAt=existing_sub.expires_at)
+
+    # For trial: also check historical (expired/cancelled) subscriptions to prevent re-use
     if body.planId == "trial":
-        used = db.query(Subscription).filter(
+        ever_used = db.query(Subscription).filter(
             Subscription.clerk_user_id == clerk_user_id
         ).first()
-        if used:
-            raise HTTPException(status_code=409, detail="Free trial already used")
+        if ever_used:
+            raise HTTPException(status_code=409, detail="Free trial already used. Please choose a paid plan.")
 
     expires_at = datetime.utcnow() + timedelta(days=PLAN_DAYS[body.planId])
 
