@@ -23,7 +23,8 @@ class UserSyncRequest(BaseModel):
     """Request body for user sync"""
     clerk_user_id: str
     email: EmailStr
-    name: Optional[str] = None
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
     
     class Config:
         json_schema_extra = {
@@ -58,7 +59,8 @@ class UserResponse(BaseModel):
     id: int
     clerk_user_id: str
     email: str
-    name: Optional[str]
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
     is_admin: bool
     onboarding_step: Optional[int] = 0
     onboarding_complete: Optional[bool] = False
@@ -103,7 +105,10 @@ async def sync_user(
             # Update existing user
             logger.info(f"Updating existing user: {user_data.clerk_user_id}")
             user.email = user_data.email
-            user.name = user_data.name
+            if user_data.first_name is not None:
+                user.first_name = user_data.first_name
+            if user_data.last_name is not None:
+                user.last_name = user_data.last_name
             user.updated_at = datetime.utcnow()
         else:
             # Create new user
@@ -113,7 +118,8 @@ async def sync_user(
             user = User(
                 clerk_user_id=user_data.clerk_user_id,
                 email=user_data.email,
-                name=user_data.name,
+                first_name=user_data.first_name or "Unknown",
+                last_name=user_data.last_name or "Unknown",
                 is_admin=is_first_user,
                 created_at=datetime.utcnow(),
                 updated_at=datetime.utcnow()
@@ -268,7 +274,8 @@ async def admin_create_user(
         user = User(
             clerk_user_id=clerk_user_id,
             email=user_data.email,
-            name=full_name,
+            first_name=user_data.first_name or "Unknown",
+            last_name=user_data.last_name or "Unknown",
             is_admin=is_first_user,
             created_at=datetime.utcnow(),
             updated_at=datetime.utcnow()

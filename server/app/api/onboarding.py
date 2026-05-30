@@ -572,7 +572,7 @@ async def get_billing_history(
 
     payments = db.query(Payment).filter(
         Payment.clerk_user_id == clerk_user_id
-    ).order_by(Payment.created_at.desc()).limit(20).all()
+    ).order_by(Payment.verified_at.desc()).limit(20).all()
 
     payment_records = []
     for p in payments:
@@ -581,7 +581,7 @@ async def get_billing_history(
             planId=p.plan_id,
             amount=p.amount,
             status=p.status,
-            createdAt=p.created_at
+            createdAt=p.verified_at
         ))
 
     return BillingResponse(
