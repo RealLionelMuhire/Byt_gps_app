@@ -28,9 +28,22 @@ class Settings(BaseSettings):
     SECRET_KEY: str = "your-secret-key-change-this-in-production"
     ALGORITHM: str = "HS256"
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 30
+
+    # Clerk Auth
     CLERK_SECRET_KEY: Optional[str] = None
+    CLERK_PUBLISHABLE_KEY: Optional[str] = None  # pk_live_... — used in admin dashboard JS
+    # Comma-separated Clerk User IDs that are allowed to access the admin dashboard
+    # e.g. "user_2abc123,user_2xyz456" — copy from Clerk Dashboard > Users
+    ADMIN_CLERK_USER_IDS: str = ""
+
+    # Legacy admin secret (kept for fallback / non-Clerk environments)
     ADMIN_SECRET: Optional[str] = None
     FLUTTERWAVE_SECRET_KEY: Optional[str] = None
+
+    @property
+    def admin_user_ids(self) -> set:
+        """Return the set of authorized admin Clerk user IDs."""
+        return {uid.strip() for uid in self.ADMIN_CLERK_USER_IDS.split(",") if uid.strip()}
     
     # CORS
     CORS_ORIGINS: list = ["*"]

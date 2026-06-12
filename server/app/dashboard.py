@@ -1,26 +1,31 @@
 """
 Admin Dashboard for GPS Tracking - BYThron GPS Service
 Includes:
-  - GET /dashboard          - device overview (read-only)
-  - GET /admin/login        - login form
-  - POST /admin/login       - authenticate with ADMIN_SECRET
-  - GET /admin/devices      - whitelisted device inventory
-  - POST /admin/devices     - add a new device to inventory
-  - DELETE /admin/devices/{imei} - remove a device from inventory
+  - GET  /dashboard            - device overview (read-only)
+  - GET  /admin/login          - Clerk sign-in page
+  - POST /admin/auth/verify    - exchange Clerk JWT for a signed admin session cookie
+  - GET  /admin/logout         - clear session
+  - GET  /admin/devices        - whitelisted device inventory
+  - POST /admin/devices        - add a new device to inventory
+  - POST /admin/devices/{imei}/delete - remove a device from inventory
 """
 
 import secrets
 import string
+import hmac
+import hashlib
 from datetime import datetime
 
-from fastapi import APIRouter, Depends, Request, Form, HTTPException
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi import APIRouter, Request, Form
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
+from fastapi import Depends
 import os
 
 from app.core.database import get_db
 from app.core.config import settings
+from app.core.auth import _verify_clerk_token
 from app.models.device import Device
 from app.models.location import Location
 from app.models.user import User
@@ -33,22 +38,57 @@ templates = Jinja2Templates(directory=templates_dir)
 
 # ── Auth Helpers ─────────────────────────────────────────────────────────────
 
+SESSION_COOKIE = "admin_session"
+
+
 def _generate_pin(length: int = 6) -> str:
     """Generate a random alphanumeric PIN (uppercase)."""
     alphabet = string.ascii_uppercase + string.digits
     return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
+def _sign_session(clerk_user_id: str) -> str:
+    """
+    Create a tamper-proof session token: HMAC-SHA256(SECRET_KEY, clerk_user_id).
+    Stored as a cookie; verified on every protected request.
+    """
+    key = settings.SECRET_KEY.encode()
+    sig = hmac.new(key, clerk_user_id.encode(), hashlib.sha256).hexdigest()
+    return f"{clerk_user_id}:{sig}"
+
+
+def _verify_session(cookie_value: str) -> str | None:
+    """
+    Verify the session cookie and return the embedded clerk_user_id,
+    or None if the cookie is missing, tampered, or the user is not an admin.
+    """
+    if not cookie_value or ":" not in cookie_value:
+        return None
+    try:
+        clerk_user_id, provided_sig = cookie_value.rsplit(":", 1)
+    except ValueError:
+        return None
+
+    expected = _sign_session(clerk_user_id)
+    # Constant-time comparison prevents timing attacks
+    if not hmac.compare_digest(expected, f"{clerk_user_id}:{provided_sig}"):
+        return None
+
+    # Confirm the user is still in the admin whitelist
+    if clerk_user_id not in settings.admin_user_ids:
+        return None
+
+    return clerk_user_id
+
+
+def _get_admin(request: Request) -> str | None:
+    """Return the admin's Clerk user ID from the session cookie, or None."""
+    return _verify_session(request.cookies.get(SESSION_COOKIE, ""))
+
+
 def _check_admin(request: Request) -> bool:
-    """Return True if the current session has a valid admin cookie."""
-    token = request.cookies.get("admin_token")
-    return bool(token and settings.ADMIN_SECRET and token == settings.ADMIN_SECRET)
+    return _get_admin(request) is not None
 
-
-def require_admin(request: Request):
-    """Dependency: redirect to login if not authenticated."""
-    if not _check_admin(request):
-        raise HTTPException(status_code=302, headers={"Location": "/admin/login"})
 
 
 # ── Helpers (reused from original dashboard) ──────────────────────────────────
@@ -153,35 +193,62 @@ async def dashboard(request: Request, db: Session = Depends(get_db)):
     })
 
 
-# ── Admin Login ───────────────────────────────────────────────────────────────
+# ── Admin Auth Routes ─────────────────────────────────────────────────────────
 
 @router.get("/admin/login", response_class=HTMLResponse)
-async def admin_login_page(request: Request, error: str = ""):
+async def admin_login_page(request: Request):
+    """Show the Clerk-powered sign-in page."""
+    if _check_admin(request):
+        return RedirectResponse(url="/admin/devices", status_code=302)
     return templates.TemplateResponse("admin_login.html", {
         "request": request,
-        "error": error,
+        "clerk_publishable_key": settings.CLERK_PUBLISHABLE_KEY or "",
     })
 
 
-@router.post("/admin/login")
-async def admin_login(request: Request, secret: str = Form(...)):
-    if not settings.ADMIN_SECRET:
-        return templates.TemplateResponse("admin_login.html", {
-            "request": request,
-            "error": "ADMIN_SECRET is not configured on this server.",
-        })
-    if secret != settings.ADMIN_SECRET:
-        return templates.TemplateResponse("admin_login.html", {
-            "request": request,
-            "error": "Incorrect admin secret. Please try again.",
-        })
-    response = RedirectResponse(url="/admin/devices", status_code=302)
+@router.post("/admin/auth/verify")
+async def admin_auth_verify(request: Request):
+    """
+    Called by the Clerk JS component after a successful sign-in.
+    Expects JSON body: { "token": "<clerk_session_jwt>" }
+    Validates the token, checks admin whitelist, and sets a signed session cookie.
+    """
+    try:
+        body = await request.json()
+        token = body.get("token", "")
+    except Exception:
+        return JSONResponse({"error": "Invalid request body."}, status_code=400)
+
+    if not token:
+        return JSONResponse({"error": "Missing token."}, status_code=400)
+
+    # Validate the Clerk JWT
+    clerk_user_id = await _verify_clerk_token(token)
+    if not clerk_user_id:
+        return JSONResponse({"error": "Invalid or expired Clerk token."}, status_code=401)
+
+    # Check admin whitelist
+    if not settings.admin_user_ids:
+        return JSONResponse(
+            {"error": "No admin users configured. Set ADMIN_CLERK_USER_IDS in your .env file."},
+            status_code=403
+        )
+    if clerk_user_id not in settings.admin_user_ids:
+        return JSONResponse(
+            {"error": "Your account does not have admin access. Contact the system administrator."},
+            status_code=403
+        )
+
+    # Issue signed session cookie
+    session_value = _sign_session(clerk_user_id)
+    response = JSONResponse({"ok": True, "redirect": "/admin/devices"})
     response.set_cookie(
-        key="admin_token",
-        value=settings.ADMIN_SECRET,
+        key=SESSION_COOKIE,
+        value=session_value,
         httponly=True,
+        secure=not settings.DEBUG,  # False on localhost (HTTP), True in production (HTTPS)
         samesite="lax",
-        max_age=3600 * 8,   # 8-hour session
+        max_age=3600 * 8,  # 8-hour session
     )
     return response
 
@@ -189,7 +256,7 @@ async def admin_login(request: Request, secret: str = Form(...)):
 @router.get("/admin/logout")
 async def admin_logout():
     response = RedirectResponse(url="/admin/login", status_code=302)
-    response.delete_cookie("admin_token")
+    response.delete_cookie(SESSION_COOKIE)
     return response
 
 

@@ -3,79 +3,163 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Admin Login — Track IQ</title>
+  <title>Admin Sign In — Track IQ</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
     body {
       font-family: 'Segoe UI', sans-serif;
       background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
       min-height: 100vh;
       display: flex;
+      flex-direction: column;
       align-items: center;
       justify-content: center;
+      gap: 24px;
     }
-    .card {
-      background: #fff;
-      border-radius: 16px;
-      padding: 48px 40px;
-      width: 100%;
-      max-width: 420px;
-      box-shadow: 0 24px 64px rgba(0,0,0,0.4);
+
+    .logo {
+      text-align: center;
+      color: #fff;
     }
-    .logo { text-align: center; margin-bottom: 32px; }
-    .logo h1 { font-size: 32px; color: #0f3460; letter-spacing: -1px; }
+    .logo h1 { font-size: 36px; font-weight: 800; letter-spacing: -1px; }
     .logo h1 span { color: #e94560; }
-    .logo p { color: #888; margin-top: 6px; font-size: 14px; }
-    label { display: block; font-size: 12px; font-weight: 600; color: #555; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
-    input[type=password] {
+    .logo p { color: rgba(255,255,255,0.5); font-size: 14px; margin-top: 6px; }
+
+    /* Container for Clerk's component */
+    #clerk-signin {
       width: 100%;
-      border: 1.5px solid #ddd;
-      border-radius: 10px;
-      padding: 13px 16px;
-      font-size: 16px;
-      outline: none;
-      transition: border-color 0.2s;
+      max-width: 440px;
     }
-    input[type=password]:focus { border-color: #0f3460; }
-    .error {
+
+    /* Error state (only shown if JS fails before Clerk loads) */
+    .error-card {
       background: #fff0f0;
       border: 1px solid #f5c6cb;
       color: #721c24;
-      padding: 10px 14px;
-      border-radius: 8px;
-      font-size: 13px;
-      margin-bottom: 18px;
-    }
-    button {
-      width: 100%;
-      background: linear-gradient(135deg, #0f3460, #e94560);
-      color: #fff;
-      border: none;
+      padding: 14px 18px;
       border-radius: 10px;
-      padding: 14px;
-      font-size: 16px;
-      font-weight: 600;
-      cursor: pointer;
-      margin-top: 24px;
-      transition: opacity 0.2s;
+      font-size: 14px;
+      max-width: 440px;
+      width: 100%;
+      display: none;
     }
-    button:hover { opacity: 0.9; }
+    .error-card.visible { display: block; }
+
+    /* Auth error from our verify endpoint */
+    #auth-error {
+      background: #fff0f0;
+      border: 1px solid #f5c6cb;
+      color: #721c24;
+      padding: 14px 18px;
+      border-radius: 10px;
+      font-size: 14px;
+      max-width: 440px;
+      width: 100%;
+      display: none;
+    }
+    #auth-error.visible { display: block; }
+
+    .spinner {
+      color: rgba(255,255,255,0.6);
+      font-size: 14px;
+    }
   </style>
 </head>
 <body>
-  <div class="card">
-    <div class="logo">
-      <h1>Track<span>IQ</span></h1>
-      <p>Admin Dashboard</p>
-    </div>
-    {% if error %}
-    <div class="error">⚠️ {{ error }}</div>
-    {% endif %}
-    <form method="POST" action="/admin/login">
-      <label for="secret">Admin Secret Key</label>
-      <input type="password" id="secret" name="secret" placeholder="Enter your admin secret…" autofocus required>
-      <button type="submit">Sign In →</button>
-    </form>
+
+  <div class="logo">
+    <h1>Track<span>IQ</span></h1>
+    <p>Admin Dashboard — Sign in to manage devices</p>
   </div>
+
+  <!-- Our custom auth error (non-admin, expired token, etc.) -->
+  <div id="auth-error"></div>
+
+  <!-- Clerk mounts its sign-in UI here -->
+  <div id="clerk-signin">
+    <p class="spinner">Loading sign-in…</p>
+  </div>
+
+  <!--
+    Load Clerk's frontend JS using your publishable key.
+    The publishable key is injected server-side from settings.CLERK_PUBLISHABLE_KEY.
+  -->
+  <script>
+    const PUBLISHABLE_KEY = "{{ clerk_publishable_key }}";
+
+    if (!PUBLISHABLE_KEY) {
+      document.getElementById("clerk-signin").innerHTML =
+        '<div class="error-card visible">⚠️ CLERK_PUBLISHABLE_KEY is not configured on this server. Set it in your .env file.</div>';
+    } else {
+      // Dynamically load the Clerk JS bundle
+      const script = document.createElement("script");
+      script.src = "https://cdn.jsdelivr.net/npm/@clerk/clerk-js@latest/dist/clerk.browser.js";
+      script.setAttribute("data-clerk-publishable-key", PUBLISHABLE_KEY);
+      script.crossOrigin = "anonymous";
+      script.onload = initClerk;
+      script.onerror = () => {
+        document.getElementById("clerk-signin").innerHTML =
+          '<div class="error-card visible">⚠️ Failed to load Clerk authentication. Check your internet connection.</div>';
+      };
+      document.head.appendChild(script);
+    }
+
+    async function initClerk() {
+      const clerk = window.Clerk;
+      await clerk.load();
+
+      // If user is already signed into Clerk, try to verify immediately
+      if (clerk.session) {
+        await tryVerify(clerk);
+        return;
+      }
+
+      // Mount the sign-in component into our container
+      const container = document.getElementById("clerk-signin");
+      container.innerHTML = ""; // clear the "Loading..." text
+      clerk.mountSignIn(container, {
+        afterSignInUrl: window.location.href, // reload this page after Clerk sign-in
+        signUpUrl: null,                       // disable sign-up from admin panel
+      });
+
+      // Clerk fires this event when sign-in completes
+      clerk.addListener(async ({ session }) => {
+        if (session) {
+          await tryVerify(clerk);
+        }
+      });
+    }
+
+    async function tryVerify(clerk) {
+      const errEl = document.getElementById("auth-error");
+      errEl.className = "";
+      errEl.textContent = "";
+
+      try {
+        // Get the short-lived session JWT from Clerk
+        const token = await clerk.session.getToken();
+        const resp = await fetch("/admin/auth/verify", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ token }),
+          credentials: "include",
+        });
+
+        const data = await resp.json();
+
+        if (resp.ok && data.ok) {
+          // Session cookie set — redirect to admin dashboard
+          window.location.href = data.redirect || "/admin/devices";
+        } else {
+          errEl.textContent = "⛔ " + (data.error || "Access denied.");
+          errEl.className = "visible";
+        }
+      } catch (err) {
+        errEl.textContent = "⚠️ Network error during authentication. Please try again.";
+        errEl.className = "visible";
+      }
+    }
+  </script>
 </body>
 </html>
