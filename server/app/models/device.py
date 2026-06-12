@@ -15,6 +15,7 @@ class Device(Base):
     imei = Column(String(20), unique=True, index=True, nullable=False)
     name = Column(String(100), nullable=False)
     description = Column(String(500), nullable=True)
+    pairing_pin = Column(String(8), nullable=True)  # Secret PIN printed inside device box
     
     # User ownership
     user_id = Column(Integer, ForeignKey('users.id'), nullable=True, index=True)

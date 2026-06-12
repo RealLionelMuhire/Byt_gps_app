@@ -18,10 +18,11 @@
 5. [Location & Tracking Endpoints](#location--tracking-endpoints)
 6. [Device Commands](#device-commands)
 7. [Trip Endpoints](#trip-endpoints)
-8. [WebSocket — Real-time Location Stream](#websocket--real-time-location-stream)
-9. [Dashboard (Web UI)](#dashboard-web-ui)
-10. [Error Reference](#error-reference)
-11. [Developer Notes](#developer-notes)
+8. [Onboarding & Subscription Endpoints](#onboarding--subscription-endpoints)
+9. [WebSocket — Real-time Location Stream](#websocket--real-time-location-stream)
+10. [Dashboard (Web UI)](#dashboard-web-ui)
+11. [Error Reference](#error-reference)
+12. [Developer Notes](#developer-notes)
 
 ---
 
@@ -180,6 +181,34 @@ X-Admin-Secret: <your-admin-secret>
 **Errors:**
 - `401` Invalid admin secret
 - `500` `CLERK_SECRET_KEY` not configured on server
+
+---
+
+### `GET /api/auth/me` *(protected)*
+
+🔒 **Requires `Authorization: Bearer <token>`**
+
+Retrieves the current authenticated user's profile.
+
+**Response (200):**
+```json
+{
+  "id": 1,
+  "clerk_user_id": "user_2abc123xyz456def",
+  "email": "user@example.com",
+  "first_name": "John",
+  "last_name": "Doe",
+  "is_admin": false,
+  "onboarding_step": 4,
+  "onboarding_complete": false,
+  "created_at": "2026-02-08T10:00:00Z",
+  "updated_at": "2026-02-08T10:00:00Z"
+}
+```
+
+**Errors:**
+- `401` Unauthorized
+- `404` User not found
 
 ---
 
@@ -670,6 +699,240 @@ Full route (LineString with timestamps) for a specific trip. Same shape as `/api
   "distance_km": 28.4,
   "duration_seconds": 4500,
   "created_at": "2026-05-20T09:15:01Z"
+}
+```
+
+---
+
+## Onboarding & Subscription Endpoints
+
+🔒 **All endpoints require `Authorization: Bearer <token>`**
+
+Endpoints supporting user onboarding steps (profile sync, device pairing, vehicle association, plan/subscription activations).
+
+---
+
+### `POST /api/users`
+
+Step 4 of onboarding: Upsert user profile after Clerk verification. This endpoint is idempotent.
+
+**Request Body:**
+```json
+{
+  "firstName": "John",
+  "lastName": "Doe",
+  "email": "john.doe@example.com",
+  "role": "owner"
+}
+```
+
+**Response (201):**
+```json
+{
+  "userId": 1,
+  "alreadyExists": false
+}
+```
+
+---
+
+### `POST /api/devices/pair`
+
+Step 5 of onboarding: Link a pre-registered GPS tracking device (by IMEI) to the current user's account.
+
+**Request Body:**
+```json
+{
+  "imei": "123456789012345"
+}
+```
+
+**Response (200):**
+```json
+{
+  "deviceId": 1,
+  "status": "pending",
+  "imei": "123456789012345"
+}
+```
+
+**Errors:**
+- `400` Invalid IMEI format (must be 15 digits)
+- `404` Device not found (must be pre-loaded in DB by admin)
+- `409` Device already registered to another account
+
+---
+
+### `GET /api/devices/{imei}/status`
+
+Step 6 of onboarding: Polls the connection status of a paired device by its IMEI. Transits from `pending` to `online` once the first TCP packet arrives from the hardware.
+
+**Path Parameters:**
+- `imei` (string): 15-digit IMEI number
+
+**Response (200):**
+```json
+{
+  "status": "online"
+}
+```
+
+---
+
+### `POST /api/vehicles`
+
+Step 7 of onboarding: Register a vehicle and link it to the paired GPS device IMEI.
+
+**Request Body:**
+```json
+{
+  "nickname": "Office Car",
+  "plate": "RAC 123 A",
+  "make": "Toyota",
+  "model": "Hilux",
+  "deviceImei": "123456789012345"
+}
+```
+
+**Response (201):**
+```json
+{
+  "vehicleId": 1
+}
+```
+
+**Errors:**
+- `403` Device not paired to your account, or plan limit reached (e.g. Trial plan allows 1 vehicle max)
+
+---
+
+### `GET /api/vehicles`
+
+Lists all registered vehicles for the authenticated user, including current device location and status.
+
+**Response (200):**
+```json
+{
+  "vehicles": [
+    {
+      "id": 1,
+      "nickname": "Office Car",
+      "plate": "RAC 123 A",
+      "make": "Toyota",
+      "model": "Hilux",
+      "device": {
+        "id": 1,
+        "imei": "123456789012345",
+        "status": "online",
+        "latitude": -1.9403,
+        "longitude": 29.8739,
+        "last_seen": "2026-05-20T10:35:00Z"
+      },
+      "created_at": "2026-05-20T10:00:00Z"
+    }
+  ]
+}
+```
+
+---
+
+### `POST /api/payments/verify`
+
+Step 8 of onboarding (for paid plans): Verifies Flutterwave transaction reference against Flutterwave's API. Creates a verified Payment record in the local database.
+
+**Request Body:**
+```json
+{
+  "txRef": "flw-tx-12345",
+  "planId": "basic"
+}
+```
+
+**Response (200):**
+```json
+{
+  "verified": true,
+  "status": "successful"
+}
+```
+
+**Errors:**
+- `400` Invalid planId (must be `basic` or `fleet`)
+- `502` Flutterwave API unreachable
+
+---
+
+### `POST /api/subscriptions`
+
+Step 8: Activates a subscription plan (`trial`, `basic`, or `fleet`).
+- For paid plans, assumes `/api/payments/verify` was called successfully.
+- For `trial`, enforces a one-time limit per user.
+- Marks the user onboarding flow as complete (`onboarding_complete = true`).
+
+**Request Body:**
+```json
+{
+  "planId": "basic"
+}
+```
+
+**Response (201):**
+```json
+{
+  "subscriptionId": 12,
+  "expiresAt": "2026-06-20T10:00:00Z"
+}
+```
+
+**Errors:**
+- `409` Trial already used (when trying to activate `trial` multiple times)
+
+---
+
+### `POST /api/subscriptions/upgrade`
+
+Upgrades an existing active plan to a higher plan tier. Assumes `/api/payments/verify` was successfully called beforehand.
+
+**Request Body:**
+```json
+{
+  "planId": "fleet",
+  "txRef": "flw-tx-12345"
+}
+```
+
+**Response (201):**
+```json
+{
+  "subscriptionId": 13,
+  "expiresAt": "2026-06-20T10:00:00Z"
+}
+```
+
+**Errors:**
+- `400` Cannot downgrade (new plan price is lower than or equal to current plan)
+- `402` Payment not verified or found
+
+---
+
+### `GET /api/billing`
+
+Retrieves the current subscription status and past payment history for the user.
+
+**Response (200):**
+```json
+{
+  "currentPlan": "basic",
+  "expiresAt": "2026-06-20T10:00:00Z",
+  "payments": [
+    {
+      "txRef": "flw-tx-12345",
+      "planId": "basic",
+      "amount": 5000,
+      "status": "successful",
+      "createdAt": "2026-05-20T10:00:00Z"
+    }
+  ]
 }
 ```
 

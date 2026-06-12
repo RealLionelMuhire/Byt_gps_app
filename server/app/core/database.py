@@ -9,12 +9,20 @@ from geoalchemy2 import Geometry
 
 from app.core.config import settings
 
-# Create engine
+# Neon serverless works best with a small pool and explicit SSL.
+# pool_size=5 avoids exhausting Neon's free-tier connection limits.
+# pool_recycle prevents stale connections after Neon auto-suspends.
+_connect_args = {}
+if "neon.tech" in settings.DATABASE_URL or "sslmode=require" in settings.DATABASE_URL:
+    _connect_args = {"sslmode": "require"}
+
 engine = create_engine(
     settings.DATABASE_URL,
-    pool_pre_ping=True,
-    pool_size=10,
-    max_overflow=20
+    pool_pre_ping=True,     # Verify connection liveness before use
+    pool_size=5,            # Neon free tier: keep pool small
+    max_overflow=10,
+    pool_recycle=300,       # Recycle after 5 min (Neon suspends idle computes)
+    connect_args=_connect_args,
 )
 
 # Session factory

@@ -59,6 +59,7 @@ class UserResponse(BaseModel):
 
 class DevicePairRequest(BaseModel):
     imei: str
+    pairingPin: Optional[str] = None  # Required for whitelisted devices
 
 
 class DeviceStatusResponse(BaseModel):
@@ -207,6 +208,19 @@ async def pair_device(
     # Conflict: device already claimed by a different user
     if device.user_id and device.user_id != user.id:
         raise HTTPException(status_code=409, detail="Device already registered to another account.")
+
+    # PIN validation: if device has a pairing_pin set, the client must supply the correct one
+    if device.pairing_pin:
+        if not body.pairingPin:
+            raise HTTPException(
+                status_code=403,
+                detail="This device requires a Pairing PIN. Check the card inside the device box."
+            )
+        if body.pairingPin.strip().upper() != device.pairing_pin.strip().upper():
+            raise HTTPException(
+                status_code=403,
+                detail="Incorrect Pairing PIN. Please check the card inside the device box."
+            )
 
     try:
         device.user_id    = user.id

@@ -138,39 +138,37 @@ class GPSTrackerConnection:
         try:
             imei = data['imei']
             self.device_imei = imei
-            self.authenticated = True
-            
-            logger.info(f"Device logged in: IMEI {imei}")
-            
-            # Store/update device in database
+
+            logger.info(f"Device login attempt: IMEI {imei}")
+
             db = SessionLocal()
             try:
                 device = db.query(Device).filter(Device.imei == imei).first()
-                
+
                 if not device:
-                    # Create new device
-                    device = Device(
-                        imei=imei,
-                        name=f"Tracker-{imei[-6:]}",
-                        status='online',
-                        last_connect=datetime.utcnow()
+                    # IMEI not whitelisted — reject the connection
+                    logger.warning(
+                        f"Rejected unknown IMEI {imei} — not in device inventory. "
+                        "Pre-register the device via the admin dashboard first."
                     )
-                    db.add(device)
-                    logger.info(f"Created new device: {imei}")
-                else:
-                    # Update existing device
-                    device.status = 'online'
-                    device.last_connect = datetime.utcnow()
-                    logger.info(f"Updated device: {imei}")
-                
+                    self.device_imei = None
+                    self.authenticated = False
+                    self.writer.close()
+                    return
+
+                # Known device — accept and mark online
+                device.status = 'online'
+                device.last_connect = datetime.utcnow()
                 db.commit()
-                
-                # Register connection in server
-                self.server.register_device(imei, self)
-            
+                logger.info(f"Device accepted: IMEI {imei} (id={device.id})")
+
             finally:
                 db.close()
-        
+
+            self.authenticated = True
+            # Register connection in server
+            self.server.register_device(imei, self)
+
         except Exception as e:
             logger.error(f"Error handling login: {e}", exc_info=True)
     

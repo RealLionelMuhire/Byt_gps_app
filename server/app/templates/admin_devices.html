@@ -1,0 +1,309 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Device Inventory — Track IQ Admin</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: 'Segoe UI', sans-serif; background: #f0f2f5; min-height: 100vh; }
+
+    /* ── NAV ── */
+    nav {
+      background: linear-gradient(135deg, #1a1a2e, #0f3460);
+      padding: 0 32px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 60px;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.3);
+    }
+    .nav-brand { color: #fff; font-size: 20px; font-weight: 700; letter-spacing: -0.5px; }
+    .nav-brand span { color: #e94560; }
+    .nav-links { display: flex; gap: 8px; }
+    .nav-links a {
+      color: rgba(255,255,255,0.75);
+      text-decoration: none;
+      padding: 6px 14px;
+      border-radius: 6px;
+      font-size: 14px;
+      font-weight: 500;
+      transition: background 0.2s, color 0.2s;
+    }
+    .nav-links a:hover, .nav-links a.active { background: rgba(255,255,255,0.15); color: #fff; }
+    .nav-links a.logout { color: #e94560; }
+
+    /* ── LAYOUT ── */
+    .page { max-width: 1200px; margin: 0 auto; padding: 32px 24px; }
+    .page-title { font-size: 26px; font-weight: 700; color: #1a1a2e; margin-bottom: 8px; }
+    .page-sub { color: #888; font-size: 14px; margin-bottom: 28px; }
+
+    /* ── STATS ── */
+    .stats { display: flex; gap: 16px; margin-bottom: 28px; flex-wrap: wrap; }
+    .stat-card {
+      background: #fff;
+      border-radius: 12px;
+      padding: 18px 24px;
+      flex: 1;
+      min-width: 150px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+      border-left: 4px solid transparent;
+    }
+    .stat-card.total { border-left-color: #0f3460; }
+    .stat-card.online { border-left-color: #22c55e; }
+    .stat-card.paired { border-left-color: #f59e0b; }
+    .stat-label { font-size: 12px; color: #888; text-transform: uppercase; letter-spacing: 0.5px; }
+    .stat-value { font-size: 32px; font-weight: 700; color: #1a1a2e; margin-top: 4px; }
+
+    /* ── ADD DEVICE FORM ── */
+    .add-panel {
+      background: #fff;
+      border-radius: 14px;
+      padding: 28px;
+      margin-bottom: 28px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.06);
+    }
+    .add-panel h2 { font-size: 18px; color: #1a1a2e; margin-bottom: 20px; display: flex; align-items: center; gap: 8px; }
+    .form-grid { display: grid; grid-template-columns: 1fr 1fr 1fr auto; gap: 14px; align-items: end; }
+    .field label { display: block; font-size: 12px; font-weight: 600; color: #666; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
+    .field input {
+      width: 100%;
+      border: 1.5px solid #e0e0e0;
+      border-radius: 8px;
+      padding: 10px 14px;
+      font-size: 14px;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    .field input:focus { border-color: #0f3460; }
+    .field input::placeholder { color: #bbb; }
+    .pin-hint { font-size: 11px; color: #aaa; margin-top: 4px; }
+    .btn-add {
+      background: linear-gradient(135deg, #0f3460, #e94560);
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      padding: 11px 24px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+      height: 42px;
+      transition: opacity 0.2s;
+    }
+    .btn-add:hover { opacity: 0.88; }
+    .error-banner {
+      background: #fff0f0;
+      border: 1px solid #f5c6cb;
+      color: #721c24;
+      padding: 12px 16px;
+      border-radius: 8px;
+      font-size: 13px;
+      margin-bottom: 16px;
+    }
+
+    /* ── TABLE ── */
+    .table-wrap { background: #fff; border-radius: 14px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); overflow: hidden; }
+    .table-header {
+      padding: 18px 24px;
+      border-bottom: 1px solid #f0f0f0;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    .table-header h2 { font-size: 18px; color: #1a1a2e; }
+    table { width: 100%; border-collapse: collapse; }
+    thead th {
+      background: #f8f9fb;
+      padding: 12px 16px;
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: #888;
+      text-align: left;
+      border-bottom: 1px solid #eee;
+    }
+    tbody tr { border-bottom: 1px solid #f5f5f5; transition: background 0.15s; }
+    tbody tr:last-child { border-bottom: none; }
+    tbody tr:hover { background: #fafbff; }
+    tbody td { padding: 14px 16px; font-size: 14px; color: #333; vertical-align: middle; }
+    .imei-mono { font-family: monospace; font-size: 13px; color: #555; }
+    .pin-badge {
+      display: inline-block;
+      background: #f0f9ff;
+      border: 1px solid #bae6fd;
+      color: #0369a1;
+      font-family: monospace;
+      font-size: 14px;
+      font-weight: 700;
+      padding: 4px 10px;
+      border-radius: 6px;
+      letter-spacing: 2px;
+    }
+    .status-dot {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      font-size: 13px;
+      font-weight: 500;
+    }
+    .dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      display: inline-block;
+    }
+    .dot-online { background: #22c55e; box-shadow: 0 0 6px #22c55e; }
+    .dot-offline { background: #ef4444; }
+    .owner-chip {
+      background: #fef3c7;
+      color: #92400e;
+      font-size: 12px;
+      padding: 3px 10px;
+      border-radius: 12px;
+      font-weight: 600;
+    }
+    .no-owner { color: #bbb; font-size: 13px; }
+    .btn-del {
+      background: none;
+      border: 1px solid #fca5a5;
+      color: #ef4444;
+      border-radius: 6px;
+      padding: 5px 12px;
+      font-size: 12px;
+      cursor: pointer;
+      transition: background 0.15s;
+    }
+    .btn-del:hover { background: #fff0f0; }
+    .empty-state { text-align: center; padding: 60px 40px; color: #aaa; }
+    .empty-state .icon { font-size: 56px; margin-bottom: 16px; }
+    @media(max-width:768px){
+      .form-grid { grid-template-columns: 1fr; }
+      .stats { flex-direction: column; }
+    }
+  </style>
+</head>
+<body>
+  <!-- Nav -->
+  <nav>
+    <div class="nav-brand">Track<span>IQ</span> Admin</div>
+    <div class="nav-links">
+      <a href="/dashboard">📡 Fleet View</a>
+      <a href="/admin/devices" class="active">📦 Device Inventory</a>
+      <a href="/admin/logout" class="logout">Sign Out</a>
+    </div>
+  </nav>
+
+  <div class="page">
+    <div class="page-title">📦 Device Inventory</div>
+    <div class="page-sub">Whitelist GPS tracker IMEIs and assign secure pairing PINs before shipping to clients.</div>
+
+    <!-- Stats -->
+    <div class="stats">
+      <div class="stat-card total">
+        <div class="stat-label">Total Whitelisted</div>
+        <div class="stat-value">{{ total_devices }}</div>
+      </div>
+      <div class="stat-card online">
+        <div class="stat-label">Online Now</div>
+        <div class="stat-value">{{ online_devices }}</div>
+      </div>
+      <div class="stat-card paired">
+        <div class="stat-label">Paired to Users</div>
+        <div class="stat-value">{{ paired_devices }}</div>
+      </div>
+    </div>
+
+    <!-- Add Device Form -->
+    <div class="add-panel">
+      <h2>➕ Add Device to Inventory</h2>
+      {% if error %}
+      <div class="error-banner">⚠️ {{ error }}</div>
+      {% endif %}
+      <form method="POST" action="/admin/devices">
+        <div class="form-grid">
+          <div class="field">
+            <label>IMEI (15 digits) *</label>
+            <input type="text" name="imei" maxlength="15" pattern="[0-9]{15}" placeholder="358765012345678"
+                   value="{{ form.imei if form else '' }}" required>
+          </div>
+          <div class="field">
+            <label>Device Name</label>
+            <input type="text" name="name" placeholder="e.g. Fleet Tracker #42"
+                   value="{{ form.name if form else '' }}">
+          </div>
+          <div class="field">
+            <label>Pairing PIN</label>
+            <input type="text" name="pairing_pin" maxlength="8" placeholder="Auto-generated if blank"
+                   value="{{ form.pairing_pin if form else '' }}" style="font-family:monospace; letter-spacing:2px;">
+            <div class="pin-hint">Leave blank to auto-generate a secure 6-character PIN.</div>
+          </div>
+          <div>
+            <button type="submit" class="btn-add">Add Device</button>
+          </div>
+        </div>
+      </form>
+    </div>
+
+    <!-- Device Table -->
+    <div class="table-wrap">
+      <div class="table-header">
+        <h2>Whitelisted Devices</h2>
+      </div>
+      {% if devices %}
+      <table>
+        <thead>
+          <tr>
+            <th>Device Name</th>
+            <th>IMEI</th>
+            <th>Pairing PIN</th>
+            <th>Status</th>
+            <th>Owner</th>
+            <th>Last Seen</th>
+            <th></th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for d in devices %}
+          <tr>
+            <td><strong>{{ d.name }}</strong>{% if d.description %}<br><small style="color:#aaa">{{ d.description }}</small>{% endif %}</td>
+            <td class="imei-mono">{{ d.imei }}</td>
+            <td><span class="pin-badge">{{ d.pairing_pin }}</span></td>
+            <td>
+              <span class="status-dot">
+                <span class="dot dot-{{ d.status }}"></span>
+                {{ d.status | capitalize }}
+              </span>
+            </td>
+            <td>
+              {% if d.owner_email %}
+                <span class="owner-chip">{{ d.owner_name or d.owner_email }}</span>
+              {% else %}
+                <span class="no-owner">Unpaired</span>
+              {% endif %}
+            </td>
+            <td style="font-size:13px; color:#888;">{{ d.last_seen_duration }}</td>
+            <td>
+              {% if not d.owner_email %}
+              <form method="POST" action="/admin/devices/{{ d.imei }}/delete"
+                    onsubmit="return confirm('Remove IMEI {{ d.imei }} from inventory?')">
+                <button type="submit" class="btn-del">Remove</button>
+              </form>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}
+      <div class="empty-state">
+        <div class="icon">📭</div>
+        <p>No devices in inventory yet. Add your first device above.</p>
+      </div>
+      {% endif %}
+    </div>
+  </div>
+</body>
+</html>

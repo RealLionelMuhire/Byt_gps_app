@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>GPS Tracking Dashboard - BYThron</title>
+    <title>Fleet Dashboard — Track IQ</title>
     <style>
         * {
             margin: 0;
@@ -13,15 +13,39 @@
 
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            background: #f0f2f5;
             min-height: 100vh;
-            padding: 20px;
+            padding: 0;
         }
 
-        .container {
-            max-width: 1400px;
-            margin: 0 auto;
+        /* ── NAV ── */
+        nav {
+            background: linear-gradient(135deg, #1a1a2e, #0f3460);
+            padding: 0 32px;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+            height: 60px;
+            position: sticky;
+            top: 0;
+            z-index: 100;
+            box-shadow: 0 2px 12px rgba(0,0,0,0.3);
         }
+        .nav-brand { color: #fff; font-size: 20px; font-weight: 700; }
+        .nav-brand span { color: #e94560; }
+        .nav-links { display: flex; gap: 8px; }
+        .nav-links a {
+            color: rgba(255,255,255,0.75);
+            text-decoration: none;
+            padding: 6px 14px;
+            border-radius: 6px;
+            font-size: 14px;
+            font-weight: 500;
+            transition: background 0.2s, color 0.2s;
+        }
+        .nav-links a:hover, .nav-links a.active { background: rgba(255,255,255,0.15); color: #fff; }
+
+        .container { max-width: 1400px; margin: 0 auto; padding: 24px; }
 
         .header {
             background: white;
@@ -259,10 +283,22 @@
     </style>
 </head>
 <body>
+  <nav>
+    <div class="nav-brand">Track<span>IQ</span></div>
+    <div class="nav-links">
+      <a href="/dashboard" class="active">📡 Fleet View</a>
+      {% if is_admin %}
+      <a href="/admin/devices">📦 Device Inventory</a>
+      <a href="/admin/logout" style="color:#e94560">Sign Out</a>
+      {% else %}
+      <a href="/admin/login">🔐 Admin</a>
+      {% endif %}
+    </div>
+  </nav>
     <div class="container">
         <div class="header">
-            <h1>🗺️ GPS Tracking Dashboard</h1>
-            <p style="color: #666; margin-top: 5px;">BYThron GPS Service</p>
+            <h1>🗺️ GPS Fleet Dashboard</h1>
+            <p style="color: #666; margin-top: 5px;">Track IQ — Live Device Monitor</p>
             
             <div class="stats">
                 <div class="stat">

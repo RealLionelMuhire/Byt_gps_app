@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Admin Login — Track IQ</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: 'Segoe UI', sans-serif;
+      background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .card {
+      background: #fff;
+      border-radius: 16px;
+      padding: 48px 40px;
+      width: 100%;
+      max-width: 420px;
+      box-shadow: 0 24px 64px rgba(0,0,0,0.4);
+    }
+    .logo { text-align: center; margin-bottom: 32px; }
+    .logo h1 { font-size: 32px; color: #0f3460; letter-spacing: -1px; }
+    .logo h1 span { color: #e94560; }
+    .logo p { color: #888; margin-top: 6px; font-size: 14px; }
+    label { display: block; font-size: 12px; font-weight: 600; color: #555; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 6px; }
+    input[type=password] {
+      width: 100%;
+      border: 1.5px solid #ddd;
+      border-radius: 10px;
+      padding: 13px 16px;
+      font-size: 16px;
+      outline: none;
+      transition: border-color 0.2s;
+    }
+    input[type=password]:focus { border-color: #0f3460; }
+    .error {
+      background: #fff0f0;
+      border: 1px solid #f5c6cb;
+      color: #721c24;
+      padding: 10px 14px;
+      border-radius: 8px;
+      font-size: 13px;
+      margin-bottom: 18px;
+    }
+    button {
+      width: 100%;
+      background: linear-gradient(135deg, #0f3460, #e94560);
+      color: #fff;
+      border: none;
+      border-radius: 10px;
+      padding: 14px;
+      font-size: 16px;
+      font-weight: 600;
+      cursor: pointer;
+      margin-top: 24px;
+      transition: opacity 0.2s;
+    }
+    button:hover { opacity: 0.9; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="logo">
+      <h1>Track<span>IQ</span></h1>
+      <p>Admin Dashboard</p>
+    </div>
+    {% if error %}
+    <div class="error">⚠️ {{ error }}</div>
+    {% endif %}
+    <form method="POST" action="/admin/login">
+      <label for="secret">Admin Secret Key</label>
+      <input type="password" id="secret" name="secret" placeholder="Enter your admin secret…" autofocus required>
+      <button type="submit">Sign In →</button>
+    </form>
+  </div>
+</body>
+</html>
