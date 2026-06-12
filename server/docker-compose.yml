@@ -28,7 +28,7 @@ services:
       TCP_PORT: 7018
       LOG_LEVEL: INFO
     ports:
-      - "8000:8000"  # HTTP API
+      - "8001:8000"  # HTTP API
       - "7018:7018"  # TCP for GPS trackers
     volumes:
       - ./app:/app/app
