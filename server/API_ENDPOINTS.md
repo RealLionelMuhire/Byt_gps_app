@@ -347,9 +347,35 @@ Get the current user's active plan and payment history.
       "status": "successful",
       "createdAt": "2026-06-14T10:00:00Z"
     }
-  ]
-}
+## Device Lifecycle (Inventory Management)
+
+Every device has a `lifecycle` field that tracks its ownership state:
+
+| Lifecycle | `user_id` | Meaning |
+|---|---|---|
+| `registered` | `null` | Admin added the IMEI to DB and inserted the SIM card. Device has **never connected via TCP**. Not ready to sell. |
+| `in_stock` | `null` | Device sent its first TCP handshake — proven operational. **Ready to sell.** Still owned by the company. |
+| `sold` | set | Device is paired to a customer account. Customer has full ownership. |
+
+### Transition Rules
+
 ```
+Admin registers IMEI
+       ↓
+  [registered]   ← user_id=null, never connected
+       ↓
+  Device powers on, SIM connects, TCP handshake received (0x01 login packet)
+       ↓ (automatic, no action needed)
+  [in_stock]     ← user_id=null, proven functional, ready to sell
+       ↓
+  Optional: admin sends STATUS#/PARAM# command to confirm, then calls /verify
+       ↓
+  Customer scans/enters IMEI + pairing PIN in mobile app → POST /api/devices/pair
+       ↓ (lifecycle set to 'sold' automatically)
+  [sold]         ← user_id=customer_id, customer owns device
+```
+
+> **Key rule:** A customer **cannot pair a `registered` device**. The device must have connected at least once (i.e. be `in_stock`) before it can be sold to a customer. This prevents selling non-functional devices.
 
 ---
 
@@ -362,6 +388,7 @@ List all devices visible to the authenticated user.
 
 **Query params:**
 - `status` — filter by `online` or `offline`
+- `lifecycle` filter is available via the admin dashboard
 - `skip` / `limit` — pagination (default limit: 100, max: 1000)
 
 ---
@@ -377,7 +404,7 @@ Get a device by its 15-digit IMEI number.
 ---
 
 ### `POST /api/devices/`
-Whitelist a new GPS device in the inventory. If `pairing_pin` is omitted, a secure 6-character PIN is auto-generated.
+Whitelist a new GPS device in the inventory. If `pairing_pin` is omitted, a secure 6-character PIN is auto-generated. Device starts with `lifecycle: "registered"`.
 
 **Request:**
 ```json
@@ -385,22 +412,24 @@ Whitelist a new GPS device in the inventory. If `pairing_pin` is omitted, a secu
   "imei": "358765012345678",
   "name": "Fleet Tracker #42",
   "description": "Installed on Toyota Hilux RAC 123A",
+  "sim_number": "+250781234567",
   "pairing_pin": "ABC123"
 }
 ```
 
-**Response `201`:** Full device object including generated `pairing_pin`.
+**Response `201`:** Full device object including generated `pairing_pin` and `lifecycle: "registered"`.
 
 ---
 
 ### `PUT /api/devices/{device_id}`
-Update device name or description.
+Update device name, description, or SIM number.
 
 **Request:**
 ```json
 {
   "name": "New Name",
-  "description": "Updated notes"
+  "description": "Updated notes",
+  "sim_number": "+250789999999"
 }
 ```
 
@@ -412,16 +441,35 @@ Delete device and all associated location data. Status 204 on success.
 ---
 
 ### `POST /api/devices/{device_id}/assign`
-Assign a device to the first user in the database (legacy/admin utility). No auth required.
+Assign a device to the first user in the database (legacy/admin utility). Sets `lifecycle: "sold"`. No auth required.
 
 **Response `200`:**
 ```json
 {
   "message": "Device assigned successfully",
   "device_id": 7,
-  "user_id": 1
+  "user_id": 1,
+  "lifecycle": "sold"
 }
 ```
+
+---
+
+### `POST /api/devices/{device_id}/verify`
+**Admin:** Manually mark a device as verified and ready to sell (`in_stock`). Optional — the TCP handshake already auto-promotes. Use this to force-promote or to confirm after sending a STATUS# command.
+
+**Response `200`:**
+```json
+{
+  "device_id": 7,
+  "imei": "358765012345678",
+  "previous_lifecycle": "registered",
+  "lifecycle": "in_stock",
+  "message": "Device marked as verified and ready to sell."
+}
+```
+
+**Response `409`:** Device is already `sold`.
 
 ---
 

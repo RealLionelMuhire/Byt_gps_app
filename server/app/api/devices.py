@@ -24,6 +24,7 @@ router = APIRouter()
 class DeviceBase(BaseModel):
     name: str
     description: Optional[str] = None
+    sim_number: Optional[str] = None  # SIM card phone number (for SMS configuration)
 
 
 class DeviceCreate(DeviceBase):
@@ -39,6 +40,7 @@ class DeviceResponse(DeviceBase):
     id: int
     imei: str
     pairing_pin: Optional[str]  # Shown on creation; used during mobile pairing
+    lifecycle: str              # registered | in_stock | sold
     status: str
     user_id: Optional[int]
     last_connect: Optional[datetime]
@@ -161,7 +163,9 @@ async def create_device(
         imei=device_data.imei,
         name=device_data.name or f"Tracker-{device_data.imei[-6:]}",
         description=device_data.description,
+        sim_number=device_data.sim_number,
         pairing_pin=pin,
+        lifecycle='registered',  # Starts as 'registered' until TCP handshake received
         user_id=None,
         status='offline'
     )
@@ -212,24 +216,67 @@ async def delete_device(
 
 @router.post("/{device_id}/assign")
 async def assign_device_to_user(device_id: int, db: Session = Depends(get_db)):
-    """Assign a device to the default user."""
+    """Assign a device to the default user (legacy admin utility)."""
     device = db.query(Device).filter(Device.id == device_id).first()
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
-    
+
     user = db.query(User).first()
     if not user:
         raise HTTPException(status_code=404, detail="No user found. Sync a user first via POST /api/auth/sync.")
-    
+
     device.user_id = user.id
+    device.lifecycle = 'sold'
     device.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(device)
-    
+
     return {
         "message": "Device assigned successfully",
         "device_id": device.id,
         "user_id": user.id,
+        "lifecycle": device.lifecycle,
+    }
+
+
+@router.post("/{device_id}/verify")
+async def verify_device(
+    device_id: int,
+    db: Session = Depends(get_db),
+    _: str = Depends(require_auth),
+):
+    """
+    Admin: Manually mark a device as verified and ready to sell.
+
+    This is an optional step after the automatic TCP handshake promotion.
+    Use this when you want to explicitly confirm the device is ready for customer pairing
+    (e.g. after sending a STATUS# or PARAM# command and confirming the response).
+
+    Transition: registered → in_stock (if device has never connected, force it ready).
+    Note: if device is already 'in_stock' or 'sold', this is a no-op.
+    """
+    device = db.query(Device).filter(Device.id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    if device.lifecycle == 'sold':
+        raise HTTPException(
+            status_code=409,
+            detail="Device is already sold and paired to a customer. Cannot modify lifecycle."
+        )
+
+    previous = device.lifecycle
+    device.lifecycle = 'in_stock'
+    device.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(device)
+
+    return {
+        "device_id": device.id,
+        "imei": device.imei,
+        "previous_lifecycle": previous,
+        "lifecycle": device.lifecycle,
+        "message": "Device marked as verified and ready to sell."
     }
 
 

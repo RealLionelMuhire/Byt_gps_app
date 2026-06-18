@@ -159,8 +159,18 @@ class GPSTrackerConnection:
                 # Known device — accept and mark online
                 device.status = 'online'
                 device.last_connect = datetime.utcnow()
+
+                # Auto-promote: first TCP handshake proves the device is functional.
+                # Transition: registered → in_stock (device is now ready to sell).
+                if device.lifecycle == 'registered':
+                    device.lifecycle = 'in_stock'
+                    logger.info(
+                        f"Device IMEI {imei} promoted to 'in_stock' "
+                        "(first TCP handshake received — device is operational)"
+                    )
+
                 db.commit()
-                logger.info(f"Device accepted: IMEI {imei} (id={device.id})")
+                logger.info(f"Device accepted: IMEI {imei} (id={device.id}, lifecycle='{device.lifecycle}')")
 
             finally:
                 db.close()

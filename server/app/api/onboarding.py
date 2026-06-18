@@ -209,6 +209,18 @@ async def pair_device(
     if device.user_id and device.user_id != user.id:
         raise HTTPException(status_code=409, detail="Device already registered to another account.")
 
+    # Guard: device must have proven it's functional (lifecycle != 'registered')
+    # 'registered' means SIM was inserted but device never connected via TCP.
+    if device.lifecycle == 'registered':
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This device has not yet connected to the server. "
+                "Please power it on with the SIM inserted and wait for the signal indicator "
+                "before pairing. Contact support if the issue persists."
+            )
+        )
+
     # PIN validation: if device has a pairing_pin set, the client must supply the correct one
     if device.pairing_pin:
         if not body.pairingPin:
@@ -224,6 +236,7 @@ async def pair_device(
 
     try:
         device.user_id    = user.id
+        device.lifecycle  = 'sold'   # Ownership transferred to customer
         device.updated_at = datetime.utcnow()
 
         user.onboarding_step = 5
@@ -232,8 +245,8 @@ async def pair_device(
         db.commit()
         db.refresh(device)
 
-        logger.info("Paired device IMEI=%s to user %s", imei, clerk_user_id)
-        return {"deviceId": device.id, "status": device.status, "imei": device.imei}
+        logger.info("Paired device IMEI=%s to user %s (lifecycle=sold)", imei, clerk_user_id)
+        return {"deviceId": device.id, "status": device.status, "imei": device.imei, "lifecycle": device.lifecycle}
 
     except SQLAlchemyError as exc:
         db.rollback()
