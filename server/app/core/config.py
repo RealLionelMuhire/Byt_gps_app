@@ -45,8 +45,15 @@ class Settings(BaseSettings):
         """Return the set of authorized admin Clerk user IDs."""
         return {uid.strip() for uid in self.ADMIN_CLERK_USER_IDS.split(",") if uid.strip()}
     
-    # CORS
-    CORS_ORIGINS: list = ["*"]
+    # CORS — accepts a comma-separated string from .env, e.g. "*" or "https://a.com,https://b.com"
+    CORS_ORIGINS: str = "*"
+
+    @property
+    def cors_origins_list(self) -> list:
+        if self.CORS_ORIGINS.strip() == "*":
+            return ["*"]
+        return [o.strip() for o in self.CORS_ORIGINS.split(",") if o.strip()]
+
     
     # Logging
     LOG_LEVEL: str = "INFO"

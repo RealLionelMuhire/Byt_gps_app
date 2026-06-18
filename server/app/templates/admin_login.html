@@ -6,7 +6,6 @@
   <title>Admin Sign In — Track IQ</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-
     body {
       font-family: 'Segoe UI', sans-serif;
       background: linear-gradient(135deg, #1a1a2e 0%, #16213e 50%, #0f3460 100%);
@@ -15,151 +14,290 @@
       flex-direction: column;
       align-items: center;
       justify-content: center;
-      gap: 24px;
+      gap: 28px;
     }
-
-    .logo {
-      text-align: center;
-      color: #fff;
-    }
+    .logo { text-align: center; color: #fff; }
     .logo h1 { font-size: 36px; font-weight: 800; letter-spacing: -1px; }
     .logo h1 span { color: #e94560; }
     .logo p { color: rgba(255,255,255,0.5); font-size: 14px; margin-top: 6px; }
 
-    /* Container for Clerk's component */
-    #clerk-signin {
+    .card {
+      background: rgba(255,255,255,0.05);
+      border: 1px solid rgba(255,255,255,0.12);
+      border-radius: 18px;
+      padding: 44px 40px;
       width: 100%;
-      max-width: 440px;
+      max-width: 400px;
+      text-align: center;
+      backdrop-filter: blur(12px);
     }
 
-    /* Error state (only shown if JS fails before Clerk loads) */
-    .error-card {
-      background: #fff0f0;
-      border: 1px solid #f5c6cb;
-      color: #721c24;
-      padding: 14px 18px;
+    .card-icon { font-size: 48px; margin-bottom: 20px; }
+    .card-title { color: #fff; font-size: 20px; font-weight: 700; margin-bottom: 10px; }
+    .card-sub { color: rgba(255,255,255,0.5); font-size: 14px; line-height: 1.6; margin-bottom: 32px; }
+
+    .btn-primary {
+      display: block;
+      width: 100%;
+      background: linear-gradient(135deg, #e94560, #c23152);
+      color: #fff;
+      border: none;
       border-radius: 10px;
-      font-size: 14px;
-      max-width: 440px;
-      width: 100%;
-      display: none;
+      padding: 15px 24px;
+      font-size: 16px;
+      font-weight: 600;
+      cursor: pointer;
+      text-decoration: none;
+      transition: opacity 0.2s, transform 0.15s;
+      margin-bottom: 12px;
     }
-    .error-card.visible { display: block; }
+    .btn-primary:hover { opacity: 0.88; transform: translateY(-1px); }
 
-    /* Auth error from our verify endpoint */
+    .btn-secondary {
+      display: block;
+      width: 100%;
+      background: rgba(255,255,255,0.08);
+      color: rgba(255,255,255,0.75);
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 10px;
+      padding: 13px 24px;
+      font-size: 14px;
+      font-weight: 500;
+      cursor: pointer;
+      text-decoration: none;
+      transition: background 0.2s;
+    }
+    .btn-secondary:hover { background: rgba(255,255,255,0.14); }
+
+    .divider {
+      color: rgba(255,255,255,0.25);
+      font-size: 12px;
+      margin: 16px 0;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    .divider::before, .divider::after {
+      content: "";
+      flex: 1;
+      height: 1px;
+      background: rgba(255,255,255,0.1);
+    }
+
+    /* Token paste panel */
+    #token-panel { display: none; }
+    #token-panel.open { display: block; }
+
+    #token-panel label {
+      display: block;
+      font-size: 11px;
+      font-weight: 600;
+      color: rgba(255,255,255,0.4);
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 8px;
+      text-align: left;
+    }
+    #token-panel textarea {
+      width: 100%;
+      background: rgba(255,255,255,0.06);
+      border: 1px solid rgba(255,255,255,0.15);
+      border-radius: 8px;
+      color: #fff;
+      padding: 10px 12px;
+      font-size: 12px;
+      font-family: monospace;
+      min-height: 90px;
+      resize: vertical;
+      outline: none;
+    }
+    #token-panel textarea:focus { border-color: #e94560; }
+    .btn-verify {
+      width: 100%;
+      margin-top: 10px;
+      background: rgba(255,255,255,0.1);
+      color: #fff;
+      border: 1px solid rgba(255,255,255,0.2);
+      border-radius: 8px;
+      padding: 11px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.2s;
+    }
+    .btn-verify:hover { background: rgba(255,255,255,0.18); }
+
     #auth-error {
       background: #fff0f0;
       border: 1px solid #f5c6cb;
       color: #721c24;
-      padding: 14px 18px;
-      border-radius: 10px;
-      font-size: 14px;
-      max-width: 440px;
-      width: 100%;
+      padding: 12px 16px;
+      border-radius: 8px;
+      font-size: 13px;
+      margin-bottom: 16px;
       display: none;
+      text-align: left;
     }
     #auth-error.visible { display: block; }
 
-    .spinner {
-      color: rgba(255,255,255,0.6);
-      font-size: 14px;
+    .help-text { color: rgba(255,255,255,0.25); font-size: 12px; }
+
+    #spinner {
+      display: none;
+      width: 18px; height: 18px;
+      border: 2px solid rgba(255,255,255,0.3);
+      border-top-color: #fff;
+      border-radius: 50%;
+      animation: spin 0.7s linear infinite;
+      margin: 0 auto 16px;
     }
+    @keyframes spin { to { transform: rotate(360deg); } }
   </style>
 </head>
 <body>
 
   <div class="logo">
     <h1>Track<span>IQ</span></h1>
-    <p>Admin Dashboard — Sign in to manage devices</p>
+    <p>Admin Dashboard</p>
   </div>
 
-  <!-- Our custom auth error (non-admin, expired token, etc.) -->
-  <div id="auth-error"></div>
+  <div class="card">
+    <div id="auth-error"></div>
+    <div id="spinner"></div>
+    <div class="card-icon">🔐</div>
+    <div class="card-title">Admin Sign In</div>
+    <div class="card-sub">
+      Sign in with your Clerk account.<br>
+      Only whitelisted admins can access this panel.
+    </div>
 
-  <!-- Clerk mounts its sign-in UI here -->
-  <div id="clerk-signin">
-    <p class="spinner">Loading sign-in…</p>
+    {% if clerk_publishable_key %}
+
+    <!-- PRIMARY: load Clerk JS and open sign-in modal on click -->
+    <button class="btn-primary" onclick="signIn()">Continue with Clerk</button>
+
+    <div class="divider">or paste a session token</div>
+
+    <button class="btn-secondary" onclick="toggleTokenPanel()">Use Session Token</button>
+
+    <div id="token-panel">
+      <br>
+      <label>Clerk Session Token (JWT)</label>
+      <textarea id="token-input" placeholder="eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9…"></textarea>
+      <button class="btn-verify" onclick="verifyPasted()">Verify & Sign In →</button>
+    </div>
+
+    {% else %}
+
+    <p style="color:#f5a623;font-size:13px;">
+      ⚠️ <strong>CLERK_PUBLISHABLE_KEY</strong> is not configured.<br>
+      Add it to <code style="font-size:11px">server/.env</code> and restart.
+    </p>
+
+    {% endif %}
   </div>
 
-  <!--
-    Load Clerk's frontend JS using your publishable key.
-    The publishable key is injected server-side from settings.CLERK_PUBLISHABLE_KEY.
-  -->
-  <script>
-    const PUBLISHABLE_KEY = "{{ clerk_publishable_key }}";
+  <p class="help-text">Access restricted to authorized admin accounts only.</p>
 
-    if (!PUBLISHABLE_KEY) {
-      document.getElementById("clerk-signin").innerHTML =
-        '<div class="error-card visible">⚠️ CLERK_PUBLISHABLE_KEY is not configured on this server. Set it in your .env file.</div>';
-    } else {
-      // Dynamically load the Clerk JS bundle
-      const script = document.createElement("script");
-      script.src = "https://cdn.jsdelivr.net/npm/@clerk/clerk-js@latest/dist/clerk.browser.js";
-      script.setAttribute("data-clerk-publishable-key", PUBLISHABLE_KEY);
-      script.crossOrigin = "anonymous";
-      script.onload = initClerk;
-      script.onerror = () => {
-        document.getElementById("clerk-signin").innerHTML =
-          '<div class="error-card visible">⚠️ Failed to load Clerk authentication. Check your internet connection.</div>';
-      };
-      document.head.appendChild(script);
-    }
+  {% if clerk_publishable_key %}
+  <script type="module">
+    const PK = "{{ clerk_publishable_key }}";
+    let clerkInstance = null;
 
-    async function initClerk() {
-      const clerk = window.Clerk;
+    // Expose helpers to onclick handlers (modules are scoped)
+    window.signIn = signIn;
+    window.toggleTokenPanel = toggleTokenPanel;
+    window.verifyPasted = verifyPasted;
+
+    async function getClerk() {
+      if (clerkInstance) return clerkInstance;
+      setLoading(true);
+      const { default: Clerk } = await import(
+        'https://cdn.jsdelivr.net/npm/@clerk/clerk-js@latest/dist/clerk.browser.js'
+      );
+      const clerk = new Clerk(PK);
       await clerk.load();
-
-      // If user is already signed into Clerk, try to verify immediately
-      if (clerk.session) {
-        await tryVerify(clerk);
-        return;
-      }
-
-      // Mount the sign-in component into our container
-      const container = document.getElementById("clerk-signin");
-      container.innerHTML = ""; // clear the "Loading..." text
-      clerk.mountSignIn(container, {
-        afterSignInUrl: window.location.href, // reload this page after Clerk sign-in
-        signUpUrl: null,                       // disable sign-up from admin panel
-      });
-
-      // Clerk fires this event when sign-in completes
-      clerk.addListener(async ({ session }) => {
-        if (session) {
-          await tryVerify(clerk);
-        }
-      });
+      clerkInstance = clerk;
+      setLoading(false);
+      return clerk;
     }
 
-    async function tryVerify(clerk) {
-      const errEl = document.getElementById("auth-error");
-      errEl.className = "";
-      errEl.textContent = "";
-
+    async function signIn() {
       try {
-        // Get the short-lived session JWT from Clerk
-        const token = await clerk.session.getToken();
+        const clerk = await getClerk();
+        if (clerk.session) {
+          await doVerify(clerk.session);
+          return;
+        }
+        // Open Clerk's modal sign-in overlay
+        clerk.openSignIn({
+          afterSignInUrl: window.location.href,
+        });
+        clerk.addListener(async ({ session }) => {
+          if (session) await doVerify(session);
+        });
+      } catch (e) {
+        showError("Could not load Clerk: " + e.message);
+      }
+    }
+
+    async function doVerify(session) {
+      clearError();
+      setLoading(true);
+      try {
+        const token = await session.getToken();
         const resp = await fetch("/admin/auth/verify", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({ token }),
           credentials: "include",
         });
-
         const data = await resp.json();
-
         if (resp.ok && data.ok) {
-          // Session cookie set — redirect to admin dashboard
           window.location.href = data.redirect || "/admin/devices";
         } else {
-          errEl.textContent = "⛔ " + (data.error || "Access denied.");
-          errEl.className = "visible";
+          setLoading(false);
+          showError("⛔ " + (data.error || "Access denied."));
         }
-      } catch (err) {
-        errEl.textContent = "⚠️ Network error during authentication. Please try again.";
-        errEl.className = "visible";
+      } catch (e) {
+        setLoading(false);
+        showError("Network error. Please try again.");
       }
     }
+
+    function verifyPasted() {
+      const token = document.getElementById("token-input").value.trim();
+      if (!token) { showError("Please paste a Clerk session token first."); return; }
+      const fakeSession = { getToken: async () => token };
+      doVerify(fakeSession);
+    }
+
+    function toggleTokenPanel() {
+      document.getElementById("token-panel").classList.toggle("open");
+    }
+
+    function setLoading(on) {
+      document.getElementById("spinner").style.display = on ? "block" : "none";
+    }
+
+    function showError(msg) {
+      const el = document.getElementById("auth-error");
+      el.textContent = msg;
+      el.classList.add("visible");
+    }
+    function clearError() {
+      document.getElementById("auth-error").classList.remove("visible");
+    }
+
+    // Check if already signed in when the page loads
+    (async () => {
+      try {
+        const clerk = await getClerk();
+        if (clerk.session) await doVerify(clerk.session);
+      } catch (_) { /* not signed in yet, show buttons */ }
+    })();
   </script>
+  {% endif %}
+
 </body>
 </html>

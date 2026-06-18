@@ -43,8 +43,17 @@ def get_db():
 
 def init_db():
     """Initialize database - create all tables"""
+    from sqlalchemy import text
+
+    # Enable PostGIS extension first — required for geometry columns.
+    # On Neon (plain PostgreSQL), PostGIS is available but must be explicitly enabled.
+    # On the local postgis/postgis Docker image it is already active, so this is a no-op.
+    with engine.connect() as conn:
+        conn.execute(text("CREATE EXTENSION IF NOT EXISTS postgis;"))
+        conn.commit()
+
     # Import all models here
     from app.models import device, location, user, geofence, trip, trip_settings
-    
+
     # Create tables
     Base.metadata.create_all(bind=engine)

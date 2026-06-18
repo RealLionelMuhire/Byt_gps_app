@@ -1,47 +1,23 @@
 services:
-  # PostgreSQL with PostGIS
-  postgres:
-    image: postgis/postgis:15-3.3
-    container_name: gps_postgres
-    environment:
-      POSTGRES_USER: gps_user
-      POSTGRES_PASSWORD: gps_password
-      POSTGRES_DB: gps_tracking
-    # Don't expose 5432 externally - only accessible within Docker network
-    # ports:
-    #   - "5432:5432"
-    volumes:
-      - postgres_data:/var/lib/postgresql/data
-      - ./init_db.sql:/docker-entrypoint-initdb.d/init.sql
-    networks:
-      - gps_network
-    restart: unless-stopped
-
   # GPS Tracking Server
+  # Uses Neon serverless DB — no local postgres service needed.
+  # All secrets are loaded from the .env file in this directory.
   gps_server:
     build: .
     container_name: gps_tracking_server
+    env_file:
+      - .env             # Loads DATABASE_URL, CLERK_*, ADMIN_*, etc.
     environment:
-      DATABASE_URL: postgresql://gps_user:gps_password@postgres:5432/gps_tracking
+      # These can be overridden here if needed, but .env takes precedence for secrets.
       HOST: 0.0.0.0
       HTTP_PORT: 8000
       TCP_PORT: 7018
-      LOG_LEVEL: INFO
     ports:
-      - "8001:8000"  # HTTP API
+      - "8001:8000"  # HTTP API  →  http://localhost:8001
       - "7018:7018"  # TCP for GPS trackers
     volumes:
       - ./app:/app/app
       - ./logs:/app/logs
-    depends_on:
-      - postgres
-    networks:
-      - gps_network
     restart: unless-stopped
 
-volumes:
-  postgres_data:
-
-networks:
-  gps_network:
-    driver: bridge
+# No local postgres volume needed — using Neon serverless

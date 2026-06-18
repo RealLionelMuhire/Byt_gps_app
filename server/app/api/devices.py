@@ -4,6 +4,8 @@ from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from datetime import datetime
+import secrets
+import string
 
 from app.core.database import get_db
 from app.core.auth import require_auth
@@ -26,6 +28,7 @@ class DeviceBase(BaseModel):
 
 class DeviceCreate(DeviceBase):
     imei: str
+    pairing_pin: Optional[str] = None  # Auto-generated if omitted
 
 
 class DeviceUpdate(DeviceBase):
@@ -35,6 +38,7 @@ class DeviceUpdate(DeviceBase):
 class DeviceResponse(DeviceBase):
     id: int
     imei: str
+    pairing_pin: Optional[str]  # Shown on creation; used during mobile pairing
     status: str
     user_id: Optional[int]
     last_connect: Optional[datetime]
@@ -44,7 +48,7 @@ class DeviceResponse(DeviceBase):
     battery_level: Optional[int]
     gsm_signal: Optional[int]
     created_at: datetime
-    
+
     class Config:
         from_attributes = True
 
@@ -137,15 +141,27 @@ async def create_device(
     db: Session = Depends(get_db),
     _: str = Depends(require_auth),
 ):
-    """Create new device (manual registration)."""
+    """
+    Whitelist a new GPS device in the inventory.
+    If `pairing_pin` is not provided, a secure 6-character PIN is auto-generated.
+    The PIN must be given to the end-user (e.g. printed inside the device box)
+    so they can pair the device from the mobile app.
+    """
     existing = db.query(Device).filter(Device.imei == device_data.imei).first()
     if existing:
         raise HTTPException(status_code=400, detail="Device with this IMEI already exists")
 
+    # Auto-generate a pairing PIN if not supplied
+    pin = (device_data.pairing_pin or "").strip().upper()
+    if not pin:
+        alphabet = string.ascii_uppercase + string.digits
+        pin = "".join(secrets.choice(alphabet) for _ in range(6))
+
     device = Device(
         imei=device_data.imei,
-        name=device_data.name,
+        name=device_data.name or f"Tracker-{device_data.imei[-6:]}",
         description=device_data.description,
+        pairing_pin=pin,
         user_id=None,
         status='offline'
     )
@@ -153,7 +169,6 @@ async def create_device(
     db.add(device)
     db.commit()
     db.refresh(device)
-
     return device
 
 
