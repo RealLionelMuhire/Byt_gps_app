@@ -1,65 +1,54 @@
-# GPS Tracking Application
+# Track IQ — GPS Tracking Application
 
-A complete GPS tracking solution for TK903ELE GPS trackers with real-time monitoring, REST API, and location history.
+A complete GPS tracking solution supporting **TK903ELE** and **G900LS J16-4G** GPS trackers with real-time monitoring, REST API, trip management, and location history.
+
+**Production API:** `https://api.track-iq.tech`  
+**GPS TCP Port:** `7018`  
+**API Docs (Swagger):** `https://api.track-iq.tech/docs`
 
 ## 🚀 Features
 
-- **Real-time GPS tracking** - Track multiple devices simultaneously
-- **TCP Server** - Receives binary protocol data on port 7018
-- **REST API** - Complete API for device and location management
-- **PostGIS Integration** - Spatial queries and GeoJSON export
-- **Battery Monitoring** - Track device battery and signal strength
-- **Location History** - Store and query historical GPS data
-- **Docker Deployment** - One-command setup with Docker Compose
-- **USB Configuration** - Configure devices via USB connection
-- **🆕 Clerk Authentication** - Multi-user support with Clerk authentication integration
+- **Real-time GPS tracking** — Track multiple devices simultaneously via WebSocket
+- **TCP Server** — Receives GT06 binary protocol data on port 7018
+- **REST API** — Complete API for device and location management
+- **Trip Management** — Auto-detected trips, route playback, distance calculations
+- **Battery & Signal Monitoring** — Track device battery level and GSM signal strength
+- **Location History** — Store and query historical GPS data with time filters
+- **Geofencing & Alarms** — SOS, vibration, overspeed, ACC, power-cut alarms
+- **Remote Commands** — Send commands to devices over existing TCP connection (no SMS needed)
+- **Clerk Authentication** — Multi-user support with Clerk JWT integration
+- **Admin Dashboard** — Web UI for device inventory management
+- **Subscription Plans** — Trial / Basic / Fleet plans with Flutterwave payments
+- **Docker Deployment** — One-command setup with Docker Compose
 
-## 🔐 NEW: Clerk Authentication Integration
+## 🔐 Authentication
 
-**Status:** ✅ **COMPLETE AND READY FOR DEPLOYMENT**
+All `/api/*` endpoints (except `/api/auth/sync`) require a Clerk Bearer JWT:
 
-The backend now supports **Clerk authentication** for mobile apps with complete user management and access control.
-
-### Key Features
-- ✅ User sync endpoint for Clerk authentication
-- ✅ Device ownership and filtering by user
-- ✅ Access control on location data
-- ✅ Header-based authentication (`X-Clerk-User-Id`)
-- ✅ Backward compatible with existing system
-
-### Quick Links
-- **[Implementation Summary](CLERK_IMPLEMENTATION_SUMMARY.md)** - Overview and mobile integration
-- **[Complete Documentation](server/CLERK_AUTH_IMPLEMENTATION.md)** - Full API specification
-- **[Quick Setup Guide](server/QUICK_SETUP.md)** - Deployment instructions
-- **[Deployment Checklist](DEPLOYMENT_CHECKLIST.md)** - Step-by-step deployment
-- **[Architecture Diagrams](server/ARCHITECTURE_DIAGRAM.md)** - Visual flow diagrams
-- **[Test Suite](server/test_clerk_auth.py)** - Automated tests
-
-### New API Endpoints
-```
-POST /api/auth/sync              - Sync Clerk user to database
-GET  /api/auth/user/{clerk_id}   - Get user by Clerk ID
-POST /api/devices/{id}/assign    - Assign device to user
-```
-
-### Mobile App Integration
 ```javascript
-// Sync user after Clerk sign-in
-await fetch('http://164.92.212.186:8000/api/auth/sync', {
+// Sync user after Clerk sign-in (no auth header needed)
+await fetch('https://api.track-iq.tech/api/auth/sync', {
   method: 'POST',
   headers: { 'Content-Type': 'application/json' },
   body: JSON.stringify({
     clerk_user_id: user.id,
     email: user.emailAddresses[0].emailAddress,
-    name: user.fullName,
+    first_name: user.firstName,
+    last_name: user.lastName,
   }),
 });
 
-// Add header to all API requests
-await fetch('http://164.92.212.186:8000/api/devices', {
-  headers: { 'X-Clerk-User-Id': clerkUserId },
+// All subsequent API requests use Bearer token
+await fetch('https://api.track-iq.tech/api/devices/', {
+  headers: { 'Authorization': `Bearer ${clerkSessionToken}` },
 });
 ```
+
+### Quick Links
+- **[API Reference](server/API_ENDPOINTS.md)** — Full endpoint documentation
+- **[Device Config Guide](docs/usage/CONFIGURATION_GUIDE.md)** — TK903ELE & G900LS setup
+- **[Deployment Checklist](DEPLOYMENT_CHECKLIST.md)** — Step-by-step deployment
+- **[Architecture Diagrams](server/ARCHITECTURE_DIAGRAM.md)** — Visual flow diagrams
 
 ## 📁 Project Structure
 
@@ -153,7 +142,7 @@ Open browser: http://localhost:8000/docs
 - Ubuntu 24.04 LTS server
 - Docker and Docker Compose installed
 - Ports 7018 (TCP) and 8000 (HTTP) open
-- Domain name (optional): api.gocavgo.com
+- Domain: `api.track-iq.tech`
 
 ### Deploy
 
@@ -170,46 +159,95 @@ chmod +x setup.sh
 sudo ./setup.sh
 
 # 4. Verify deployment
-curl http://localhost:8000/health
+curl https://api.track-iq.tech/health
 ```
 
 ### Configure GPS Tracker for Production
 
-**SMS Method:**
-```sms
-SERVER#your-server-ip#7018#
-APN#internet#
+**TK903ELE (SMS):**
+```
+SERVER,0,api.track-iq.tech,7018,0#
+APN,internet,,#
 ```
 
-**USB Method:**
-```bash
-sudo ./gps_config.py
-# Enter production IP
+**G900LS J16-4G (SMS):**
+```
+SERVER,1,api.track-iq.tech,7018,0#
+APN,internet,,#
+TIMER,20,60#
 ```
 
-For detailed deployment instructions, see [server/DEPLOYMENT.md](server/DEPLOYMENT.md)
+For full device configuration, see [docs/usage/CONFIGURATION_GUIDE.md](docs/usage/CONFIGURATION_GUIDE.md).  
+For deployment details, see [server/DEPLOYMENT.md](server/DEPLOYMENT.md).
 
 ## 📡 API Endpoints
 
-### Device Management
+Full documentation with request/response shapes: **[server/API_ENDPOINTS.md](server/API_ENDPOINTS.md)**  
+Interactive docs: **https://api.track-iq.tech/docs**
 
-- `GET /api/devices/` - List all devices
-- `GET /api/devices/{id}` - Get device by ID
-- `GET /api/devices/imei/{imei}` - Get device by IMEI
-- `POST /api/devices/` - Create device
-- `PUT /api/devices/{id}` - Update device
-- `DELETE /api/devices/{id}` - Delete device
-- `GET /api/devices/{id}/status` - Device status
+### Auth
+- `POST /api/auth/sync` — Sync Clerk user (no auth needed)
+- `GET /api/auth/me` — Current user profile
+- `GET /api/auth/user/{clerk_id}` — User by Clerk ID
+- `POST /api/auth/admin-create-user` — Create user (admin)
+
+### Onboarding
+- `POST /api/users` — Create/update user profile
+- `POST /api/devices/pair` — Pair device by IMEI + PIN
+- `GET /api/devices/{imei}/status` — Poll device status (by IMEI)
+- `POST /api/vehicles` — Register vehicle
+- `GET /api/vehicles` — List user's vehicles
+- `POST /api/payments/verify` — Verify Flutterwave payment
+- `POST /api/subscriptions` — Activate subscription
+- `POST /api/subscriptions/upgrade` — Upgrade plan
+- `GET /api/billing` — Current plan + payment history
+
+### Device Management
+- `GET /api/devices/` — List devices
+- `GET /api/devices/{id}` — Get device by ID
+- `GET /api/devices/imei/{imei}` — Get device by IMEI
+- `POST /api/devices/` — Register device (admin)
+- `PUT /api/devices/{id}` — Update device
+- `DELETE /api/devices/{id}` — Delete device
+- `GET /api/devices/{id}/status` — Device status + battery
+- `GET /api/devices/{id}/diagnostics` — Packet interval analysis
+- `GET /api/devices/{id}/trips` — List device trips
+
+### Remote Commands (sent over TCP, no SMS)
+- `POST /api/devices/{id}/command` — Send raw command
+- `POST /api/devices/{id}/alarm/vibration` — Toggle vibration alarm
+- `POST /api/devices/{id}/alarm/lowbattery` — Toggle low battery alarm
+- `POST /api/devices/{id}/alarm/acc` — Toggle ACC alarm
+- `POST /api/devices/{id}/alarm/overspeed` — Toggle overspeed alarm
+- `POST /api/devices/{id}/alarm/displacement` — Toggle movement alarm
+- `POST /api/devices/{id}/alarm/sos` — Toggle SOS alarm
+- `POST /api/devices/{id}/fuel/cut` — Immobilize vehicle
+- `POST /api/devices/{id}/fuel/restore` — Re-enable vehicle
+- `POST /api/devices/{id}/query/location` — Request location from device
+- `POST /api/devices/{id}/query/status` — Request status from device
 
 ### Location Tracking
+- `GET /api/locations/{device_id}/latest` — Latest position
+- `GET /api/locations/{device_id}/history` — Location history
+- `GET /api/locations/{device_id}/route` — Route as GeoJSON FeatureCollection
+- `GET /api/locations/{device_id}/route-line` — Route as GeoJSON LineString
+- `GET /api/locations/{device_id}/distance` — Total distance in time range
+- `GET /api/locations/{device_id}/alarms` — Alarm events
+- `GET /api/locations/nearby` — Find nearby devices
 
-- `GET /api/locations/{device_id}/latest` - Latest position
-- `GET /api/locations/{device_id}/history` - Location history
-- `GET /api/locations/{device_id}/route` - Route as GeoJSON
-- `GET /api/locations/{device_id}/alarms` - Alarm events
-- `GET /api/locations/nearby` - Find nearby devices
+### Trips
+- `GET /api/trips` — List trips for device
+- `POST /api/trips` — Create trip from history
+- `POST /api/trips/start` — Start active trip
+- `GET /api/trips/suggested` — Auto-suggested trip segments
+- `GET /api/trips/settings` — Trip segmentation settings
+- `PUT /api/trips/settings` — Update trip settings
+- `GET /api/trips/{id}` — Trip detail + route
+- `POST /api/trips/{id}/end` — End active trip
+- `DELETE /api/trips/{id}` — Delete trip
 
-Full API documentation: http://your-server:8000/docs
+### Real-time
+- `WS /ws/locations/{device_id}` — Live location stream
 
 ## 🔧 Device Configuration Tools
 
@@ -308,18 +346,24 @@ python -m app.main
 
 ## 📊 Hardware Compatibility
 
-**Tested with:**
-- TK903ELE GPS Tracker (v1.1.6)
-- Protocol: Binary 0x7878...0x0D0A
-- Connection: USB via CH341 or TCP
-- SIM: MTN Rwanda (IoT/M2M recommended)
+**Supported Devices:**
+
+| # | Model | Network | Config Method |
+|---|-------|---------|---------------|
+| 1 | TK903ELE (v1.1.6) | GSM/GPRS | SMS `SERVER,0,...` / USB AT commands |
+| 2 | G900LS J16-4G | LTE/GSM | SMS `SERVER,1,...` |
+
+**Protocol:** GT06 binary (`0x7878...0x0D0A`)
 
 **Packet Types Supported:**
-- 0x01 - Login (IMEI authentication)
-- 0x12 - Location data (GPS coordinates)
-- 0x13 - Heartbeat (battery, signal)
-- 0x16 - Alarm events (SOS, geofence)
-- 0x80 - Command responses
+- `0x01` — Login (IMEI authentication)
+- `0x12` — Location data (GPS coordinates)
+- `0x13` — Heartbeat (battery, signal)
+- `0x15` — Command response
+- `0x16` — Alarm events (SOS, vibration, etc.)
+- `0x80` — Server→Device commands
+
+**SIM:** Any SIM with GPRS/LTE data (MTN Rwanda: APN `internet`)
 
 ## 🤝 Contributing
 
@@ -336,8 +380,8 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 ## 👤 Author
 
 **Leo**
-- Project: GOCAVGO GPS Tracking System
-- Server: api.gocavgo.com
+- Project: Track IQ GPS Tracking System
+- Server: api.track-iq.tech
 
 ## 🆘 Support
 
@@ -347,31 +391,46 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 
 ## 🎯 Roadmap
 
-- [ ] JWT authentication
-- [ ] WebSocket for real-time updates
-- [ ] Geofencing with alerts
-- [ ] Mobile app (Flutter)
-- [ ] Web dashboard
-- [ ] Multi-user support
-- [ ] Command sending to devices
-- [ ] Route playback
-- [ ] Analytics and reports
+**Completed ✅**
+- [x] Clerk JWT authentication
+- [x] WebSocket real-time location streaming
+- [x] Alarm events (SOS, vibration, overspeed, ACC, power cut)
+- [x] Admin web dashboard
+- [x] Multi-user support
+- [x] Remote command sending over TCP
+- [x] Trip management with auto-detection
+- [x] Subscription / billing (Flutterwave)
+- [x] Distance calculation, route playback
+- [x] Geofence model (DB schema ready)
+
+**Planned 📋**
+- [ ] Mobile app (Flutter / React Native)
+- [ ] Geofence alerts (active enforcement)
+- [ ] Driver behavior analysis (harsh braking, acceleration)
+- [ ] Fuel consumption tracking
+- [ ] OTA firmware updates
+- [ ] Multi-tenant fleet management
 
 ## 📞 GPS Tracker Commands (SMS)
 
-```sms
-# Set server
-SERVER#ip_address#port#
+**TK903ELE:**
+```
+SERVER,0,api.track-iq.tech,7018,0#
+APN,internet,,#
+fix020s060m***n123456
+check123456
+```
 
-# Set APN
-APN#internet#
-
-# Query status
-STATUS#
-
-# Restart device
+**G900LS J16-4G:**
+```
+SERVER,1,api.track-iq.tech,7018,0#
+APN,internet,,#
+TIMER,20,60#
+SZCS#SLPDISCONNECT=0
 RESET#
 ```
+
+Full command reference: [docs/usage/CONFIGURATION_GUIDE.md](docs/usage/CONFIGURATION_GUIDE.md)
 
 ## 🌐 Useful Links
 
