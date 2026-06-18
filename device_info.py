@@ -23,7 +23,7 @@ class BatteryMonitorASCII:
         self.baudrate = baudrate
         self.timeout = timeout
         self.ser = None
-        self.server_url = server_url or "http://164.92.212.186:8000"
+        self.server_url = server_url or "https://api.track-iq.tech"
     
     def connect(self):
         """Connect to the GPS tracker"""
@@ -459,7 +459,7 @@ Examples:
   sudo ./device_info.py
   sudo ./device_info.py --duration 60
   sudo ./device_info.py --debug
-  sudo ./device_info.py --server http://164.92.212.186:8000
+  sudo ./device_info.py --server https://api.track-iq.tech
         """
     )
     
@@ -491,8 +491,8 @@ Examples:
     
     parser.add_argument(
         '--server',
-        default='http://164.92.212.186:8000',
-        help='GPS tracking server URL (default: http://164.92.212.186:8000)'
+        default='https://api.track-iq.tech',
+        help='GPS tracking server URL (default: https://api.track-iq.tech)'
     )
     
     args = parser.parse_args()
