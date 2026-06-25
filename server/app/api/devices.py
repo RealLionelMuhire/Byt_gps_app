@@ -94,10 +94,10 @@ async def list_devices(
     return devices
 
 
-@router.get("/rejected", response_model=List[Dict[str, Any]])
+@router.get("/rejected")
 async def list_rejected_devices(
     request: Request,
-    _: str = Depends(require_auth),
+    clerk_user_id: str = Depends(require_auth),
 ):
     """Get the list of recently rejected unknown IMEI connections."""
     tcp_server = getattr(request.app.state, "tcp_server", None)
