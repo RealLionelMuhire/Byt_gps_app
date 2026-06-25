@@ -1,7 +1,7 @@
 """Device API endpoints"""
 
-from typing import List, Optional
-from fastapi import APIRouter, Depends, HTTPException, Query
+from typing import List, Optional, Dict, Any
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.orm import Session
 from datetime import datetime
 import secrets
@@ -92,6 +92,28 @@ async def list_devices(
 
     devices = query.offset(skip).limit(limit).all()
     return devices
+
+
+@router.get("/rejected", response_model=List[Dict[str, Any]])
+async def list_rejected_devices(
+    request: Request,
+    _: str = Depends(require_auth),
+):
+    """Get the list of recently rejected unknown IMEI connections."""
+    tcp_server = getattr(request.app.state, "tcp_server", None)
+    if not tcp_server:
+        return []
+    
+    rejected = []
+    for r in tcp_server.rejected_imeis:
+        diff = int((datetime.utcnow() - r["time"]).total_seconds())
+        rejected.append({
+            "imei": r["imei"],
+            "ip": r["ip"],
+            "time": r["time"].isoformat(),
+            "seconds_ago": diff
+        })
+    return rejected
 
 
 @router.get("/{device_id}/trips", response_model=List[TripResponse])
