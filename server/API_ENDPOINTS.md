@@ -951,8 +951,9 @@ Protected by Clerk-based session cookie. Only users in `ADMIN_CLERK_USER_IDS` ca
 | `GET /admin/login` | Clerk sign-in page |
 | `POST /admin/auth/verify` | Exchange Clerk JWT for session cookie |
 | `GET /admin/logout` | Clear session, redirect to login |
-| `GET /admin/devices` | Device inventory management UI |
-| `POST /admin/devices` | Add a new device to the whitelist |
+| `GET /admin/devices` | Device inventory management UI (shows recent rejected connections) |
+| `POST /admin/devices` | Add a new device to the whitelist (accepts `sim_number`) |
+| `POST /admin/devices/{imei}/verify`| Manually promote from `registered` to `in_stock` and send test command |
 | `POST /admin/devices/{imei}/delete` | Remove an unpaired device |
 | `GET /dashboard` | Read-only fleet monitor (public) |
 
@@ -1027,17 +1028,19 @@ Updates `devices.battery_level` and `devices.gsm_signal`.
 Admin (Web UI)                  GPS Hardware               Mobile App (User)
      │                               │                           │
      │ POST /admin/devices           │                           │
-     │ {imei, name, pairingPin}      │                           │
+     │ {imei, name, sim_number}      │                           │
      │ ──────────────────────►DB     │                           │
+     │ (State: registered)           │                           │
      │                               │ TCP Login (IMEI)          │
      │                               │ ──────────────────────►   │
      │                               │  Server checks whitelist  │
-     │                               │  ✅ Accept → mark online  │
+     │                               │  ✅ Auto-promotes to      │
+     │                               │     in_stock              │
      │                               │                           │
      │                               │                 POST /api/devices/pair
      │                               │                 {imei, pairingPin}
      │                               │                 ──────────────────►DB
-     │                               │                 ✅ Link user_id
+     │                               │                 ✅ State -> sold
      │                               │                           │
      │                               │                 GET /api/devices/{imei}/status
      │                               │                 ← {status: "online"}

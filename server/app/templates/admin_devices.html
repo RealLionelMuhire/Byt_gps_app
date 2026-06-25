@@ -179,6 +179,29 @@
     .btn-del:hover { background: #fff0f0; }
     .empty-state { text-align: center; padding: 60px 40px; color: #aaa; }
     .empty-state .icon { font-size: 56px; margin-bottom: 16px; }
+
+    /* ── REJECTED LIST ── */
+    .rejected-panel {
+      background: #fff;
+      border-radius: 14px;
+      padding: 20px;
+      margin-bottom: 28px;
+      border: 1px solid #fecaca;
+      box-shadow: 0 4px 12px rgba(239, 68, 68, 0.08);
+    }
+    .rejected-panel h3 { color: #b91c1c; font-size: 16px; margin-bottom: 12px; display: flex; align-items: center; gap: 8px; }
+    .rejected-list { list-style: none; display: flex; flex-direction: column; gap: 8px; }
+    .rejected-item { display: flex; justify-content: space-between; align-items: center; background: #fef2f2; padding: 10px 14px; border-radius: 8px; font-size: 14px; }
+    .rejected-info { color: #7f1d1d; }
+    .btn-quick-add { background: #ef4444; color: #fff; border: none; padding: 6px 12px; border-radius: 6px; font-size: 12px; font-weight: 600; cursor: pointer; }
+    .btn-quick-add:hover { background: #dc2626; }
+
+    /* ── LIFECYCLE CHIP ── */
+    .lc-chip { font-size: 11px; padding: 3px 8px; border-radius: 12px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; }
+    .lc-registered { background: #f3f4f6; color: #4b5563; border: 1px solid #d1d5db; }
+    .lc-instock { background: #dcfce7; color: #166534; border: 1px solid #bbf7d0; }
+    .lc-sold { background: #e0e7ff; color: #3730a3; border: 1px solid #c7d2fe; }
+
     @media(max-width:768px){
       .form-grid { grid-template-columns: 1fr; }
       .stats { flex-direction: column; }
@@ -225,8 +248,8 @@
       <form method="POST" action="/admin/devices">
         <div class="form-grid">
           <div class="field">
-            <label>IMEI (15 digits) *</label>
-            <input type="text" name="imei" maxlength="15" pattern="[0-9]{15}" placeholder="358765012345678"
+            <label>IMEI (15 or 16 digits) *</label>
+            <input type="text" name="imei" maxlength="16" pattern="[0-9]{15,16}" placeholder="358765012345678" id="add-imei"
                    value="{{ form.imei if form else '' }}" required>
           </div>
           <div class="field">
@@ -235,17 +258,75 @@
                    value="{{ form.name if form else '' }}">
           </div>
           <div class="field">
-            <label>Pairing PIN</label>
-            <input type="text" name="pairing_pin" maxlength="8" placeholder="Auto-generated if blank"
-                   value="{{ form.pairing_pin if form else '' }}" style="font-family:monospace; letter-spacing:2px;">
-            <div class="pin-hint">Leave blank to auto-generate a secure 6-character PIN.</div>
+            <label>SIM Phone #</label>
+            <input type="text" name="sim_number" placeholder="e.g. +25078..."
+                   value="{{ form.sim_number if form else '' }}">
           </div>
-          <div>
-            <button type="submit" class="btn-add">Add Device</button>
+          <div class="field">
+            <label>Pairing PIN</label>
+            <input type="text" name="pairing_pin" maxlength="8" placeholder="Auto-gen if blank"
+                   value="{{ form.pairing_pin if form else '' }}" style="font-family:monospace; letter-spacing:2px;">
+            <div class="pin-hint">Leave blank to auto-generate.</div>
+          </div>
+          <div class="field">
+            <label>Hardware Model</label>
+            <select name="hardware_model" style="padding: 10px; border-radius: 8px; border: 1px solid #ddd; width: 100%; box-sizing: border-box; background: white; font-size: 14px; font-family: inherit;">
+              <option value="">Unknown / Other</option>
+              <option value="G900LS J16-4G" {% if form and form.hardware_model == 'G900LS J16-4G' %}selected{% endif %}>G900LS J16-4G (Power USB)</option>
+              <option value="TK903ELE" {% if form and form.hardware_model == 'TK903ELE' %}selected{% endif %}>TK903ELE (Data USB)</option>
+              <option value="GT06" {% if form and form.hardware_model == 'GT06' %}selected{% endif %}>Generic GT06</option>
+            </select>
+          </div>
+          <div class="field">
+            <label>SIM Expiry Date</label>
+            <input type="date" name="sim_renewal_date" style="padding: 10px; border-radius: 8px; border: 1px solid #ddd; width: 100%; box-sizing: border-box; font-family: inherit;">
+          </div>
+          <div style="grid-column: 1 / -1;">
+            <button type="submit" class="btn-add">Add Single Device</button>
           </div>
         </div>
       </form>
     </div>
+
+    <!-- Bulk Upload Form -->
+    <div class="add-panel" style="margin-top: 20px;">
+      <h2>📥 Bulk Register Devices (CSV)</h2>
+      <form method="POST" action="/admin/devices/bulk" enctype="multipart/form-data" style="display: flex; gap: 16px; align-items: center; margin-top: 12px;">
+        <input type="file" name="file" accept=".csv" required style="padding: 8px;">
+        <button type="submit" class="btn-add" style="background: #0f3460;">Upload & Register</button>
+      </form>
+      <div class="pin-hint" style="margin-top: 8px;">
+        Required CSV headers: <code>imei, name, sim_number, hardware_model</code>
+      </div>
+    </div>
+
+    <!-- Unregistered Devices -->
+    {% if rejected_imeis %}
+    <div class="rejected-panel">
+      <h3>⚠️ Connection Attempts from Unknown Devices</h3>
+      <p style="font-size: 13px; color: #666; margin-bottom: 12px;">These trackers are trying to connect to your server but their IMEIs are not whitelisted above.</p>
+      <ul class="rejected-list">
+        {% for r in rejected_imeis %}
+        <li class="rejected-item">
+          <div class="rejected-info">
+            <strong>{{ r.imei }}</strong> 
+            <span style="opacity: 0.7; margin-left: 8px;">({{ r.duration }} via IP: {{ r.ip }})</span>
+          </div>
+          <form method="POST" action="/admin/devices" style="margin: 0;">
+            <input type="hidden" name="imei" value="{{ r.imei }}">
+            <input type="hidden" name="name" value="">
+            <input type="hidden" name="description" value="">
+            <input type="hidden" name="sim_number" value="">
+            <input type="hidden" name="pairing_pin" value="">
+            <input type="hidden" name="hardware_model" value="">
+            <input type="hidden" name="sim_renewal_date" value="">
+            <button type="submit" class="btn-quick-add">Register Instantly ⚡</button>
+          </form>
+        </li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% endif %}
 
     <!-- Device Table -->
     <div class="table-wrap">
@@ -257,20 +338,33 @@
         <thead>
           <tr>
             <th>Device Name</th>
-            <th>IMEI</th>
-            <th>Pairing PIN</th>
+            <th>IMEI & Model</th>
+            <th>Pairing PIN & SIM</th>
+            <th>Lifecycle</th>
             <th>Status</th>
             <th>Owner</th>
             <th>Last Seen</th>
-            <th></th>
+            <th>Actions</th>
           </tr>
         </thead>
         <tbody>
           {% for d in devices %}
           <tr>
             <td><strong>{{ d.name }}</strong>{% if d.description %}<br><small style="color:#aaa">{{ d.description }}</small>{% endif %}</td>
-            <td class="imei-mono">{{ d.imei }}</td>
-            <td><span class="pin-badge">{{ d.pairing_pin }}</span></td>
+            <td>
+              <span class="imei-mono">{{ d.imei }}</span><br>
+              <small style="color:#666;">{{ d.hardware_model }}</small>
+            </td>
+            <td>
+              <span class="pin-badge">{{ d.pairing_pin }}</span><br>
+              <small style="color:#888;">📱 {{ d.sim_number }}</small>
+              {% if d.sim_renewal_date %}
+              <br><small style="color:#b91c1c;">📅 Exp: {{ d.sim_renewal_date }}</small>
+              {% endif %}
+            </td>
+            <td>
+              <span class="lc-chip lc-{{ d.lifecycle | replace('_', '') }}">{{ d.lifecycle }}</span>
+            </td>
             <td>
               <span class="status-dot">
                 <span class="dot dot-{{ d.status }}"></span>
@@ -286,10 +380,31 @@
             </td>
             <td style="font-size:13px; color:#888;">{{ d.last_seen_duration }}</td>
             <td>
+              {% if d.lifecycle == 'registered' %}
+              <form method="POST" action="/admin/devices/{{ d.imei }}/verify" style="display:inline;"
+                    onsubmit="return confirm('Manually mark {{ d.imei }} as verified/in-stock and send a test command?')">
+                <button type="submit" class="btn-quick-add" style="background:#0f3460; margin-bottom:4px;">Verify Setup</button>
+              </form>
+              {% endif %}
+
+              {% if d.lifecycle == 'in_stock' %}
+              <button class="btn-quick-add" style="background:#16a34a; margin-bottom:4px;" 
+                      onclick="window.open('https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=' + encodeURIComponent('{{ d.imei }}:{{ d.pairing_pin }}'), '_blank')">
+                Print QR Label
+              </button>
+              {% endif %}
+              
+              {% if d.owner_email %}
+              <form method="POST" action="/admin/devices/{{ d.imei }}/unpair" style="display:inline;"
+                    onsubmit="return confirm('WARNING: This will revoke ownership from the current user and reset the device to IN STOCK. Continue?')">
+                <button type="submit" class="btn-del" style="margin-bottom:4px; padding: 6px 12px; font-weight: 600;">Unpair & Reclaim</button>
+              </form>
+              {% endif %}
+
               {% if not d.owner_email %}
-              <form method="POST" action="/admin/devices/{{ d.imei }}/delete"
+              <form method="POST" action="/admin/devices/{{ d.imei }}/delete" style="display:inline;"
                     onsubmit="return confirm('Remove IMEI {{ d.imei }} from inventory?')">
-                <button type="submit" class="btn-del">Remove</button>
+                <button type="submit" class="btn-del" style="padding: 6px 12px; font-weight: 600;">Delete</button>
               </form>
               {% endif %}
             </td>

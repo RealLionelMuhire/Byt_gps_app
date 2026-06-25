@@ -202,6 +202,14 @@ Interactive docs: **https://api.track-iq.tech/docs**
 - `POST /api/subscriptions/upgrade` — Upgrade plan
 - `GET /api/billing` — Current plan + payment history
 
+### Admin Dashboard (Web UI)
+Admin users can manage the fleet inventory via the secure web interface at `https://api.track-iq.tech/admin/login`.
+- Manage whitelisted IMEIs
+- Record SIM Phone Numbers
+- Monitor "Unknown Connection Attempts" (Unregistered devices radar)
+- Track Device Lifecycle (`registered` → `in_stock` → `sold`)
+- Manually trigger TCP `PARAM#` test commands to verify setups
+
 ### Device Management
 - `GET /api/devices/` — List devices
 - `GET /api/devices/{id}` — Get device by ID
@@ -213,7 +221,7 @@ Interactive docs: **https://api.track-iq.tech/docs**
 - `GET /api/devices/{id}/diagnostics` — Packet interval analysis
 - `GET /api/devices/{id}/trips` — List device trips
 
-### Remote Commands (sent over TCP, no SMS)
+### Remote Commands (Sent via TCP, no SMS required)
 - `POST /api/devices/{id}/command` — Send raw command
 - `POST /api/devices/{id}/alarm/vibration` — Toggle vibration alarm
 - `POST /api/devices/{id}/alarm/lowbattery` — Toggle low battery alarm

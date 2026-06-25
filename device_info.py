@@ -26,20 +26,48 @@ class BatteryMonitorASCII:
         self.server_url = server_url or "https://api.track-iq.tech"
     
     def connect(self):
-        """Connect to the GPS tracker"""
-        try:
-            self.ser = serial.Serial(
-                port=self.port,
-                baudrate=self.baudrate,
-                bytesize=serial.EIGHTBITS,
-                parity=serial.PARITY_NONE,
-                stopbits=serial.STOPBITS_ONE,
-                timeout=self.timeout
-            )
-            return True
-        except serial.SerialException as e:
-            print(f"❌ Error connecting to {self.port}: {e}")
-            return False
+        """Connect to the GPS tracker, auto-detecting baud rate if needed."""
+        # Try the configured baud rate first, then fall back to common rates
+        baud_rates = [self.baudrate] if self.baudrate else []
+        for rate in [9600, 115200, 19200, 38400, 57600]:
+            if rate not in baud_rates:
+                baud_rates.append(rate)
+
+        for rate in baud_rates:
+            try:
+                ser = serial.Serial(
+                    port=self.port,
+                    baudrate=rate,
+                    bytesize=serial.EIGHTBITS,
+                    parity=serial.PARITY_NONE,
+                    stopbits=serial.STOPBITS_ONE,
+                    timeout=2
+                )
+                # Send a probe command and wait for any reply
+                ser.write(b'AT+ZDR=check123456\r\n')
+                time.sleep(0.5)
+                if ser.in_waiting > 0:
+                    self.baudrate = rate
+                    self.ser = ser
+                    self.ser.timeout = self.timeout
+                    return True
+                # Also accept if device sends unsolicited data (binary protocol)
+                ser.write(b'AT\r\n')
+                time.sleep(0.5)
+                if ser.in_waiting > 0:
+                    self.baudrate = rate
+                    self.ser = ser
+                    self.ser.timeout = self.timeout
+                    return True
+                ser.close()
+            except serial.SerialException as e:
+                print(f"❌ Error connecting to {self.port} at {rate}: {e}")
+                return False
+
+        print(f"❌ No response at any baud rate on {self.port}")
+        print("   → G900LS J16-4G: USB port is power-only. Configure via SMS instead.")
+        print("   → TK903ELE: Check the device is powered on (12V) and USB cable is connected.")
+        return False
     
     def parse_status_message(self, message):
         """Parse ASCII status message from GPS tracker"""
@@ -435,9 +463,10 @@ class BatteryMonitorASCII:
             if message_count == 0:
                 print("\n❌ No status messages received")
                 print("\n💡 Troubleshooting:")
-                print("   1. Is the device powered on (12V)?")
-                print("   2. Try: sudo ./test_connection.py")
-                print("   3. Check baud rate with: sudo ./analyze_protocol.py")
+                print("   1. TK903ELE: Is the device powered on (12V)?")
+                print("   2. G900LS J16-4G: USB is power-only — no serial data. Use SMS to configure.")
+                print("   3. Try: sudo ./test_connection.py")
+                print("   4. Try a specific baud rate: sudo ./device_info.py --baud 9600")
             else:
                 print(f"\n✅ Received {message_count} status messages")
             
@@ -472,8 +501,8 @@ Examples:
     parser.add_argument(
         '--baud',
         type=int,
-        default=115200,
-        help='Baud rate (default: 115200)'
+        default=None,
+        help='Baud rate (default: auto-detect). TK903ELE is typically 9600.'
     )
     
     parser.add_argument(

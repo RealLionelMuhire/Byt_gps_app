@@ -16,12 +16,14 @@ import hmac
 import hashlib
 from datetime import datetime
 
-from fastapi import APIRouter, Request, Form
+from fastapi import APIRouter, Request, Form, UploadFile, File
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy.orm import Session
 from fastapi import Depends
 import os
+import csv
+import io
 
 from app.core.database import get_db
 from app.core.config import settings
@@ -164,6 +166,10 @@ def _build_device_data(devices, db):
             "longitude": device.last_longitude,
             "battery_level": device.battery_level or 0,
             "gsm_signal": device.gsm_signal or 0,
+            "lifecycle": device.lifecycle,
+            "sim_number": device.sim_number or "—",
+            "hardware_model": device.hardware_model or "—",
+            "sim_renewal_date": device.sim_renewal_date.strftime("%Y-%m-%d") if device.sim_renewal_date else None,
             "last_seen": last_seen,
             "last_seen_duration": format_duration(last_seen_seconds),
             "sending_status": sending_status,
@@ -269,9 +275,19 @@ async def admin_devices(request: Request, db: Session = Depends(get_db)):
 
     devices = db.query(Device).order_by(Device.created_at.desc()).all()
     device_data = _build_device_data(devices, db)
+    
+    tcp_server = getattr(request.app.state, "tcp_server", None)
+    rejected_imeis = tcp_server.rejected_imeis if tcp_server else []
+
+    # Format time for rejected list
+    for r in rejected_imeis:
+        diff = datetime.utcnow() - r["time"]
+        r["duration"] = format_duration(int(diff.total_seconds()))
+
     return templates.TemplateResponse("admin_devices.html", {
         "request": request,
         "devices": device_data,
+        "rejected_imeis": rejected_imeis,
         "total_devices": len(device_data),
         "online_devices": len([d for d in device_data if d["status"] == "online"]),
         "paired_devices": len([d for d in device_data if d["owner_email"]]),
@@ -284,7 +300,10 @@ async def admin_add_device(
     imei: str = Form(...),
     name: str = Form(...),
     description: str = Form(""),
+    sim_number: str = Form(""),
     pairing_pin: str = Form(""),
+    hardware_model: str = Form(""),
+    sim_renewal_date: str = Form(""),
     db: Session = Depends(get_db),
 ):
     if not _check_admin(request):
@@ -300,8 +319,8 @@ async def admin_add_device(
             "total_devices": len(device_data),
             "online_devices": len([d for d in device_data if d["status"] == "online"]),
             "paired_devices": len([d for d in device_data if d["owner_email"]]),
-            "error": "Invalid IMEI — must be exactly 15 digits.",
-            "form": {"imei": imei, "name": name, "description": description},
+            "error": "Invalid IMEI — must be exactly 15 or 16 digits.",
+            "form": {"imei": imei, "name": name, "description": description, "sim_number": sim_number, "hardware_model": hardware_model},
         })
 
     existing = db.query(Device).filter(Device.imei == imei).first()
@@ -315,16 +334,27 @@ async def admin_add_device(
             "online_devices": len([d for d in device_data if d["status"] == "online"]),
             "paired_devices": len([d for d in device_data if d["owner_email"]]),
             "error": f"Device with IMEI {imei} already exists.",
-            "form": {"imei": imei, "name": name, "description": description},
+            "form": {"imei": imei, "name": name, "description": description, "sim_number": sim_number, "hardware_model": hardware_model},
         })
 
     pin = pairing_pin.strip().upper() or _generate_pin()
+    
+    renewal_dt = None
+    if sim_renewal_date:
+        try:
+            renewal_dt = datetime.strptime(sim_renewal_date, "%Y-%m-%d")
+        except ValueError:
+            pass
 
     device = Device(
         imei=imei,
         name=name.strip() or f"Tracker-{imei[-6:]}",
         description=description.strip() or None,
+        sim_number=sim_number.strip() or None,
+        hardware_model=hardware_model.strip() or None,
+        sim_renewal_date=renewal_dt,
         pairing_pin=pin,
+        lifecycle="registered",
         status="offline",
     )
     db.add(device)
@@ -347,3 +377,98 @@ async def admin_delete_device(
         db.delete(device)
         db.commit()
     return RedirectResponse(url="/admin/devices", status_code=302)
+
+
+@router.post("/admin/devices/{imei}/verify")
+async def admin_verify_device(
+    imei: str,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """
+    Manually mark a device as verified/in_stock, optionally sending a TCP test command.
+    """
+    if not _check_admin(request):
+        return RedirectResponse(url="/admin/login", status_code=302)
+
+    device = db.query(Device).filter(Device.imei == imei).first()
+    if device and device.lifecycle == 'registered':
+        device.lifecycle = 'in_stock'
+        device.updated_at = datetime.utcnow()
+        
+        # Try to send a PARAM# command to test it if it's connected
+        tcp_server = getattr(request.app.state, "tcp_server", None)
+        if tcp_server and device.status == 'online':
+            # This is async, we don't await the response here because 
+            # we just want to trigger it and let the device process it.
+            import asyncio
+            asyncio.create_task(tcp_server.send_command_to_device(imei, "PARAM#"))
+
+        db.commit()
+
+    return RedirectResponse(url="/admin/devices", status_code=302)
+
+
+@router.post("/admin/devices/{imei}/unpair")
+async def admin_unpair_device(
+    imei: str,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """
+    Reclaim a device from a user (transfer ownership back to the company).
+    Resets user_id, lifecycle to in_stock, and generates a new pairing pin.
+    """
+    if not _check_admin(request):
+        return RedirectResponse(url="/admin/login", status_code=302)
+
+    device = db.query(Device).filter(Device.imei == imei).first()
+    if device and device.user_id:
+        device.user_id = None
+        device.lifecycle = 'in_stock'
+        device.pairing_pin = _generate_pin()
+        device.updated_at = datetime.utcnow()
+        db.commit()
+
+    return RedirectResponse(url="/admin/devices", status_code=302)
+
+
+@router.post("/admin/devices/bulk")
+async def admin_add_device_bulk(
+    request: Request,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+):
+    """
+    Bulk register devices from a CSV file.
+    Expected CSV columns: imei, name, sim_number, hardware_model
+    """
+    if not _check_admin(request):
+        return RedirectResponse(url="/admin/login", status_code=302)
+
+    contents = await file.read()
+    decoded = contents.decode("utf-8")
+    reader = csv.DictReader(io.StringIO(decoded))
+
+    added = 0
+    for row in reader:
+        imei = row.get("imei", "").strip()
+        if not imei or not (15 <= len(imei) <= 16):
+            continue
+
+        existing = db.query(Device).filter(Device.imei == imei).first()
+        if not existing:
+            device = Device(
+                imei=imei,
+                name=row.get("name", "").strip() or f"Tracker-{imei[-6:]}",
+                sim_number=row.get("sim_number", "").strip() or None,
+                hardware_model=row.get("hardware_model", "").strip() or None,
+                pairing_pin=_generate_pin(),
+                lifecycle="registered",
+                status="offline",
+            )
+            db.add(device)
+            added += 1
+
+    db.commit()
+    return RedirectResponse(url=f"/admin/devices?bulk_added={added}", status_code=302)

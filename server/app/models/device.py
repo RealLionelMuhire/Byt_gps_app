@@ -40,6 +40,8 @@ class Device(Base):
     description = Column(String(500), nullable=True)
     pairing_pin = Column(String(8), nullable=True)  # Secret PIN printed inside device box
     sim_number = Column(String(20), nullable=True)   # Phone number of the SIM card inside device
+    hardware_model = Column(String(50), nullable=True) # e.g. 'G900LS J16-4G', 'TK903ELE'
+    sim_renewal_date = Column(DateTime, nullable=True) # When the SIM airtime/data expires
 
     # Inventory lifecycle
     # Values: 'registered' | 'in_stock' | 'sold'

@@ -192,8 +192,8 @@ async def pair_device(
     Returns 404 if the IMEI is unknown, 409 if already paired to another user.
     """
     imei = body.imei.strip()
-    if not imei.isdigit() or len(imei) != 15:
-        raise HTTPException(status_code=400, detail="Invalid IMEI — must be exactly 15 digits")
+    if not imei.isdigit() or len(imei) not in (15, 16):
+        raise HTTPException(status_code=400, detail="Invalid IMEI — must be exactly 15 or 16 digits")
 
     # Look up by IMEI
     device = db.query(Device).filter(Device.imei == imei).first()

@@ -25,6 +25,8 @@ class DeviceBase(BaseModel):
     name: str
     description: Optional[str] = None
     sim_number: Optional[str] = None  # SIM card phone number (for SMS configuration)
+    hardware_model: Optional[str] = None
+    sim_renewal_date: Optional[datetime] = None
 
 
 class DeviceCreate(DeviceBase):
