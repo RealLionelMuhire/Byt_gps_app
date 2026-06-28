@@ -17,7 +17,7 @@ from datetime import datetime, timedelta
 from typing import Optional
 
 import httpx
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
@@ -29,6 +29,7 @@ from app.models.user import User
 from app.models.device import Device
 from app.models.vehicle import Vehicle
 from app.models.subscription import Subscription, Payment
+from app.api.devices import _check_pair_rate_limit
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -182,6 +183,7 @@ async def create_or_update_user(
 @router.post("/devices/pair")
 async def pair_device(
     body: DevicePairRequest,
+    request: Request,
     clerk_user_id: str = Depends(require_auth),
     db: Session = Depends(get_db),
 ):
@@ -191,6 +193,10 @@ async def pair_device(
     The IMEI must already exist in the `devices` table (pre-loaded by admin).
     Returns 404 if the IMEI is unknown, 409 if already paired to another user.
     """
+    # Rate limit: max 5 attempts per IP per 60 seconds
+    client_ip = request.client.host if request.client else "unknown"
+    _check_pair_rate_limit(client_ip)
+
     imei = body.imei.strip()
     if not imei.isdigit() or len(imei) not in (15, 16):
         raise HTTPException(status_code=400, detail="Invalid IMEI — must be exactly 15 or 16 digits")

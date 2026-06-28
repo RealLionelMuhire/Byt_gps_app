@@ -277,12 +277,19 @@ async def admin_devices(request: Request, db: Session = Depends(get_db)):
     device_data = _build_device_data(devices, db)
     
     tcp_server = getattr(request.app.state, "tcp_server", None)
-    rejected_imeis = tcp_server.rejected_imeis if tcp_server else []
-
+    raw_rejected = tcp_server.rejected_imeis if tcp_server else []
+    
+    # Get all currently registered IMEIs to filter out resolved items
+    registered_imeis = {d.imei for d in devices}
+    
+    rejected_imeis = []
     # Format time for rejected list
-    for r in rejected_imeis:
+    for r in raw_rejected:
+        if r["imei"] in registered_imeis:
+            continue
         diff = datetime.utcnow() - r["time"]
         r["duration"] = format_duration(int(diff.total_seconds()))
+        rejected_imeis.append(r)
 
     return templates.TemplateResponse("admin_devices.html", {
         "request": request,

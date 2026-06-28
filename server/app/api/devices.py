@@ -3,9 +3,11 @@
 from typing import List, Optional, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy.orm import Session
-from datetime import datetime
+from datetime import datetime, timedelta
 import secrets
 import string
+import time
+from collections import defaultdict
 
 from app.core.database import get_db
 from app.core.auth import require_auth
@@ -18,6 +20,24 @@ from app.models.user import User
 from pydantic import BaseModel
 
 router = APIRouter()
+
+# ── Simple in-memory rate limiter for pairing endpoint ────────────────────────
+_pair_attempts: Dict[str, list] = defaultdict(list)  # ip -> [timestamps]
+_PAIR_WINDOW_SECONDS = 60
+_PAIR_MAX_ATTEMPTS   = 5
+
+def _check_pair_rate_limit(ip: str):
+    """Raise 429 if the IP has exceeded pairing attempt limits."""
+    now = time.monotonic()
+    cutoff = now - _PAIR_WINDOW_SECONDS
+    # Keep only recent attempts
+    _pair_attempts[ip] = [t for t in _pair_attempts[ip] if t > cutoff]
+    if len(_pair_attempts[ip]) >= _PAIR_MAX_ATTEMPTS:
+        raise HTTPException(
+            status_code=429,
+            detail=f"Too many pairing attempts. Please wait {_PAIR_WINDOW_SECONDS} seconds and try again."
+        )
+    _pair_attempts[ip].append(now)
 
 
 # Pydantic schemas
@@ -97,6 +117,7 @@ async def list_devices(
 @router.get("/rejected")
 async def list_rejected_devices(
     request: Request,
+    db: Session = Depends(get_db),
     clerk_user_id: str = Depends(require_auth),
 ):
     """Get the list of recently rejected unknown IMEI connections."""
@@ -104,8 +125,15 @@ async def list_rejected_devices(
     if not tcp_server:
         return []
     
+    # Get all currently registered IMEIs
+    registered_imeis = {row[0] for row in db.query(Device.imei).all()}
+    
     rejected = []
-    for r in tcp_server.rejected_imeis:
+    # Iterate over a copy since we might mutate the original list later
+    for r in list(tcp_server.rejected_imeis):
+        if r["imei"] in registered_imeis:
+            continue  # Skip devices that have already been registered!
+            
         diff = int((datetime.utcnow() - r["time"]).total_seconds())
         rejected.append({
             "imei": r["imei"],
@@ -215,6 +243,12 @@ async def update_device(
     device.name = device_data.name
     if device_data.description is not None:
         device.description = device_data.description
+    if device_data.sim_number is not None:
+        device.sim_number = device_data.sim_number
+    if device_data.hardware_model is not None:
+        device.hardware_model = device_data.hardware_model
+    if device_data.sim_renewal_date is not None:
+        device.sim_renewal_date = device_data.sim_renewal_date
     device.updated_at = datetime.utcnow()
 
     db.commit()
@@ -238,29 +272,8 @@ async def delete_device(
     return None
 
 
-@router.post("/{device_id}/assign")
-async def assign_device_to_user(device_id: int, db: Session = Depends(get_db)):
-    """Assign a device to the default user (legacy admin utility)."""
-    device = db.query(Device).filter(Device.id == device_id).first()
-    if not device:
-        raise HTTPException(status_code=404, detail="Device not found")
-
-    user = db.query(User).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="No user found. Sync a user first via POST /api/auth/sync.")
-
-    device.user_id = user.id
-    device.lifecycle = 'sold'
-    device.updated_at = datetime.utcnow()
-    db.commit()
-    db.refresh(device)
-
-    return {
-        "message": "Device assigned successfully",
-        "device_id": device.id,
-        "user_id": user.id,
-        "lifecycle": device.lifecycle,
-    }
+# assign_device_to_user was removed — it was an unauthenticated legacy utility.
+# Use POST /api/devices/pair from the mobile app for proper device ownership transfer.
 
 
 @router.post("/{device_id}/verify")
@@ -304,9 +317,35 @@ async def verify_device(
     }
 
 
+@router.get("/imei/{imei}/status")
+async def get_device_status_by_imei_ownership(
+    imei: str,
+    db: Session = Depends(get_db),
+    clerk_user_id: str = Depends(require_auth),
+):
+    """
+    Get device status by IMEI — ownership-checked.
+    Used by the mobile app's device-wait screen to poll for first signal.
+    Returns 404 if the device doesn't exist or isn't owned by the requesting user.
+    """
+    user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    device = db.query(Device).filter(
+        Device.imei == imei,
+        Device.user_id == user.id,
+    ).first()
+
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found or not paired to your account")
+
+    return {"status": device.status}
+
+
 @router.get("/{device_id}/status")
 async def get_device_status(device_id: int, db: Session = Depends(get_db)):
-    """Get device current status"""
+    """Get device current status by numeric device ID (admin use)"""
     device = db.query(Device).filter(Device.id == device_id).first()
     
     if not device:
