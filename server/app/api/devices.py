@@ -103,10 +103,19 @@ async def list_devices(
     limit: int = Query(100, ge=1, le=1000),
     status: Optional[str] = Query(None, description="Filter by status: online, offline"),
     db: Session = Depends(get_db),
-    _: str = Depends(require_auth),
+    clerk_user_id: str = Depends(require_auth),
 ):
     """List GPS tracker devices."""
+    user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
+    if not user:
+        raise HTTPException(status_code=401, detail="User not found")
+
     query = db.query(Device)
+    
+    # If not admin, only show devices paired to this user
+    if not user.is_admin:
+        query = query.filter(Device.user_id == user.id)
+
     if status:
         query = query.filter(Device.status == status)
 
