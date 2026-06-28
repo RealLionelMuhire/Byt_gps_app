@@ -344,26 +344,68 @@ async def get_device_status_by_imei_ownership(
 
 
 @router.get("/{device_id}/status")
-async def get_device_status(device_id: int, db: Session = Depends(get_db)):
-    """Get device current status by numeric device ID (admin use)"""
-    device = db.query(Device).filter(Device.id == device_id).first()
-    
-    if not device:
-        raise HTTPException(status_code=404, detail="Device not found")
-    
-    return {
-        "id": device.id,
-        "imei": device.imei,
-        "name": device.name,
-        "status": device.status,
-        "last_update": device.last_update,
-        "battery_level": device.battery_level,
-        "gsm_signal": device.gsm_signal,
-        "location": {
-            "latitude": device.last_latitude,
-            "longitude": device.last_longitude
-        } if device.last_latitude and device.last_longitude else None
-    }
+async def get_device_status(
+    device_id: str,
+    request: Request,
+    db: Session = Depends(get_db),
+):
+    """
+    Get device status by numeric device ID or by IMEI.
+
+    - If device_id looks like an IMEI (15-16 digits), perform an ownership-aware
+      lookup using the caller's Clerk JWT (required for mobile app polling).
+    - Otherwise treat it as a numeric admin device ID (no auth required).
+    """
+    is_imei = device_id.isdigit() and len(device_id) in (15, 16)
+
+    if is_imei:
+        # Ownership-aware path — mobile app polls this after pairing
+        from app.core.auth import _verify_clerk_token
+        auth_header = request.headers.get("Authorization", "")
+        token = auth_header.removeprefix("Bearer ").strip()
+        clerk_user_id = await _verify_clerk_token(token) if token else None
+
+        if not clerk_user_id:
+            raise HTTPException(status_code=401, detail="Authentication required")
+
+        user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+
+        device = db.query(Device).filter(
+            Device.imei == device_id,
+            Device.user_id == user.id,
+        ).first()
+
+        if not device:
+            raise HTTPException(status_code=404, detail="Device not found or not paired to your account")
+
+        return {"status": device.status}
+
+    else:
+        # Numeric device ID path — admin use, no ownership check
+        try:
+            dev_id = int(device_id)
+        except ValueError:
+            raise HTTPException(status_code=422, detail="device_id must be numeric or a 15-16 digit IMEI")
+
+        device = db.query(Device).filter(Device.id == dev_id).first()
+        if not device:
+            raise HTTPException(status_code=404, detail="Device not found")
+
+        return {
+            "id": device.id,
+            "imei": device.imei,
+            "name": device.name,
+            "status": device.status,
+            "last_update": device.last_update,
+            "battery_level": device.battery_level,
+            "gsm_signal": device.gsm_signal,
+            "location": {
+                "latitude": device.last_latitude,
+                "longitude": device.last_longitude,
+            } if device.last_latitude and device.last_longitude else None,
+        }
 
 
 @router.get("/{device_id}/diagnostics", response_model=DeviceDiagnosticsResponse)
