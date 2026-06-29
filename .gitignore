@@ -65,3 +65,7 @@ server/__pycache__/
 *.tmp
 *.temp
 .env
+
+# Utility scripts
+check_users.py
+make_admin.py
