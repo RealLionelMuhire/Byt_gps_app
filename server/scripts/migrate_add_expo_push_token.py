@@ -1,38 +1,32 @@
-#!/usr/bin/env python3
-"""
-migrate_add_expo_push_token.py
-
-Adds the expo_push_token column to the users table.
-Run once on the DigitalOcean server after deploying the updated code.
-
-Usage (SSH into the droplet):
-    cd /path/to/server
-    python3 scripts/migrate_add_expo_push_token.py
-"""
-
 import sys
 import os
+import logging
 
-# Make sure the app package is importable from the server root
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+# Match the pattern used by cron_expiry.py — add server root to path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
-from sqlalchemy import text, inspect
-from app.core.database import engine
+from sqlalchemy import text
+from app.core.database import SessionLocal
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 def run():
-    insp = inspect(engine)
-    cols = [c["name"] for c in insp.get_columns("users")]
-
-    if "expo_push_token" in cols:
-        print("✅  expo_push_token already exists — nothing to do.")
-        return
-
-    with engine.begin() as conn:
-        conn.execute(text(
-            "ALTER TABLE users ADD COLUMN expo_push_token VARCHAR(255) NULL"
+    db = SessionLocal()
+    try:
+        # IF NOT EXISTS makes this safe to run multiple times
+        db.execute(text(
+            "ALTER TABLE users ADD COLUMN IF NOT EXISTS expo_push_token VARCHAR(255) NULL"
         ))
-    print("✅  Migration complete: expo_push_token column added to users table.")
+        db.commit()
+        logger.info("✅  Migration complete: expo_push_token column ready.")
+    except Exception as e:
+        db.rollback()
+        logger.error("❌  Migration failed: %s", e)
+        sys.exit(1)
+    finally:
+        db.close()
 
 
 if __name__ == "__main__":
