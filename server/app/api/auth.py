@@ -121,10 +121,19 @@ async def sync_user(
                 first_name=user_data.first_name or "Unknown",
                 last_name=user_data.last_name or "Unknown",
                 is_admin=is_first_user,
+                # Admins skip the customer onboarding flow entirely
+                onboarding_complete=is_first_user,
+                onboarding_step=9 if is_first_user else 0,
                 created_at=datetime.utcnow(),
                 updated_at=datetime.utcnow()
             )
             db.add(user)
+        
+        # If this is an existing admin, ensure their onboarding is marked complete
+        # (handles the case where admins were created before this fix)
+        if user.is_admin and not user.onboarding_complete:
+            user.onboarding_complete = True
+            user.onboarding_step = 9
         
         # Commit changes
         db.commit()
@@ -290,3 +299,35 @@ async def admin_create_user(
         db.rollback()
         logger.error(f"Database error during admin user creation: {str(e)}")
         raise HTTPException(status_code=500, detail="Database error occurred")
+
+
+# ── Push notification token ────────────────────────────────────────────────
+
+class PushTokenRequest(BaseModel):
+    """Request body for saving an Expo push token."""
+    token: str
+
+
+@router.put("/push-token", status_code=200)
+async def update_push_token(
+    body: PushTokenRequest,
+    clerk_user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    """
+    Store (or update) the Expo push token for the authenticated user.
+
+    Called by the mobile app once on login so the backend can send push
+    notifications when a GPS alarm fires on one of their devices.
+    """
+    user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user.expo_push_token = body.token
+    user.updated_at = datetime.utcnow()
+    db.commit()
+
+    logger.info("Push token updated for user %s", clerk_user_id)
+    return {"ok": True}
+

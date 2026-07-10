@@ -6,6 +6,7 @@ Handles binary protocol communication
 
 import asyncio
 import logging
+import httpx
 from typing import Dict, Optional, Set
 from datetime import datetime
 import struct
@@ -472,6 +473,9 @@ class TCPServer:
             "timestamp": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
         }
         await self.ws_manager.broadcast(device_id, payload)
+
+        # Also send a push notification to the device owner (works when app is backgrounded)
+        await self._send_push_notification(device_id, data)
     
     async def send_command_to_device(self, imei: str, command: str, timeout: float = 10.0) -> Dict:
         """Send an ASCII command to a connected device and return the response."""
@@ -479,3 +483,69 @@ class TCPServer:
         if not connection:
             return {"success": False, "error": "Device not connected"}
         return await connection.send_command(command, timeout=timeout)
+
+    async def _send_push_notification(self, device_id: int, data: Dict) -> None:
+        """
+        Send an Expo push notification to the owner of a device when an alarm fires.
+        Looks up the owner's expo_push_token from the DB and posts to the Expo Push API.
+        Non-fatal: any failure is logged but does not affect the WS broadcast.
+        """
+        ALARM_LABELS: Dict[str, tuple] = {
+            "sos":          ("\U0001f198 SOS Alert",         "Emergency SOS triggered"),
+            "vibration":    ("\U0001f4f3 Vibration Detected", "Unusual movement detected on your vehicle"),
+            "low_battery":  ("\U0001faab Low Battery",        "GPS tracker battery is running low"),
+            "acc":          ("\U0001f511 Ignition Change",    "Vehicle ignition changed state"),
+            "overspeed":    ("\u26a1 Overspeed Alert",        "Vehicle exceeded the speed limit"),
+            "displacement": ("\U0001f4cd Displacement Alert", "Vehicle moved outside the allowed radius"),
+        }
+
+        db = SessionLocal()
+        try:
+            device = db.query(Device).filter(Device.id == device_id).first()
+            if not device or not device.user_id:
+                return
+
+            from app.models.user import User
+            user = db.query(User).filter(User.id == device.user_id).first()
+            if not user or not user.expo_push_token:
+                return
+
+            alarm_key = str(data.get("alarm_type", "")).lower()
+            title, body_text = ALARM_LABELS.get(
+                alarm_key,
+                ("\U0001f6a8 Device Alarm", f"Alarm triggered: {alarm_key}")
+            )
+            body_text = f"{device.name} \u2022 {body_text}"
+
+            push_payload = {
+                "to": user.expo_push_token,
+                "title": title,
+                "body": body_text,
+                "sound": "default",
+                "priority": "high",
+                "channelId": "gps-alarms",
+                "data": {
+                    "type": "alarm",
+                    "device_id": device_id,
+                    "alarm_type": alarm_key,
+                },
+            }
+
+            async with httpx.AsyncClient(timeout=6.0) as client:
+                resp = await client.post(
+                    "https://exp.host/--/api/v2/push/send",
+                    json=push_payload,
+                    headers={"Content-Type": "application/json", "Accept": "application/json"},
+                )
+                if resp.status_code == 200:
+                    logger.info(
+                        "Push notification sent to user %d for device %d (alarm: %s)",
+                        user.id, device_id, alarm_key,
+                    )
+                else:
+                    logger.warning("Expo push API returned %d: %s", resp.status_code, resp.text[:200])
+
+        except Exception as exc:
+            logger.error("Failed to send push notification for device %d: %s", device_id, exc)
+        finally:
+            db.close()

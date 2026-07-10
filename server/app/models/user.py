@@ -19,6 +19,7 @@ class User(Base):
     is_admin = Column(Boolean, default=False, nullable=False)
     onboarding_step = Column(Integer, default=0, nullable=False)
     onboarding_complete = Column(Boolean, default=False, nullable=False)
+    expo_push_token = Column(String(255), nullable=True)  # Expo push token for mobile notifications
     
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
