@@ -25,7 +25,8 @@ class UserSyncRequest(BaseModel):
     email: EmailStr
     first_name: Optional[str] = None
     last_name: Optional[str] = None
-    
+    name: Optional[str] = None  # Alternative: full name (split into first/last)
+
     class Config:
         json_schema_extra = {
             "example": {
@@ -74,6 +75,7 @@ class UserResponse(BaseModel):
 @router.post("/sync", response_model=UserResponse, status_code=200)
 async def sync_user(
     user_data: UserSyncRequest,
+    clerk_user_id: str = Depends(require_auth),
     db: Session = Depends(get_db)
 ):
     """
@@ -101,25 +103,33 @@ async def sync_user(
             User.clerk_user_id == user_data.clerk_user_id
         ).first()
         
+        # Resolve first/last name from either `name` or `first_name`/`last_name`
+        resolved_first = user_data.first_name
+        resolved_last = user_data.last_name
+        if not resolved_first and not resolved_last and user_data.name:
+            parts = user_data.name.strip().split(" ", 1)
+            resolved_first = parts[0]
+            resolved_last = parts[1] if len(parts) > 1 else ""
+
         if user:
             # Update existing user
             logger.info(f"Updating existing user: {user_data.clerk_user_id}")
             user.email = user_data.email
-            if user_data.first_name is not None:
-                user.first_name = user_data.first_name
-            if user_data.last_name is not None:
-                user.last_name = user_data.last_name
+            if resolved_first is not None:
+                user.first_name = resolved_first
+            if resolved_last is not None:
+                user.last_name = resolved_last
             user.updated_at = datetime.utcnow()
         else:
             # Create new user
             is_first_user = db.query(User).count() == 0
-            
+
             logger.info(f"Creating new user: {user_data.clerk_user_id}. First user admin: {is_first_user}")
             user = User(
                 clerk_user_id=user_data.clerk_user_id,
                 email=user_data.email,
-                first_name=user_data.first_name or "Unknown",
-                last_name=user_data.last_name or "Unknown",
+                first_name=resolved_first or "Unknown",
+                last_name=resolved_last or "Unknown",
                 is_admin=is_first_user,
                 # Admins skip the customer onboarding flow entirely
                 onboarding_complete=is_first_user,
