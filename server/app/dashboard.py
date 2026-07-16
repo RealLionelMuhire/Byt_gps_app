@@ -30,7 +30,7 @@ from app.core.config import settings
 from app.core.auth import _verify_clerk_token
 from app.models.device import Device
 from app.models.location import Location
-from app.models.user import User
+from app.models.user import User, Role
 
 router = APIRouter()
 
@@ -62,7 +62,7 @@ def _sign_session(clerk_user_id: str) -> str:
 def _verify_session(cookie_value: str) -> str | None:
     """
     Verify the session cookie and return the embedded clerk_user_id,
-    or None if the cookie is missing, tampered, or the user is not an admin.
+    or None if the cookie is missing or tampered.
     """
     if not cookie_value or ":" not in cookie_value:
         return None
@@ -72,24 +72,38 @@ def _verify_session(cookie_value: str) -> str | None:
         return None
 
     expected = _sign_session(clerk_user_id)
-    # Constant-time comparison prevents timing attacks
     if not hmac.compare_digest(expected, f"{clerk_user_id}:{provided_sig}"):
-        return None
-
-    # Confirm the user is still in the admin whitelist
-    if clerk_user_id not in settings.admin_user_ids:
         return None
 
     return clerk_user_id
 
 
 def _get_admin(request: Request) -> str | None:
-    """Return the admin's Clerk user ID from the session cookie, or None."""
+    """Return the Clerk user ID from the session cookie, or None."""
     return _verify_session(request.cookies.get(SESSION_COOKIE, ""))
 
 
 def _check_admin(request: Request) -> bool:
     return _get_admin(request) is not None
+
+
+async def _require_admin_dashboard(
+    request: Request,
+    db: Session = Depends(get_db),
+) -> User:
+    """
+    Dashboard auth dependency: verify session cookie and check DB role
+    is ADMIN or SUPER_ADMIN. Redirects to login on failure.
+    """
+    clerk_user_id = _get_admin(request)
+    if not clerk_user_id:
+        raise HTTPException(status_code=302, detail="Redirecting to login")
+
+    user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
+    if not user or user.role not in (Role.SUPER_ADMIN, Role.ADMIN):
+        raise HTTPException(status_code=302, detail="Redirecting to login")
+
+    return user
 
 
 
@@ -213,11 +227,12 @@ async def admin_login_page(request: Request):
 
 
 @router.post("/admin/auth/verify")
-async def admin_auth_verify(request: Request):
+async def admin_auth_verify(request: Request, db: Session = Depends(get_db)):
     """
     Called by the Clerk JS component after a successful sign-in.
     Expects JSON body: { "token": "<clerk_session_jwt>" }
-    Validates the token, checks admin whitelist, and sets a signed session cookie.
+    Validates the token, checks DB role (must be ADMIN or SUPER_ADMIN),
+    and sets a signed session cookie.
     """
     try:
         body = await request.json()
@@ -233,16 +248,12 @@ async def admin_auth_verify(request: Request):
     if not clerk_user_id:
         return JSONResponse({"error": "Invalid or expired Clerk token."}, status_code=401)
 
-    # Check admin whitelist
-    if not settings.admin_user_ids:
-        return JSONResponse(
-            {"error": "No admin users configured. Set ADMIN_CLERK_USER_IDS in your .env file."},
-            status_code=403
-        )
-    if clerk_user_id not in settings.admin_user_ids:
+    # Check DB role — must be ADMIN or SUPER_ADMIN
+    user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
+    if not user or user.role not in (Role.SUPER_ADMIN, Role.ADMIN):
         return JSONResponse(
             {"error": "Your account does not have admin access. Contact the system administrator."},
-            status_code=403
+            status_code=403,
         )
 
     # Issue signed session cookie
@@ -252,9 +263,9 @@ async def admin_auth_verify(request: Request):
         key=SESSION_COOKIE,
         value=session_value,
         httponly=True,
-        secure=not settings.DEBUG,  # False on localhost (HTTP), True in production (HTTPS)
+        secure=not settings.DEBUG,
         samesite="lax",
-        max_age=3600 * 8,  # 8-hour session
+        max_age=3600 * 8,
     )
     return response
 

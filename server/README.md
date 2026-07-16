@@ -84,8 +84,6 @@ SECRET_KEY=run-openssl-rand-hex-32-and-paste-here
 # Clerk Authentication
 CLERK_SECRET_KEY=sk_test_...
 CLERK_PUBLISHABLE_KEY=pk_test_...
-# Comma-separated Clerk User IDs allowed to access /admin
-ADMIN_CLERK_USER_IDS=user_2abc123
 
 # Payments (optional for local dev)
 FLUTTERWAVE_SECRET_KEY=FLWSECK-...
@@ -160,7 +158,18 @@ All `/api/*` endpoints require a valid **Clerk JWT** in the `Authorization: Bear
 
 ### Admin Dashboard Authentication
 
-`/admin/*` routes use a Clerk-based sign-in. After successful Clerk authentication, the server checks the user's Clerk ID against `ADMIN_CLERK_USER_IDS`. If authorized, a signed session cookie (HMAC-SHA256) is issued for 8 hours.
+`/admin/*` routes use a Clerk-based sign-in. After successful Clerk authentication, the server checks the user's role in the database. Only users with `ADMIN` or `SUPER_ADMIN` role can access the admin dashboard. A signed session cookie (HMAC-SHA256) is issued for 8 hours.
+
+### Role Management
+
+User roles are managed via `GET /api/auth/users` (list) and `PUT /api/auth/users/{id}/role` (update). The four roles are:
+
+| Role | Permissions |
+|------|-------------|
+| `SUPER_ADMIN` | Full access, can assign any role |
+| `ADMIN` | Admin dashboard, manage all devices |
+| `TECHNICIAN` | View all devices and diagnostics |
+| `USER` | Default — own devices only |
 
 ---
 
@@ -172,7 +181,6 @@ All `/api/*` endpoints require a valid **Clerk JWT** in the `Authorization: Bear
 | `SECRET_KEY` | ✅ | Random 32-byte hex string for signing session cookies |
 | `CLERK_SECRET_KEY` | ✅ | Clerk backend secret (`sk_live_...` or `sk_test_...`) |
 | `CLERK_PUBLISHABLE_KEY` | ✅ | Clerk frontend key (`pk_live_...`) — for admin login page |
-| `ADMIN_CLERK_USER_IDS` | ✅ | Comma-separated Clerk User IDs with admin access |
 | `FLUTTERWAVE_SECRET_KEY` | For payments | Flutterwave secret key for payment verification |
 | `ADMIN_SECRET` | Optional | Legacy header secret for `POST /api/auth/admin-create-user` |
 | `DEBUG` | Optional | `True` for local dev (disables HTTPS-only cookies) |

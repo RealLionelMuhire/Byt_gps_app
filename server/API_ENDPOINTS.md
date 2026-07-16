@@ -16,7 +16,7 @@ Authorization: Bearer <clerk_session_token>
 
 The token is a short-lived JWT issued by Clerk after the user signs in on the mobile app. The server validates it against Clerk's JWKS endpoint.
 
-**Admin dashboard** (`/admin/*`) uses a separate Clerk-based sign-in and a signed session cookie. Only users whose Clerk User ID is listed in `ADMIN_CLERK_USER_IDS` can access it.
+**Admin dashboard** (`/admin/*`) uses a separate Clerk-based sign-in and a signed session cookie. Only users with `ADMIN` or `SUPER_ADMIN` role in the database can access it.
 
 ---
 
@@ -91,13 +91,15 @@ Syncs a Clerk-authenticated user into the local database (upsert). Called automa
   "email": "user@example.com",
   "first_name": "Jane",
   "last_name": "Doe",
-  "is_admin": false,
+  "role": "USER",
   "onboarding_step": 0,
   "onboarding_complete": false,
   "created_at": "2026-06-12T10:00:00Z",
   "updated_at": "2026-06-12T10:00:00Z"
 }
 ```
+
+The first user ever created gets `role: "SUPER_ADMIN"`; all subsequent users default to `role: "USER"`. The role can be updated by an admin via `PUT /api/auth/users/{id}/role`.
 
 ---
 
@@ -138,6 +140,62 @@ Create a new user account in Clerk and sync to the local DB. Used by admins to p
 
 **Response `201`:** Full user object.  
 **Response `401`:** Invalid admin secret.
+
+---
+
+### `GET /api/auth/users`
+List all users. Requires `ADMIN` or `SUPER_ADMIN` role.
+
+**Headers:** `Authorization: Bearer <token>`
+
+**Query params:**
+- `skip` (int, default 0) — pagination offset
+- `limit` (int, default 100, max 500) — page size
+
+**Response `200`:**
+```json
+[
+  {
+    "id": 1,
+    "clerk_user_id": "user_2abc...",
+    "email": "admin@example.com",
+    "first_name": "Super",
+    "last_name": "Admin",
+    "role": "SUPER_ADMIN",
+    "onboarding_complete": true,
+    "created_at": "2026-01-01T00:00:00Z",
+    "updated_at": "2026-06-01T00:00:00Z"
+  }
+]
+```
+
+**Response `403`:** Caller does not have admin access.
+
+---
+
+### `PUT /api/auth/users/{id}/role`
+Update a user's role. Requires `ADMIN` or `SUPER_ADMIN` role. Only `SUPER_ADMIN` can assign the `SUPER_ADMIN` role.
+
+**Headers:** `Authorization: Bearer <token>`
+
+**Request:**
+```json
+{
+  "role": "ADMIN"
+}
+```
+
+Valid roles: `SUPER_ADMIN`, `ADMIN`, `TECHNICIAN`, `USER`.
+
+**Response `200`:** Full user object with updated role.
+
+**Response `400`:** Invalid role name.
+
+**Response `403`:** Insufficient permissions (e.g. non-SUPER_ADMIN trying to assign SUPER_ADMIN).
+
+**Response `404`:** User not found.
+
+**Response `409`:** Cannot demote the last remaining `SUPER_ADMIN`.
 
 ---
 
@@ -944,7 +1002,7 @@ Client may send any text frame as a keep-alive ping (ignored by server). Connect
 
 ## Admin Dashboard (Web UI)
 
-Protected by Clerk-based session cookie. Only users in `ADMIN_CLERK_USER_IDS` can access.
+Protected by Clerk-based session cookie. Only users with `ADMIN` or `SUPER_ADMIN` role in the database can access.
 
 | Route | Description |
 |---|---|
@@ -972,7 +1030,7 @@ Exchange a valid Clerk session JWT for a signed admin session cookie.
 
 Sets `admin_session` cookie (HMAC-SHA256 signed, 8-hour TTL, HTTPS-only in production).
 
-**Response `403`:** Valid token but user is not in `ADMIN_CLERK_USER_IDS`.
+**Response `403`:** Valid token but user does not have `ADMIN` or `SUPER_ADMIN` role.
 
 ---
 

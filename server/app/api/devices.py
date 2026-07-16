@@ -10,13 +10,13 @@ import time
 from collections import defaultdict
 
 from app.core.database import get_db
-from app.core.auth import require_auth
+from app.core.auth import require_auth, require_admin
 from app.models.device import Device
 from app.models.location import Location
 from app.models.trip import Trip
 from app.api.trips import TripResponse
 from app.core.config import settings
-from app.models.user import User
+from app.models.user import User, Role
 from pydantic import BaseModel
 
 router = APIRouter()
@@ -112,8 +112,8 @@ async def list_devices(
 
     query = db.query(Device)
     
-    # If not admin, only show devices paired to this user
-    if not user.is_admin:
+    # If not admin/super_admin, only show devices paired to this user
+    if user.role not in (Role.SUPER_ADMIN, Role.ADMIN):
         query = query.filter(Device.user_id == user.id)
 
     if status:

@@ -1,7 +1,7 @@
 """Authentication API endpoints - Clerk user sync"""
 
-from typing import Optional
-from fastapi import APIRouter, Depends, HTTPException, Header
+from typing import Optional, List
+from fastapi import APIRouter, Depends, HTTPException, Header, Query
 import httpx
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
@@ -11,8 +11,8 @@ import logging
 
 from app.core.database import get_db
 from app.core.config import settings
-from app.core.auth import require_auth
-from app.models.user import User
+from app.core.auth import require_auth, require_admin
+from app.models.user import User, Role
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -62,7 +62,7 @@ class UserResponse(BaseModel):
     email: str
     first_name: Optional[str] = None
     last_name: Optional[str] = None
-    is_admin: bool
+    role: str
     onboarding_step: Optional[int] = 0
     onboarding_complete: Optional[bool] = False
     created_at: datetime
@@ -121,17 +121,18 @@ async def sync_user(
                 user.last_name = resolved_last
             user.updated_at = datetime.utcnow()
         else:
-            # Create new user
+            # Create new user — first user becomes SUPER_ADMIN, rest default to USER
             is_first_user = db.query(User).count() == 0
+            initial_role = Role.SUPER_ADMIN if is_first_user else Role.USER
 
-            logger.info(f"Creating new user: {user_data.clerk_user_id}. First user admin: {is_first_user}")
+            logger.info(f"Creating new user: {user_data.clerk_user_id}. Role: {initial_role.value}")
             user = User(
                 clerk_user_id=user_data.clerk_user_id,
                 email=user_data.email,
                 first_name=resolved_first or "Unknown",
                 last_name=resolved_last or "Unknown",
-                is_admin=is_first_user,
-                # Admins skip the customer onboarding flow entirely
+                role=initial_role,
+                # SUPER_ADMIN skips the customer onboarding flow entirely
                 onboarding_complete=is_first_user,
                 onboarding_step=9 if is_first_user else 0,
                 created_at=datetime.utcnow(),
@@ -139,8 +140,7 @@ async def sync_user(
             )
             db.add(user)
         
-        # If this is an existing admin, ensure their onboarding is marked complete
-        # (handles the case where admins were created before this fix)
+        # If this is a SUPER_ADMIN or ADMIN, ensure onboarding is marked complete
         if user.is_admin and not user.onboarding_complete:
             user.onboarding_complete = True
             user.onboarding_step = 9
@@ -288,13 +288,14 @@ async def admin_create_user(
             full_name = " ".join(parts)
 
         is_first_user = db.query(User).count() == 0
+        initial_role = Role.SUPER_ADMIN if is_first_user else Role.USER
 
         user = User(
             clerk_user_id=clerk_user_id,
             email=user_data.email,
             first_name=user_data.first_name or "Unknown",
             last_name=user_data.last_name or "Unknown",
-            is_admin=is_first_user,
+            role=initial_role,
             created_at=datetime.utcnow(),
             updated_at=datetime.utcnow()
         )
@@ -309,6 +310,103 @@ async def admin_create_user(
         db.rollback()
         logger.error(f"Database error during admin user creation: {str(e)}")
         raise HTTPException(status_code=500, detail="Database error occurred")
+
+
+# ── User Management (Admin only) ────────────────────────────────────────────
+
+
+class UpdateRoleRequest(BaseModel):
+    """Request body for updating a user's role."""
+    role: str
+
+    class Config:
+        json_schema_extra = {
+            "example": {"role": "ADMIN"}
+        }
+
+
+class UserListResponse(BaseModel):
+    """User list item"""
+    id: int
+    clerk_user_id: str
+    email: str
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    role: str
+    onboarding_complete: bool
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+@router.get("/users", response_model=List[UserListResponse])
+async def list_users(
+    skip: int = Query(0, ge=0),
+    limit: int = Query(100, ge=1, le=500),
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    """
+    List all users. Requires ADMIN or SUPER_ADMIN role.
+    """
+    users = db.query(User).order_by(User.created_at.asc()).offset(skip).limit(limit).all()
+    return users
+
+
+@router.put("/users/{user_id}/role", response_model=UserResponse)
+async def update_user_role(
+    user_id: int,
+    body: UpdateRoleRequest,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(require_admin),
+):
+    """
+    Update a user's role. Requires ADMIN or SUPER_ADMIN role.
+    Only SUPER_ADMIN can assign SUPER_ADMIN role.
+    """
+    try:
+        new_role = Role(body.role.upper())
+    except ValueError:
+        valid = [r.value for r in Role]
+        raise HTTPException(
+            status_code=400,
+            detail=f"Invalid role '{body.role}'. Must be one of: {', '.join(valid)}",
+        )
+
+    # Only SUPER_ADMIN can assign the SUPER_ADMIN role
+    if new_role == Role.SUPER_ADMIN and current_user.role != Role.SUPER_ADMIN:
+        raise HTTPException(status_code=403, detail="Only SUPER_ADMIN can assign the SUPER_ADMIN role.")
+
+    target = db.query(User).filter(User.id == user_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    # Prevent self-demotion from SUPER_ADMIN
+    if target.id == current_user.id and new_role != Role.SUPER_ADMIN and current_user.role == Role.SUPER_ADMIN:
+        # Check if this is the last SUPER_ADMIN
+        super_admin_count = db.query(User).filter(User.role == Role.SUPER_ADMIN).count()
+        if super_admin_count <= 1:
+            raise HTTPException(
+                status_code=409,
+                detail="Cannot demote the last SUPER_ADMIN. Promote another user first.",
+            )
+
+    # Prevent demoting SUPER_ADMIN unless caller is also SUPER_ADMIN
+    if target.role == Role.SUPER_ADMIN and current_user.role != Role.SUPER_ADMIN:
+        raise HTTPException(status_code=403, detail="Only SUPER_ADMIN can change another SUPER_ADMIN's role.")
+
+    old_role = target.role.value
+    target.role = new_role
+    target.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(target)
+
+    logger.info("User %d (%s) role changed from %s to %s by user %d",
+                target.id, target.email, old_role, new_role.value, current_user.id)
+
+    return target
 
 
 # ── Push notification token ────────────────────────────────────────────────
