@@ -25,7 +25,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from app.core.database import get_db
 from app.core.auth import require_auth
 from app.core.config import settings
-from app.models.user import User
+from app.models.user import User, Role
 from app.models.device import Device
 from app.models.vehicle import Vehicle
 from app.models.subscription import Subscription, Payment
@@ -140,27 +140,25 @@ async def create_or_update_user(
         existing = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
 
         if existing:
-            # Idempotent update
             existing.first_name = body.firstName
             existing.last_name  = body.lastName
             existing.email      = body.email
-            existing.role       = body.role or "owner"
             existing.updated_at = datetime.utcnow()
             db.commit()
             db.refresh(existing)
             logger.info("Updated user profile: %s", clerk_user_id)
             return UserResponse(userId=existing.id, alreadyExists=True)
 
-        # First user gets admin flag
+        # First user gets SUPER_ADMIN, rest default to USER
         is_first = db.query(User).count() == 0
+        initial_role = Role.SUPER_ADMIN if is_first else Role.USER
 
         user = User(
             clerk_user_id=clerk_user_id,
             first_name=body.firstName,
             last_name=body.lastName,
             email=body.email,
-            role=body.role or "owner",
-            is_admin=is_first,
+            role=initial_role,
             onboarding_step=4,
             onboarding_complete=False,
             created_at=datetime.utcnow(),

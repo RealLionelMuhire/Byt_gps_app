@@ -1,13 +1,20 @@
 -- Initialize PostGIS extension
 CREATE EXTENSION IF NOT EXISTS postgis;
 
+-- Create user_role enum type
+DO $$ BEGIN
+    CREATE TYPE user_role AS ENUM ('SUPER_ADMIN', 'ADMIN', 'TECHNICIAN', 'USER');
+EXCEPTION
+    WHEN duplicate_object THEN NULL;
+END $$;
+
 -- Create users table for Clerk authentication sync
 CREATE TABLE IF NOT EXISTS users (
     id SERIAL PRIMARY KEY,
     clerk_user_id VARCHAR(255) UNIQUE NOT NULL,
     email VARCHAR(255) NOT NULL,
     name VARCHAR(255),
-    is_admin BOOLEAN DEFAULT FALSE NOT NULL,
+    role user_role DEFAULT 'USER' NOT NULL,
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW()
 );

@@ -77,11 +77,13 @@ curl -X POST http://164.92.212.186:8000/api/auth/sync \
   "clerk_user_id": "user_2abc123xyz456def",
   "email": "user@example.com",
   "name": "John Doe",
-  "is_admin": true,
+  "role": "SUPER_ADMIN",
   "created_at": "2026-02-06T10:00:00Z",
   "updated_at": "2026-02-06T10:00:00Z"
 }
 ```
+
+The first user ever created gets `role: "SUPER_ADMIN"`; all subsequent users default to `role: "USER"`.
 
 #### **POST /api/auth/admin-create-user**
 Create a new user entirely from the backend (creates in Clerk and syncs to DB).
@@ -110,7 +112,7 @@ curl -X POST http://164.92.212.186:8000/api/auth/admin-create-user \
   "clerk_user_id": "user_3DHEr8vBKs7uNUS7pCJkBGe78ij",
   "email": "newuser@example.com",
   "name": "John Doe",
-  "is_admin": false,
+  "role": "USER",
   "created_at": "2026-05-04T21:39:50Z",
   "updated_at": "2026-05-04T21:39:50Z"
 }
@@ -195,27 +197,30 @@ curl -X GET "http://164.92.212.186:8000/api/locations/1/route" \
 
 ## 🔐 Security Model
 
-### Header-Based Authentication
-- All endpoints accept **`X-Clerk-User-Id`** header
-- When provided, the backend:
-  1. Looks up the user by `clerk_user_id`
-  2. Filters data to only that user's devices
-  3. Verifies access permissions
+### Role-Based Access Control
+User roles are managed via a `user_role` PostgreSQL enum with four levels:
 
-### First-User Admin Privileges
-- The **first user** to ever be created in the database (either via `/api/auth/sync` or `/api/auth/admin-create-user`) is automatically granted **Administrator privileges** (`is_admin: true`).
-- All subsequent users are created as standard users (`is_admin: false`).
-- The `is_admin` flag is used by the frontend to conditionally render admin dashboards and management features.
+| Role | Access |
+|------|--------|
+| `SUPER_ADMIN` | Full system access, can assign any role, manage all devices |
+| `ADMIN` | Admin dashboard, manage all devices, cannot assign `SUPER_ADMIN` |
+| `TECHNICIAN` | Can view all devices and diagnostics |
+| `USER` | Default role — can only see/manage own paired devices |
 
-### Backward Compatibility
-- All endpoints work **without** the header (returns all data)
-- Allows gradual migration from old to new authentication
+### First-User Super Admin Privileges
+- The **first user** to ever be created in the database (either via `/api/auth/sync` or `/api/auth/admin-create-user`) is automatically granted the `SUPER_ADMIN` role.
+- All subsequent users are created as `USER` by default.
+- Roles can be updated by admins via `PUT /api/auth/users/{id}/role`.
+
+### Auth Dependencies (FastAPI)
+- `require_auth` — validates the Clerk JWT, returns `clerk_user_id`
+- `require_admin` — requires `SUPER_ADMIN` or `ADMIN` role
+- `require_technician` — requires `TECHNICIAN`, `ADMIN`, or `SUPER_ADMIN` role
+- `require_super_admin` — requires `SUPER_ADMIN` only
 
 ### Device Ownership
-- Devices can be assigned to users via:
-  1. Setting header when creating device
-  2. Using `/api/devices/{device_id}/assign` endpoint
-  3. Direct database update (for migration)
+- Non-admin users can only see/manage devices paired to their account
+- Admin/super-admin users can see all devices
 
 ---
 
@@ -223,18 +228,21 @@ curl -X GET "http://164.92.212.186:8000/api/locations/1/route" \
 
 ### Users Table
 ```sql
+CREATE TYPE user_role AS ENUM ('SUPER_ADMIN', 'ADMIN', 'TECHNICIAN', 'USER');
+
 CREATE TABLE users (
     id SERIAL PRIMARY KEY,
     clerk_user_id VARCHAR(255) UNIQUE NOT NULL,
     email VARCHAR(255) NOT NULL,
     name VARCHAR(255),
-    is_admin BOOLEAN DEFAULT FALSE NOT NULL,
+    role user_role DEFAULT 'USER' NOT NULL,
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW()
 );
 
 CREATE INDEX idx_clerk_user_id ON users(clerk_user_id);
 CREATE INDEX idx_email ON users(email);
+CREATE INDEX idx_users_role ON users(role);
 ```
 
 ### Devices Table (Updated)

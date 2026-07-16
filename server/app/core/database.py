@@ -50,6 +50,14 @@ def init_db():
     # On the local postgis/postgis Docker image it is already active, so this is a no-op.
     with engine.connect() as conn:
         conn.execute(text("CREATE EXTENSION IF NOT EXISTS postgis;"))
+        # Create the user_role enum type if it doesn't exist (for fresh installs)
+        conn.execute(text("""
+            DO $$ BEGIN
+                CREATE TYPE user_role AS ENUM ('SUPER_ADMIN', 'ADMIN', 'TECHNICIAN', 'USER');
+            EXCEPTION
+                WHEN duplicate_object THEN NULL;
+            END $$;
+        """))
         conn.commit()
 
     # Import all models here

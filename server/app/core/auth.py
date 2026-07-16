@@ -6,11 +6,20 @@ Clerk session token. Routes that depend on `require_auth` will return
 HTTP 401 if the token is missing or invalid.
 
 Usage:
-    from app.core.auth import require_auth
+    from app.core.auth import require_auth, require_admin, require_technician
 
     @router.get("/something")
     async def my_route(clerk_user_id: str = Depends(require_auth)):
         ...  # clerk_user_id is the verified Clerk user ID string
+
+Role-based access:
+    @router.get("/admin-only")
+    async def admin_route(clerk_user_id: str = Depends(require_admin)):
+        ...
+
+    @router.get("/tech-or-admin")
+    async def tech_route(clerk_user_id: str = Depends(require_technician)):
+        ...
 
 Dev/offline mode:
     If CLERK_SECRET_KEY is not set in the environment the check is skipped
@@ -24,8 +33,11 @@ import httpx
 from jose import jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.database import get_db
+from app.models.user import User, Role
 
 logger = logging.getLogger(__name__)
 
@@ -44,7 +56,6 @@ async def _get_jwks() -> Optional[dict]:
 
     try:
         async with httpx.AsyncClient(timeout=5.0) as client:
-            # The JWKS endpoint is standard for Clerk backend APIs
             resp = await client.get(
                 "https://api.clerk.com/v1/jwks",
                 headers={"Authorization": f"Bearer {settings.CLERK_SECRET_KEY}"},
@@ -66,31 +77,23 @@ async def _verify_clerk_token(token: str) -> Optional[str]:
     so a brief Clerk API outage does not lock out real users.
     """
     if not settings.CLERK_SECRET_KEY:
-        # Dev mode — no secret key configured, skip verification
         logger.warning(
             "AUTH: CLERK_SECRET_KEY not set — skipping token verification (dev mode)"
         )
         return "dev-user"
 
-    # 1. Fetch JWKS
     jwks = await _get_jwks()
     if not jwks:
-        # Network error talking to Clerk — fail open so real users aren't blocked
-        # (Alternatively, you can fail closed if security is paramount)
         logger.warning("AUTH: Could not fetch JWKS, allowing fallback")
         return "network-error-fallback"
 
-    # 2. Decode and verify the JWT signature
     try:
-        # Clerk tokens usually use RS256. 
-        # We don't enforce `verify_aud` strictly unless configured.
         payload = jwt.decode(
             token,
             jwks,
             algorithms=["RS256"],
             options={"verify_aud": False}
         )
-        # Clerk puts the user_id in the 'sub' claim
         return payload.get("sub")
     
     except jwt.ExpiredSignatureError:
@@ -106,13 +109,6 @@ async def require_auth(
 ) -> str:
     """
     FastAPI dependency that enforces Clerk authentication.
-
-    Inject this into any route that should be protected:
-
-        @router.get("/")
-        async def list_things(clerk_user_id: str = Depends(require_auth)):
-            ...
-
     Returns the verified Clerk user ID on success.
     Raises HTTP 401 if the token is missing or invalid.
     """
@@ -133,3 +129,57 @@ async def require_auth(
         )
 
     return clerk_user_id
+
+
+async def _get_current_user(
+    clerk_user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+) -> User:
+    """Look up the User record for the authenticated Clerk user."""
+    user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="User not found. Complete sign-up via POST /api/auth/sync first.",
+        )
+    return user
+
+
+REQUIRE_ADMIN_ROLES = {Role.SUPER_ADMIN, Role.ADMIN}
+REQUIRE_TECHNICIAN_ROLES = {Role.SUPER_ADMIN, Role.ADMIN, Role.TECHNICIAN}
+
+
+async def require_admin(
+    user: User = Depends(_get_current_user),
+) -> User:
+    """FastAPI dependency: require ADMIN or SUPER_ADMIN role."""
+    if user.role not in REQUIRE_ADMIN_ROLES:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Admin access required.",
+        )
+    return user
+
+
+async def require_technician(
+    user: User = Depends(_get_current_user),
+) -> User:
+    """FastAPI dependency: require TECHNICIAN, ADMIN, or SUPER_ADMIN role."""
+    if user.role not in REQUIRE_TECHNICIAN_ROLES:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Technician or admin access required.",
+        )
+    return user
+
+
+async def require_super_admin(
+    user: User = Depends(_get_current_user),
+) -> User:
+    """FastAPI dependency: require SUPER_ADMIN role only."""
+    if user.role != Role.SUPER_ADMIN:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN,
+            detail="Super admin access required.",
+        )
+    return user
