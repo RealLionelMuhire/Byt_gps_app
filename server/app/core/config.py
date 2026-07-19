@@ -32,6 +32,7 @@ class Settings(BaseSettings):
     # Clerk Auth
     CLERK_SECRET_KEY: Optional[str] = None
     CLERK_PUBLISHABLE_KEY: Optional[str] = None  # pk_live_... — used in admin dashboard JS
+    CLERK_WEBHOOK_SECRET: Optional[str] = None
     # Comma-separated Clerk User IDs that are allowed to access the admin dashboard
     # e.g. "user_2abc123,user_2xyz456" — copy from Clerk Dashboard > Users
     ADMIN_CLERK_USER_IDS: str = ""
