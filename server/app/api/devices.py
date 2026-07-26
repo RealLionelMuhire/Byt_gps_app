@@ -102,10 +102,16 @@ async def list_devices(
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=1000),
     status: Optional[str] = Query(None, description="Filter by status: online, offline"),
+    lifecycle: Optional[str] = Query(None, description="Filter by lifecycle: registered, in_stock, sold"),
+    unowned: Optional[bool] = Query(None, description="Filter devices without a client owner (user_id IS NULL)"),
+    name: Optional[str] = Query(None, description="Search by device name (partial match, case-insensitive)"),
+    imei: Optional[str] = Query(None, description="Search by IMEI (partial match)"),
+    dormant_days: Optional[int] = Query(None, ge=1, description="Filter devices not seen (no location update) in N days"),
+    dormant_hours: Optional[int] = Query(None, ge=1, description="Filter devices not seen (no location update) in N hours"),
     db: Session = Depends(get_db),
     clerk_user_id: str = Depends(require_auth),
 ):
-    """List GPS tracker devices."""
+    """List GPS tracker devices with optional filters."""
     user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
@@ -118,6 +124,32 @@ async def list_devices(
 
     if status:
         query = query.filter(Device.status == status)
+
+    if lifecycle:
+        query = query.filter(Device.lifecycle == lifecycle)
+
+    if unowned is True:
+        query = query.filter(Device.user_id.is_(None))
+    elif unowned is False:
+        query = query.filter(Device.user_id.isnot(None))
+
+    if name:
+        query = query.filter(Device.name.ilike(f"%{name}%"))
+
+    if imei:
+        query = query.filter(Device.imei.ilike(f"%{imei}%"))
+
+    if dormant_days is not None:
+        cutoff = datetime.utcnow() - timedelta(days=dormant_days)
+        query = query.filter(
+            (Device.last_update.is_(None)) | (Device.last_update < cutoff)
+        )
+
+    if dormant_hours is not None:
+        cutoff = datetime.utcnow() - timedelta(hours=dormant_hours)
+        query = query.filter(
+            (Device.last_update.is_(None)) | (Device.last_update < cutoff)
+        )
 
     devices = query.offset(skip).limit(limit).all()
     return devices

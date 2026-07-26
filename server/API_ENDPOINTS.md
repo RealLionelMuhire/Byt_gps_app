@@ -442,12 +442,23 @@ Admin registers IMEI
 All require `Authorization: Bearer <token>`.
 
 ### `GET /api/devices/`
-List all devices visible to the authenticated user.
+List all devices visible to the authenticated user with optional filters.
 
 **Query params:**
-- `status` — filter by `online` or `offline`
-- `lifecycle` filter is available via the admin dashboard
-- `skip` / `limit` — pagination (default limit: 100, max: 1000)
+
+| Param | Type | Description |
+|---|---|---|
+| `skip` | int | Pagination offset (default: 0) |
+| `limit` | int | Page size (default: 100, max: 1000) |
+| `status` | string | Filter by connection status: `online` or `offline` |
+| `lifecycle` | string | Filter by inventory lifecycle: `registered`, `in_stock`, or `sold` |
+| `unowned` | bool | Filter devices without a client owner (`true` = unowned only, `false` = owned only) |
+| `name` | string | Search by device name (partial match, case-insensitive) |
+| `imei` | string | Search by IMEI (partial match) |
+| `dormant_days` | int | Filter devices not seen (no location update) in N days (min: 1) |
+| `dormant_hours` | int | Filter devices not seen (no location update) in N hours (min: 1) |
+
+All filters are optional and can be combined.
 
 ---
 
