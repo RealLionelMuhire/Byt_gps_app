@@ -6,7 +6,7 @@ services:
     build: .
     container_name: gps_tracking_server_test
     env_file:
-      - .env             # Loads DATABASE_URL, CLERK_*, ADMIN_*, etc.
+      - .env             # Loads DATABASE_URL, ADMIN_*, etc.
     environment:
       # These can be overridden here if needed, but .env takes precedence for secrets.
       HOST: 0.0.0.0
