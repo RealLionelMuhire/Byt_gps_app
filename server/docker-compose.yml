@@ -1,3 +1,4 @@
+name: bythron-test
 services:
   # GPS Tracking Server
   # Uses Neon serverless DB — no local postgres service needed.
