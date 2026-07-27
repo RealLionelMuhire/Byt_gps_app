@@ -46,7 +46,7 @@ GIT_REMOTE="origin"
 # CHANGE THIS:
 # Production = main
 # Test      = test
-GIT_BRANCH="main"
+GIT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
 
 
 # ==============================
