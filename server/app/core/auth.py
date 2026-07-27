@@ -2,35 +2,34 @@
 Shared authentication dependency for FastAPI routes.
 
 Reads the `Authorization: Bearer <token>` header and validates the
-Clerk session token. Routes that depend on `require_auth` will return
-HTTP 401 if the token is missing or invalid.
+JWT using HS256 with the server's local SECRET_KEY. Routes that depend
+on `require_auth` will return HTTP 401 if the token is missing or invalid.
 
 Usage:
     from app.core.auth import require_auth, require_admin, require_technician
 
     @router.get("/something")
-    async def my_route(clerk_user_id: str = Depends(require_auth)):
-        ...  # clerk_user_id is the verified Clerk user ID string
+    async def my_route(user_id: str = Depends(require_auth)):
+        ...  # user_id is the verified user identifier (email) from the JWT
 
 Role-based access:
     @router.get("/admin-only")
-    async def admin_route(clerk_user_id: str = Depends(require_admin)):
+    async def admin_route(user: User = Depends(require_admin)):
         ...
 
     @router.get("/tech-or-admin")
-    async def tech_route(clerk_user_id: str = Depends(require_technician)):
+    async def tech_route(user: User = Depends(require_technician)):
         ...
 
 Dev/offline mode:
-    If CLERK_SECRET_KEY is not set in the environment the check is skipped
-    and a placeholder ID is returned. This keeps local development painless.
+    If SECRET_KEY is the default placeholder the token is still verified
+    (unlike Clerk dev mode), so set a real SECRET_KEY in production.
 """
 
 import logging
 from typing import Optional
 
-import httpx
-from jose import jwt
+from jose import jwt, JWTError
 from fastapi import Depends, HTTPException, status
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
@@ -45,62 +44,27 @@ logger = logging.getLogger(__name__)
 _bearer = HTTPBearer(auto_error=False)
 
 
-# Cache JWKS to avoid network requests on every route call
-_jwks_cache = None
-
-async def _get_jwks() -> Optional[dict]:
-    """Fetch the JSON Web Key Set from Clerk."""
-    global _jwks_cache
-    if _jwks_cache is not None:
-        return _jwks_cache
-
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(
-                "https://api.clerk.com/v1/jwks",
-                headers={"Authorization": f"Bearer {settings.CLERK_SECRET_KEY}"},
-            )
-            if resp.status_code == 200:
-                _jwks_cache = resp.json()
-                return _jwks_cache
-            logger.error("AUTH: Failed to fetch JWKS — HTTP %d: %s", resp.status_code, resp.text)
-    except Exception as exc:
-        logger.error("AUTH: Network error fetching JWKS — %s", exc)
-    return None
-
-async def _verify_clerk_token(token: str) -> Optional[str]:
+def _decode_token(token: str) -> Optional[str]:
     """
-    Verify a Clerk session JWT using the Clerk JWKS.
+    Decode and verify a JWT issued by this server.
 
-    Returns the Clerk user ID string on success, or None on failure.
-    Falls back to returning a placeholder on transient network errors
-    so a brief Clerk API outage does not lock out real users.
+    Returns the `sub` claim (user identifier — email) on success,
+    or None on failure.
     """
-    if not settings.CLERK_SECRET_KEY:
-        logger.warning(
-            "AUTH: CLERK_SECRET_KEY not set — skipping token verification (dev mode)"
-        )
-        return "dev-user"
-
-    jwks = await _get_jwks()
-    if not jwks:
-        logger.warning("AUTH: Could not fetch JWKS, allowing fallback")
-        return "network-error-fallback"
-
     try:
         payload = jwt.decode(
             token,
-            jwks,
-            algorithms=["RS256"],
-            options={"verify_aud": False}
+            settings.SECRET_KEY,
+            algorithms=[settings.ALGORITHM],
+            options={"verify_aud": False},
         )
-        return payload.get("sub")
-    
-    except jwt.ExpiredSignatureError:
-        logger.warning("AUTH: Clerk token expired")
-        return None
-    except jwt.JWTError as exc:
-        logger.warning("AUTH: Clerk rejected token — %s", exc)
+        sub: Optional[str] = payload.get("sub")
+        if not sub:
+            logger.warning("AUTH: JWT has no 'sub' claim")
+            return None
+        return sub
+    except JWTError as exc:
+        logger.warning("AUTH: JWT validation failed — %s", exc)
         return None
 
 
@@ -108,39 +72,43 @@ async def require_auth(
     credentials: Optional[HTTPAuthorizationCredentials] = Depends(_bearer),
 ) -> str:
     """
-    FastAPI dependency that enforces Clerk authentication.
-    Returns the verified Clerk user ID on success.
+    FastAPI dependency that enforces JWT authentication.
+    Returns the verified user identifier (email) on success.
     Raises HTTP 401 if the token is missing or invalid.
     """
     if credentials is None or not credentials.credentials:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Missing Authorization header. Expected: Bearer <clerk-token>",
+            detail="Missing Authorization header. Expected: Bearer <token>",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    clerk_user_id = await _verify_clerk_token(credentials.credentials)
+    user_id = _decode_token(credentials.credentials)
 
-    if clerk_user_id is None:
+    if user_id is None:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid or expired session token.",
+            detail="Invalid or expired token.",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
-    return clerk_user_id
+    return user_id
 
 
 async def _get_current_user(
-    clerk_user_id: str = Depends(require_auth),
+    user_id: str = Depends(require_auth),
     db: Session = Depends(get_db),
 ) -> User:
-    """Look up the User record for the authenticated Clerk user."""
-    user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
+    """Look up the User record for the authenticated user (by email / clerk_user_id)."""
+    # Try by email first (new auth), then by clerk_user_id for backwards compat
+    user = (
+        db.query(User).filter(User.email == user_id).first()
+        or db.query(User).filter(User.clerk_user_id == user_id).first()
+    )
     if not user:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="User not found. Complete sign-up via POST /api/auth/sync first.",
+            detail="User not found. Register via POST /api/auth/register first.",
         )
     return user
 

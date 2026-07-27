@@ -1,12 +1,25 @@
-"""Authentication API endpoints - Clerk user sync"""
+"""
+Authentication API endpoints — custom JWT auth (no third-party provider).
+
+Endpoints:
+  POST /api/auth/register   — Create new account, return JWT
+  POST /api/auth/login      — Verify credentials, return JWT
+  GET  /api/auth/me         — Return current user profile
+  POST /api/auth/sync       — Upsert user record (called from onboarding)
+  PUT  /api/auth/push-token — Save Expo push notification token
+  GET  /api/auth/users      — List all users (admin only)
+  PUT  /api/auth/users/{id}/role — Update user role (admin only)
+"""
 
 from typing import Optional, List
-from fastapi import APIRouter, Depends, HTTPException, Header, Query
-import httpx
+from datetime import datetime, timedelta
+
+from fastapi import APIRouter, Depends, HTTPException, Header, Query, status
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
-from datetime import datetime
 from pydantic import BaseModel, EmailStr
+from passlib.context import CryptContext
+from jose import jwt
 import logging
 
 from app.core.database import get_db
@@ -17,28 +30,34 @@ from app.models.user import User, Role
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
+# ── Password hashing ──────────────────────────────────────────────────────────
 
-# Pydantic schemas
-class UserSyncRequest(BaseModel):
-    """Request body for user sync"""
-    clerk_user_id: str
-    email: EmailStr
-    first_name: Optional[str] = None
-    last_name: Optional[str] = None
-    name: Optional[str] = None  # Alternative: full name (split into first/last)
-
-    class Config:
-        json_schema_extra = {
-            "example": {
-                "clerk_user_id": "user_2abc123xyz456def",
-                "email": "user@example.com",
-                "name": "John Doe"
-            }
-        }
+_pwd_ctx = CryptContext(schemes=["bcrypt"], deprecated="auto")
 
 
-class AdminCreateUserRequest(BaseModel):
-    """Request body for creating a user via admin endpoint"""
+def _hash_password(plain: str) -> str:
+    return _pwd_ctx.hash(plain)
+
+
+def _verify_password(plain: str, hashed: str) -> bool:
+    return _pwd_ctx.verify(plain, hashed)
+
+
+# ── JWT helpers ───────────────────────────────────────────────────────────────
+
+def _create_token(subject: str) -> str:
+    """Create a signed HS256 JWT with sub=subject and an expiry."""
+    expire = datetime.utcnow() + timedelta(minutes=settings.ACCESS_TOKEN_EXPIRE_MINUTES)
+    return jwt.encode(
+        {"sub": subject, "exp": expire},
+        settings.SECRET_KEY,
+        algorithm=settings.ALGORITHM,
+    )
+
+
+# ── Pydantic schemas ──────────────────────────────────────────────────────────
+
+class RegisterRequest(BaseModel):
     email: EmailStr
     password: str
     first_name: Optional[str] = None
@@ -48,15 +67,43 @@ class AdminCreateUserRequest(BaseModel):
         json_schema_extra = {
             "example": {
                 "email": "user@example.com",
-                "password": "StrongPassword123!",
+                "password": "StrongPass1!",
                 "first_name": "John",
-                "last_name": "Doe"
+                "last_name": "Doe",
+            }
+        }
+
+
+class LoginRequest(BaseModel):
+    email: EmailStr
+    password: str
+
+
+class TokenResponse(BaseModel):
+    access_token: str
+    token_type: str = "bearer"
+    user: "UserResponse"
+
+
+class UserSyncRequest(BaseModel):
+    """Request body for user sync from the mobile onboarding flow."""
+    clerk_user_id: str        # kept for API backwards-compat; treated as a stable user ID
+    email: EmailStr
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    name: Optional[str] = None  # full name alternative; split into first/last
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "clerk_user_id": "user@example.com",
+                "email": "user@example.com",
+                "name": "John Doe",
             }
         }
 
 
 class UserResponse(BaseModel):
-    """User response model"""
     id: int
     clerk_user_id: str
     email: str
@@ -67,43 +114,124 @@ class UserResponse(BaseModel):
     onboarding_complete: Optional[bool] = False
     created_at: datetime
     updated_at: datetime
-    
+
     class Config:
         from_attributes = True
+
+
+# ── Auth endpoints ────────────────────────────────────────────────────────────
+
+@router.post("/register", response_model=TokenResponse, status_code=201)
+async def register(
+    body: RegisterRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Register a new user and return a JWT.
+
+    - **email**: User email address
+    - **password**: Plain-text password (≥ 8 chars, stored as bcrypt hash)
+    - **first_name / last_name**: Optional name fields
+    """
+    # Check for duplicate email
+    if db.query(User).filter(User.email == body.email).first():
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="An account with this email already exists.",
+        )
+
+    if len(body.password) < 8:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="Password must be at least 8 characters.",
+        )
+
+    is_first = db.query(User).count() == 0
+    initial_role = Role.SUPER_ADMIN if is_first else Role.USER
+
+    user = User(
+        clerk_user_id=body.email,  # use email as stable identifier
+        email=body.email,
+        first_name=body.first_name or "Unknown",
+        last_name=body.last_name or "Unknown",
+        password_hash=_hash_password(body.password),
+        role=initial_role,
+        onboarding_complete=is_first,
+        onboarding_step=9 if is_first else 0,
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    try:
+        db.add(user)
+        db.commit()
+        db.refresh(user)
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error("register: DB error — %s", exc)
+        raise HTTPException(status_code=500, detail="Database error during registration.")
+
+    token = _create_token(body.email)
+    logger.info("New user registered: %s (role=%s)", body.email, initial_role.value)
+    return {"access_token": token, "token_type": "bearer", "user": user}
+
+
+@router.post("/login", response_model=TokenResponse)
+async def login(
+    body: LoginRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Authenticate with email + password and return a JWT.
+    """
+    user = db.query(User).filter(User.email == body.email).first()
+
+    if not user or not user.password_hash:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password.",
+        )
+
+    if not _verify_password(body.password, user.password_hash):
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid email or password.",
+        )
+
+    token = _create_token(body.email)
+    logger.info("User logged in: %s", body.email)
+    return {"access_token": token, "token_type": "bearer", "user": user}
+
+
+@router.get("/me", response_model=UserResponse)
+async def get_current_user(
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    """Return the current authenticated user's profile."""
+    user = (
+        db.query(User).filter(User.email == user_id).first()
+        or db.query(User).filter(User.clerk_user_id == user_id).first()
+    )
+    if not user:
+        raise HTTPException(
+            status_code=401,
+            detail="User profile not found. Register via POST /api/auth/register first.",
+        )
+    return user
 
 
 @router.post("/sync", response_model=UserResponse, status_code=200)
 async def sync_user(
     user_data: UserSyncRequest,
-    clerk_user_id: str = Depends(require_auth),
-    db: Session = Depends(get_db)
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
 ):
     """
-    Sync Clerk-authenticated user to database (upsert operation)
-    
-    This endpoint creates or updates user records based on Clerk authentication data.
-    It's called automatically when users sign in to the mobile app.
-    
-    - **clerk_user_id**: Unique identifier from Clerk authentication (required)
-    - **email**: User's email address (required)
-    - **name**: User's full name (optional)
-    
-    Returns the created or updated user record with timestamps.
+    Upsert user record from the mobile onboarding flow.
+    Called by the app after sign-up to ensure the backend DB is up to date.
     """
     try:
-        # Validate required fields
-        if not user_data.clerk_user_id or not user_data.email:
-            raise HTTPException(
-                status_code=400,
-                detail="Missing required fields: clerk_user_id and email are required"
-            )
-        
-        # Try to find existing user by clerk_user_id
-        user = db.query(User).filter(
-            User.clerk_user_id == user_data.clerk_user_id
-        ).first()
-        
-        # Resolve first/last name from either `name` or `first_name`/`last_name`
+        # Resolve first/last name
         resolved_first = user_data.first_name
         resolved_last = user_data.last_name
         if not resolved_first and not resolved_last and user_data.name:
@@ -111,222 +239,104 @@ async def sync_user(
             resolved_first = parts[0]
             resolved_last = parts[1] if len(parts) > 1 else ""
 
+        # Try by email first, then clerk_user_id for backwards compat
+        user = (
+            db.query(User).filter(User.email == user_data.email).first()
+            or db.query(User).filter(User.clerk_user_id == user_data.clerk_user_id).first()
+        )
+
         if user:
-            # Update existing user
-            logger.info(f"Updating existing user: {user_data.clerk_user_id}")
             user.email = user_data.email
-            if resolved_first is not None:
+            if resolved_first:
                 user.first_name = resolved_first
-            if resolved_last is not None:
+            if resolved_last:
                 user.last_name = resolved_last
             user.updated_at = datetime.utcnow()
         else:
-            # Create new user — first user becomes SUPER_ADMIN, rest default to USER
-            is_first_user = db.query(User).count() == 0
-            initial_role = Role.SUPER_ADMIN if is_first_user else Role.USER
-
-            logger.info(f"Creating new user: {user_data.clerk_user_id}. Role: {initial_role.value}")
+            is_first = db.query(User).count() == 0
+            initial_role = Role.SUPER_ADMIN if is_first else Role.USER
             user = User(
-                clerk_user_id=user_data.clerk_user_id,
+                clerk_user_id=user_data.clerk_user_id or user_data.email,
                 email=user_data.email,
                 first_name=resolved_first or "Unknown",
                 last_name=resolved_last or "Unknown",
                 role=initial_role,
-                # SUPER_ADMIN skips the customer onboarding flow entirely
-                onboarding_complete=is_first_user,
-                onboarding_step=9 if is_first_user else 0,
+                onboarding_complete=is_first,
+                onboarding_step=9 if is_first else 0,
                 created_at=datetime.utcnow(),
-                updated_at=datetime.utcnow()
+                updated_at=datetime.utcnow(),
             )
             db.add(user)
-        
-        # If this is a SUPER_ADMIN or ADMIN, ensure onboarding is marked complete
+
         if user.is_admin and not user.onboarding_complete:
             user.onboarding_complete = True
             user.onboarding_step = 9
-        
-        # Commit changes
+
         db.commit()
         db.refresh(user)
-        
-        logger.info(f"User synced successfully: {user.clerk_user_id} (ID: {user.id})")
         return user
-        
+
     except HTTPException:
-        # Re-raise HTTP exceptions
         raise
-    except SQLAlchemyError as e:
-        # Handle database errors
+    except SQLAlchemyError as exc:
         db.rollback()
-        logger.error(f"Database error during user sync: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail="Database error occurred"
-        )
-    except Exception as e:
-        # Handle unexpected errors
-        db.rollback()
-        logger.error(f"Unexpected error during user sync: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail="An unexpected error occurred"
-        )
-
-
-@router.get("/user/{clerk_user_id}", response_model=UserResponse)
-async def get_user(
-    clerk_user_id: str,
-    db: Session = Depends(get_db)
-):
-    """
-    Get user by Clerk user ID
-    
-    - **clerk_user_id**: Clerk user identifier
-    """
-    user = db.query(User).filter(
-        User.clerk_user_id == clerk_user_id
-    ).first()
-    
-    if not user:
-        raise HTTPException(
-            status_code=404,
-            detail=f"User not found: {clerk_user_id}"
-        )
-    
-    return user
-
-
-@router.get("/me", response_model=UserResponse)
-async def get_current_user(
-    clerk_user_id: str = Depends(require_auth),
-    db: Session = Depends(get_db)
-):
-    """
-    Get current authenticated user profile
-    """
-    user = db.query(User).filter(
-        User.clerk_user_id == clerk_user_id
-    ).first()
-    
-    if not user:
-        raise HTTPException(
-            status_code=401,
-            detail="User profile not found. Complete sign-up via POST /api/auth/sync first."
-        )
-    return user
-
-
-
-@router.post("/admin-create-user", response_model=UserResponse, status_code=201)
-async def admin_create_user(
-    user_data: AdminCreateUserRequest,
-    x_admin_secret: Optional[str] = Header(None),
-    db: Session = Depends(get_db)
-):
-    """
-    Create a new user in Clerk and sync to local database.
-    Requires ADMIN_SECRET in headers and CLERK_SECRET_KEY in environment.
-    """
-    # 1. Security Check
-    if not settings.ADMIN_SECRET:
-        logger.warning("ADMIN_SECRET is not set. Admin user creation endpoint is unsecured!")
-    elif x_admin_secret != settings.ADMIN_SECRET:
-        raise HTTPException(status_code=401, detail="Unauthorized: Invalid admin secret")
-
-    if not settings.CLERK_SECRET_KEY:
-        raise HTTPException(status_code=500, detail="CLERK_SECRET_KEY is not configured on the server")
-
-    # 2. Create user in Clerk
-    try:
-        async with httpx.AsyncClient() as client:
-            payload = {
-                "email_address": [user_data.email],
-                "password": user_data.password,
-            }
-            if user_data.first_name:
-                payload["first_name"] = user_data.first_name
-            if user_data.last_name:
-                payload["last_name"] = user_data.last_name
-
-            response = await client.post(
-                "https://api.clerk.com/v1/users",
-                json=payload,
-                headers={
-                    "Authorization": f"Bearer {settings.CLERK_SECRET_KEY}",
-                    "Content-Type": "application/json"
-                },
-                timeout=10.0
-            )
-            
-            if response.status_code != 200:
-                logger.error(f"Clerk API error: {response.text}")
-                raise HTTPException(
-                    status_code=response.status_code,
-                    detail=f"Failed to create user in Clerk: {response.text}"
-                )
-            
-            clerk_data = response.json()
-            clerk_user_id = clerk_data.get("id")
-            
-            if not clerk_user_id:
-                raise HTTPException(status_code=500, detail="Clerk API did not return an ID")
-
-    except httpx.RequestError as e:
-        logger.error(f"Request to Clerk API failed: {str(e)}")
-        raise HTTPException(status_code=500, detail="Failed to communicate with Clerk API")
-
-    # 3. Sync to local database
-    try:
-        # Check if user already exists in DB (just in case)
-        existing_user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
-        if existing_user:
-            return existing_user
-
-        full_name = None
-        if user_data.first_name or user_data.last_name:
-            parts = [p for p in (user_data.first_name, user_data.last_name) if p]
-            full_name = " ".join(parts)
-
-        is_first_user = db.query(User).count() == 0
-        initial_role = Role.SUPER_ADMIN if is_first_user else Role.USER
-
-        user = User(
-            clerk_user_id=clerk_user_id,
-            email=user_data.email,
-            first_name=user_data.first_name or "Unknown",
-            last_name=user_data.last_name or "Unknown",
-            role=initial_role,
-            created_at=datetime.utcnow(),
-            updated_at=datetime.utcnow()
-        )
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-
-        logger.info(f"Admin created new user successfully: {user.clerk_user_id} (ID: {user.id})")
-        return user
-
-    except SQLAlchemyError as e:
-        db.rollback()
-        logger.error(f"Database error during admin user creation: {str(e)}")
+        logger.error("sync_user: DB error — %s", exc)
         raise HTTPException(status_code=500, detail="Database error occurred")
+    except Exception as exc:
+        db.rollback()
+        logger.error("sync_user: unexpected error — %s", exc)
+        raise HTTPException(status_code=500, detail="An unexpected error occurred")
 
 
-# ── User Management (Admin only) ────────────────────────────────────────────
+@router.get("/user/{user_email}", response_model=UserResponse)
+async def get_user_by_email(
+    user_email: str,
+    db: Session = Depends(get_db),
+):
+    """Get user by email."""
+    user = db.query(User).filter(User.email == user_email).first()
+    if not user:
+        raise HTTPException(status_code=404, detail=f"User not found: {user_email}")
+    return user
 
+
+# ── Push notification token ────────────────────────────────────────────────
+
+class PushTokenRequest(BaseModel):
+    token: str
+
+
+@router.put("/push-token", status_code=200)
+async def update_push_token(
+    body: PushTokenRequest,
+    user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    """Store (or update) the Expo push token for the authenticated user."""
+    user = (
+        db.query(User).filter(User.email == user_id).first()
+        or db.query(User).filter(User.clerk_user_id == user_id).first()
+    )
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    user.expo_push_token = body.token
+    user.updated_at = datetime.utcnow()
+    db.commit()
+    logger.info("Push token updated for user %s", user_id)
+    return {"ok": True}
+
+
+# ── User Management (Admin only) ───────────────────────────────────────────
 
 class UpdateRoleRequest(BaseModel):
-    """Request body for updating a user's role."""
     role: str
 
     class Config:
-        json_schema_extra = {
-            "example": {"role": "ADMIN"}
-        }
+        json_schema_extra = {"example": {"role": "ADMIN"}}
 
 
 class UserListResponse(BaseModel):
-    """User list item"""
     id: int
     clerk_user_id: str
     email: str
@@ -348,11 +358,8 @@ async def list_users(
     db: Session = Depends(get_db),
     _: User = Depends(require_admin),
 ):
-    """
-    List all users. Requires ADMIN or SUPER_ADMIN role.
-    """
-    users = db.query(User).order_by(User.created_at.asc()).offset(skip).limit(limit).all()
-    return users
+    """List all users. Requires ADMIN or SUPER_ADMIN role."""
+    return db.query(User).order_by(User.created_at.asc()).offset(skip).limit(limit).all()
 
 
 @router.put("/users/{user_id}/role", response_model=UserResponse)
@@ -362,10 +369,7 @@ async def update_user_role(
     db: Session = Depends(get_db),
     current_user: User = Depends(require_admin),
 ):
-    """
-    Update a user's role. Requires ADMIN or SUPER_ADMIN role.
-    Only SUPER_ADMIN can assign SUPER_ADMIN role.
-    """
+    """Update a user's role. Requires ADMIN or SUPER_ADMIN."""
     try:
         new_role = Role(body.role.upper())
     except ValueError:
@@ -375,7 +379,6 @@ async def update_user_role(
             detail=f"Invalid role '{body.role}'. Must be one of: {', '.join(valid)}",
         )
 
-    # Only SUPER_ADMIN can assign the SUPER_ADMIN role
     if new_role == Role.SUPER_ADMIN and current_user.role != Role.SUPER_ADMIN:
         raise HTTPException(status_code=403, detail="Only SUPER_ADMIN can assign the SUPER_ADMIN role.")
 
@@ -383,17 +386,14 @@ async def update_user_role(
     if not target:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # Prevent self-demotion from SUPER_ADMIN
     if target.id == current_user.id and new_role != Role.SUPER_ADMIN and current_user.role == Role.SUPER_ADMIN:
-        # Check if this is the last SUPER_ADMIN
-        super_admin_count = db.query(User).filter(User.role == Role.SUPER_ADMIN).count()
-        if super_admin_count <= 1:
+        count = db.query(User).filter(User.role == Role.SUPER_ADMIN).count()
+        if count <= 1:
             raise HTTPException(
                 status_code=409,
                 detail="Cannot demote the last SUPER_ADMIN. Promote another user first.",
             )
 
-    # Prevent demoting SUPER_ADMIN unless caller is also SUPER_ADMIN
     if target.role == Role.SUPER_ADMIN and current_user.role != Role.SUPER_ADMIN:
         raise HTTPException(status_code=403, detail="Only SUPER_ADMIN can change another SUPER_ADMIN's role.")
 
@@ -402,40 +402,5 @@ async def update_user_role(
     target.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(target)
-
-    logger.info("User %d (%s) role changed from %s to %s by user %d",
-                target.id, target.email, old_role, new_role.value, current_user.id)
-
+    logger.info("User %d role changed %s → %s by user %d", target.id, old_role, new_role.value, current_user.id)
     return target
-
-
-# ── Push notification token ────────────────────────────────────────────────
-
-class PushTokenRequest(BaseModel):
-    """Request body for saving an Expo push token."""
-    token: str
-
-
-@router.put("/push-token", status_code=200)
-async def update_push_token(
-    body: PushTokenRequest,
-    clerk_user_id: str = Depends(require_auth),
-    db: Session = Depends(get_db),
-):
-    """
-    Store (or update) the Expo push token for the authenticated user.
-
-    Called by the mobile app once on login so the backend can send push
-    notifications when a GPS alarm fires on one of their devices.
-    """
-    user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    user.expo_push_token = body.token
-    user.updated_at = datetime.utcnow()
-    db.commit()
-
-    logger.info("Push token updated for user %s", clerk_user_id)
-    return {"ok": True}
-

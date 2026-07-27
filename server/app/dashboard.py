@@ -27,7 +27,7 @@ import io
 
 from app.core.database import get_db
 from app.core.config import settings
-from app.core.auth import _verify_clerk_token
+from app.core.auth import _decode_token
 from app.models.device import Device
 from app.models.location import Location
 from app.models.user import User, Role
@@ -49,37 +49,37 @@ def _generate_pin(length: int = 6) -> str:
     return "".join(secrets.choice(alphabet) for _ in range(length))
 
 
-def _sign_session(clerk_user_id: str) -> str:
+def _sign_session(user_email: str) -> str:
     """
-    Create a tamper-proof session token: HMAC-SHA256(SECRET_KEY, clerk_user_id).
+    Create a tamper-proof session token: HMAC-SHA256(SECRET_KEY, user_email).
     Stored as a cookie; verified on every protected request.
     """
     key = settings.SECRET_KEY.encode()
-    sig = hmac.new(key, clerk_user_id.encode(), hashlib.sha256).hexdigest()
-    return f"{clerk_user_id}:{sig}"
+    sig = hmac.new(key, user_email.encode(), hashlib.sha256).hexdigest()
+    return f"{user_email}:{sig}"
 
 
 def _verify_session(cookie_value: str) -> str | None:
     """
-    Verify the session cookie and return the embedded clerk_user_id,
+    Verify the session cookie and return the embedded user_email,
     or None if the cookie is missing or tampered.
     """
     if not cookie_value or ":" not in cookie_value:
         return None
     try:
-        clerk_user_id, provided_sig = cookie_value.rsplit(":", 1)
+        user_email, provided_sig = cookie_value.rsplit(":", 1)
     except ValueError:
         return None
 
-    expected = _sign_session(clerk_user_id)
-    if not hmac.compare_digest(expected, f"{clerk_user_id}:{provided_sig}"):
+    expected = _sign_session(user_email)
+    if not hmac.compare_digest(expected, f"{user_email}:{provided_sig}"):
         return None
 
-    return clerk_user_id
+    return user_email
 
 
 def _get_admin(request: Request) -> str | None:
-    """Return the Clerk user ID from the session cookie, or None."""
+    """Return the user email from the session cookie, or None."""
     return _verify_session(request.cookies.get(SESSION_COOKIE, ""))
 
 
@@ -95,11 +95,14 @@ async def _require_admin_dashboard(
     Dashboard auth dependency: verify session cookie and check DB role
     is ADMIN or SUPER_ADMIN. Redirects to login on failure.
     """
-    clerk_user_id = _get_admin(request)
-    if not clerk_user_id:
+    user_email = _get_admin(request)
+    if not user_email:
         raise HTTPException(status_code=302, detail="Redirecting to login")
 
-    user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
+    user = (
+        db.query(User).filter(User.email == user_email).first()
+        or db.query(User).filter(User.clerk_user_id == user_email).first()
+    )
     if not user or user.role not in (Role.SUPER_ADMIN, Role.ADMIN):
         raise HTTPException(status_code=302, detail="Redirecting to login")
 
@@ -217,20 +220,19 @@ async def dashboard(request: Request, db: Session = Depends(get_db)):
 
 @router.get("/admin/login", response_class=HTMLResponse)
 async def admin_login_page(request: Request):
-    """Show the Clerk-powered sign-in page."""
+    """Show the admin sign-in page."""
     if _check_admin(request):
         return RedirectResponse(url="/admin/devices", status_code=302)
     return templates.TemplateResponse("admin_login.html", {
         "request": request,
-        "clerk_publishable_key": settings.CLERK_PUBLISHABLE_KEY or "",
     })
 
 
 @router.post("/admin/auth/verify")
 async def admin_auth_verify(request: Request, db: Session = Depends(get_db)):
     """
-    Called by the Clerk JS component after a successful sign-in.
-    Expects JSON body: { "token": "<clerk_session_jwt>" }
+    Admin login via JWT bearer token.
+    Expects JSON body: { "token": "<jwt_from_login_api>" }
     Validates the token, checks DB role (must be ADMIN or SUPER_ADMIN),
     and sets a signed session cookie.
     """
@@ -243,13 +245,16 @@ async def admin_auth_verify(request: Request, db: Session = Depends(get_db)):
     if not token:
         return JSONResponse({"error": "Missing token."}, status_code=400)
 
-    # Validate the Clerk JWT
-    clerk_user_id = await _verify_clerk_token(token)
-    if not clerk_user_id:
-        return JSONResponse({"error": "Invalid or expired Clerk token."}, status_code=401)
+    # Validate the JWT
+    user_email = _decode_token(token)
+    if not user_email:
+        return JSONResponse({"error": "Invalid or expired token."}, status_code=401)
 
     # Check DB role — must be ADMIN or SUPER_ADMIN
-    user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
+    user = (
+        db.query(User).filter(User.email == user_email).first()
+        or db.query(User).filter(User.clerk_user_id == user_email).first()
+    )
     if not user or user.role not in (Role.SUPER_ADMIN, Role.ADMIN):
         return JSONResponse(
             {"error": "Your account does not have admin access. Contact the system administrator."},
@@ -257,7 +262,7 @@ async def admin_auth_verify(request: Request, db: Session = Depends(get_db)):
         )
 
     # Issue signed session cookie
-    session_value = _sign_session(clerk_user_id)
+    session_value = _sign_session(user_email)
     response = JSONResponse({"ok": True, "redirect": "/admin/devices"})
     response.set_cookie(
         key=SESSION_COOKIE,

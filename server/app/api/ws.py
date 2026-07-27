@@ -10,7 +10,7 @@ import logging
 import asyncio
 from typing import Dict, Set, Optional
 
-import httpx
+from jose import jwt, JWTError
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
 
 from app.core.config import settings
@@ -19,30 +19,25 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-async def _verify_clerk_token(token: str) -> bool:
+def _verify_jwt(token: str) -> bool:
     """
-    Verify a Clerk session token via the Clerk REST API.
-    Returns True if valid. Falls back to True on network errors (Clerk outage)
-    so we don't lock out users unintentionally.
-    In dev mode (no CLERK_SECRET_KEY), always returns True.
+    Verify a JWT issued by this server (HS256, SECRET_KEY).
+    Returns True if the token is valid, False otherwise.
+    An empty token always returns False.
     """
-    if not settings.CLERK_SECRET_KEY:
-        logger.warning("WS auth: CLERK_SECRET_KEY not set — skipping verification (dev mode)")
-        return True
+    if not token:
+        return False
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(
-                "https://api.clerk.com/v1/me",
-                headers={"Authorization": f"Bearer {token}"},
-            )
-            if resp.status_code == 200:
-                return True
-            logger.warning("WS auth: Clerk rejected token (HTTP %d)", resp.status_code)
-            return False
-    except Exception as exc:
-        # Fail open on transient network errors — don't block real users
-        logger.error("WS auth: token verification error — %s", exc)
-        return True
+        payload = jwt.decode(
+            token,
+            settings.SECRET_KEY,
+            algorithms=[settings.ALGORITHM],
+            options={"verify_aud": False},
+        )
+        return bool(payload.get("sub"))
+    except JWTError as exc:
+        logger.warning("WS auth: JWT validation failed — %s", exc)
+        return False
 
 
 class ConnectionManager:
@@ -133,9 +128,8 @@ async def location_stream(
     - Client may send any text frame as a keep-alive ping (ignored by server).
     """
     # --- Authentication ---
-    # In dev mode (no CLERK_SECRET_KEY), _verify_clerk_token always returns True.
-    # In production, a missing or invalid token closes with 4001.
-    if not await _verify_clerk_token(token or ""):
+    # Verify the HS256 JWT issued by /api/auth/login. A missing or invalid token closes with 4001.
+    if not _verify_jwt(token or ""):
         await websocket.close(code=4001, reason="Unauthorized")
         logger.warning("WS: rejected unauthenticated connection for device %d", device_id)
         return
