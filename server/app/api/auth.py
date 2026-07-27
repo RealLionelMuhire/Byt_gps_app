@@ -79,10 +79,26 @@ class LoginRequest(BaseModel):
     password: str
 
 
+class UserResponse(BaseModel):
+    id: int
+    clerk_user_id: str
+    email: str
+    first_name: Optional[str] = None
+    last_name: Optional[str] = None
+    role: str
+    onboarding_step: Optional[int] = 0
+    onboarding_complete: Optional[bool] = False
+    created_at: datetime
+    updated_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
 class TokenResponse(BaseModel):
     access_token: str
     token_type: str = "bearer"
-    user: "UserResponse"
+    user: UserResponse
 
 
 class UserSyncRequest(BaseModel):
@@ -101,22 +117,6 @@ class UserSyncRequest(BaseModel):
                 "name": "John Doe",
             }
         }
-
-
-class UserResponse(BaseModel):
-    id: int
-    clerk_user_id: str
-    email: str
-    first_name: Optional[str] = None
-    last_name: Optional[str] = None
-    role: str
-    onboarding_step: Optional[int] = 0
-    onboarding_complete: Optional[bool] = False
-    created_at: datetime
-    updated_at: datetime
-
-    class Config:
-        from_attributes = True
 
 
 # ── Auth endpoints ────────────────────────────────────────────────────────────
