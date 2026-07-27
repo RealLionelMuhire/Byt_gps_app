@@ -4,7 +4,7 @@ services:
   # All secrets are loaded from the .env file in this directory.
   gps_server:
     build: .
-    container_name: gps_tracking_server
+    container_name: gps_tracking_server_prod
     env_file:
       - .env             # Loads DATABASE_URL, CLERK_*, ADMIN_*, etc.
     environment:
