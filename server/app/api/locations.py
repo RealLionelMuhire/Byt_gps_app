@@ -8,9 +8,10 @@ from pydantic import BaseModel
 from math import radians, cos, sin, asin, sqrt
 
 from app.core.database import get_db
-from app.core.auth import require_auth
+from app.core.auth import get_current_user, require_device_access
 from app.models.location import Location
 from app.models.device import Device
+from app.models.user import User
 
 router = APIRouter()
 
@@ -25,12 +26,12 @@ def haversine_km(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
     return 6371 * c
 
 
-def verify_device_access(device_id: int, clerk_user_id: Optional[str], db: Session) -> Device:
-    """Verify device exists. Ownership check disabled (no Clerk auth)."""
+def verify_device_access(device_id: int, user: User, db: Session) -> Device:
+    """Verify device exists and the caller owns it (or is admin)."""
     device = db.query(Device).filter(Device.id == device_id).first()
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
-    return device
+    return require_device_access(device, user)
 
 
 def compute_distance_for_device_time_range(
@@ -146,10 +147,10 @@ class RouteLineStringResponse(BaseModel):
 async def get_latest_location(
     device_id: int,
     db: Session = Depends(get_db),
-    _: str = Depends(require_auth),
+    user: User = Depends(get_current_user),
 ):
     """Get latest location for a device."""
-    verify_device_access(device_id, None, db)
+    verify_device_access(device_id, user, db)
 
     location = db.query(Location).filter(
         Location.device_id == device_id
@@ -168,10 +169,10 @@ async def get_location_history(
     end_time: Optional[datetime] = Query(None, description="End time (UTC)"),
     limit: int = Query(1000, ge=1, le=10000, description="Maximum number of points"),
     db: Session = Depends(get_db),
-    _: str = Depends(require_auth),
+    user: User = Depends(get_current_user),
 ):
     """Get location history for a device."""
-    device = verify_device_access(device_id, None, db)
+    device = verify_device_access(device_id, user, db)
     
     # Build query
     query = db.query(Location).filter(Location.device_id == device_id)
@@ -209,10 +210,10 @@ async def get_device_route(
     end_time: Optional[datetime] = Query(None),
     simplify: bool = Query(False, description="Simplify route to reduce points"),
     db: Session = Depends(get_db),
-    _: str = Depends(require_auth),
+    user: User = Depends(get_current_user),
 ):
     """Get device route (optimized for map display)."""
-    device = verify_device_access(device_id, None, db)
+    device = verify_device_access(device_id, user, db)
     
     query = db.query(Location).filter(
         Location.device_id == device_id,
@@ -266,7 +267,7 @@ async def get_device_distance(
     start_time: Optional[datetime] = Query(None, description="Start time (UTC)"),
     end_time: Optional[datetime] = Query(None, description="End time (UTC)"),
     db: Session = Depends(get_db),
-    _: str = Depends(require_auth),
+    user: User = Depends(get_current_user),
 ):
     """
     Get total distance covered by a device within a time range.
@@ -274,7 +275,7 @@ async def get_device_distance(
     Distance is calculated using the Haversine formula across consecutive GPS points.
     Only GPS-valid points are used.
     """
-    device = verify_device_access(device_id, None, db)
+    device = verify_device_access(device_id, user, db)
 
     if not start_time:
         start_time = datetime.utcnow() - timedelta(hours=24)
@@ -302,12 +303,12 @@ async def get_device_route_line(
     start_time: Optional[datetime] = Query(None, description="Start time (UTC)"),
     end_time: Optional[datetime] = Query(None, description="End time (UTC)"),
     db: Session = Depends(get_db),
-    _: str = Depends(require_auth),
+    user: User = Depends(get_current_user),
 ):
     """
     Get device route as a LineString with timestamps aligned to coordinates.
     """
-    device = verify_device_access(device_id, None, db)
+    device = verify_device_access(device_id, user, db)
 
     if not start_time:
         start_time = datetime.utcnow() - timedelta(hours=24)
@@ -328,9 +329,11 @@ async def get_device_alarms(
     end_time: Optional[datetime] = Query(None),
     limit: int = Query(100, ge=1, le=1000),
     db: Session = Depends(get_db),
-    _: str = Depends(require_auth),
+    user: User = Depends(get_current_user),
 ):
     """Get alarm events for a device"""
+    verify_device_access(device_id, user, db)
+
     query = db.query(Location).filter(
         Location.device_id == device_id,
         Location.is_alarm == True

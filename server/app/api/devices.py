@@ -10,7 +10,7 @@ import time
 from collections import defaultdict
 
 from app.core.database import get_db
-from app.core.auth import require_auth, require_admin
+from app.core.auth import require_auth, require_admin, get_current_user, require_device_access
 from app.models.device import Device
 from app.models.location import Location
 from app.models.trip import Trip
@@ -157,12 +157,13 @@ async def list_rejected_devices(
 async def list_device_trips(
     device_id: int,
     db: Session = Depends(get_db),
-    _: str = Depends(require_auth),
+    user: User = Depends(get_current_user),
 ):
     """List trips for a device. Access trips via device_id."""
     device = db.query(Device).filter(Device.id == device_id).first()
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
+    require_device_access(device, user)
     trips = (
         db.query(Trip)
         .filter(Trip.device_id == device_id)
@@ -176,12 +177,13 @@ async def list_device_trips(
 async def get_device(
     device_id: int,
     db: Session = Depends(get_db),
-    _: str = Depends(require_auth),
+    user: User = Depends(get_current_user),
 ):
     """Get device by ID"""
     device = db.query(Device).filter(Device.id == device_id).first()
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
+    require_device_access(device, user)
     return device
 
 
@@ -189,12 +191,13 @@ async def get_device(
 async def get_device_by_imei(
     imei: str,
     db: Session = Depends(get_db),
-    _: str = Depends(require_auth),
+    user: User = Depends(get_current_user),
 ):
     """Get device by IMEI"""
     device = db.query(Device).filter(Device.imei == imei).first()
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
+    require_device_access(device, user)
     return device
 
 
@@ -202,10 +205,10 @@ async def get_device_by_imei(
 async def create_device(
     device_data: DeviceCreate,
     db: Session = Depends(get_db),
-    _: str = Depends(require_auth),
+    _: User = Depends(require_admin),
 ):
     """
-    Whitelist a new GPS device in the inventory.
+    Whitelist a new GPS device in the inventory. Admin only.
     If `pairing_pin` is not provided, a secure 6-character PIN is auto-generated.
     The PIN must be given to the end-user (e.g. printed inside the device box)
     so they can pair the device from the mobile app.
@@ -242,12 +245,13 @@ async def update_device(
     device_id: int,
     device_data: DeviceUpdate,
     db: Session = Depends(get_db),
-    _: str = Depends(require_auth),
+    user: User = Depends(get_current_user),
 ):
     """Update device information"""
     device = db.query(Device).filter(Device.id == device_id).first()
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
+    require_device_access(device, user)
 
     device.name = device_data.name
     if device_data.description is not None:
@@ -270,12 +274,13 @@ async def update_device(
 async def delete_device(
     device_id: int,
     db: Session = Depends(get_db),
-    _: str = Depends(require_auth),
+    user: User = Depends(get_current_user),
 ):
     """Delete device"""
     device = db.query(Device).filter(Device.id == device_id).first()
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
+    require_device_access(device, user)
     db.delete(device)
     db.commit()
     return None
@@ -289,7 +294,7 @@ async def delete_device(
 async def verify_device(
     device_id: int,
     db: Session = Depends(get_db),
-    _: str = Depends(require_auth),
+    _: User = Depends(require_admin),
 ):
     """
     Admin: Manually mark a device as verified and ready to sell.
@@ -355,66 +360,48 @@ async def get_device_status_by_imei_ownership(
 @router.get("/{device_id}/status")
 async def get_device_status(
     device_id: str,
-    request: Request,
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     """
     Get device status by numeric device ID or by IMEI.
 
-    - If device_id looks like an IMEI (15-16 digits), perform an ownership-aware
-      lookup using the caller's Clerk JWT (required for mobile app polling).
-    - Otherwise treat it as a numeric admin device ID (no auth required).
+    Ownership-checked either way: the caller must own the device, or hold an
+    ADMIN/SUPER_ADMIN role. Returns 404 if the device doesn't exist or isn't
+    accessible to the caller.
     """
     is_imei = device_id.isdigit() and len(device_id) in (15, 16)
 
     if is_imei:
-        # Ownership-aware path — mobile app polls this after pairing
-        from app.core.auth import _verify_clerk_token
-        auth_header = request.headers.get("Authorization", "")
-        token = auth_header.removeprefix("Bearer ").strip()
-        clerk_user_id = await _verify_clerk_token(token) if token else None
-
-        if not clerk_user_id:
-            raise HTTPException(status_code=401, detail="Authentication required")
-
-        user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found")
-
-        device = db.query(Device).filter(
-            Device.imei == device_id,
-            Device.user_id == user.id,
-        ).first()
-
-        if not device:
-            raise HTTPException(status_code=404, detail="Device not found or not paired to your account")
-
-        return {"status": device.status}
-
+        device = db.query(Device).filter(Device.imei == device_id).first()
     else:
-        # Numeric device ID path — admin use, no ownership check
         try:
             dev_id = int(device_id)
         except ValueError:
             raise HTTPException(status_code=422, detail="device_id must be numeric or a 15-16 digit IMEI")
-
         device = db.query(Device).filter(Device.id == dev_id).first()
-        if not device:
-            raise HTTPException(status_code=404, detail="Device not found")
 
-        return {
-            "id": device.id,
-            "imei": device.imei,
-            "name": device.name,
-            "status": device.status,
-            "last_update": device.last_update,
-            "battery_level": device.battery_level,
-            "gsm_signal": device.gsm_signal,
-            "location": {
-                "latitude": device.last_latitude,
-                "longitude": device.last_longitude,
-            } if device.last_latitude and device.last_longitude else None,
-        }
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    require_device_access(device, user)
+
+    if is_imei:
+        # Mobile app device-wait screen — minimal payload
+        return {"status": device.status}
+
+    return {
+        "id": device.id,
+        "imei": device.imei,
+        "name": device.name,
+        "status": device.status,
+        "last_update": device.last_update,
+        "battery_level": device.battery_level,
+        "gsm_signal": device.gsm_signal,
+        "location": {
+            "latitude": device.last_latitude,
+            "longitude": device.last_longitude,
+        } if device.last_latitude and device.last_longitude else None,
+    }
 
 
 @router.get("/{device_id}/diagnostics", response_model=DeviceDiagnosticsResponse)
@@ -422,7 +409,7 @@ async def get_device_diagnostics(
     device_id: int,
     samples: int = Query(20, ge=2, le=200, description="Number of recent location points to analyze"),
     db: Session = Depends(get_db),
-    _: str = Depends(require_auth),
+    user: User = Depends(get_current_user),
 ):
     """
     Diagnostics for a device, including recent location packet intervals.
@@ -432,6 +419,7 @@ async def get_device_diagnostics(
     device = db.query(Device).filter(Device.id == device_id).first()
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
+    require_device_access(device, user)
 
     # Determine last seen and sending status
     last_seen = device.last_update or device.last_connect

@@ -9,6 +9,7 @@ from sqlalchemy.orm import Session
 from pydantic import BaseModel, field_validator, model_validator
 
 from app.core.database import get_db
+from app.core.auth import get_current_user
 from app.models.trip import Trip
 from app.models.trip_settings import TripSettings
 from app.models.user import User
@@ -30,21 +31,6 @@ GEOCODING_TIMEOUT_SECONDS = 15
 DEFAULT_STOP_SPLITS_MINUTES = 60
 DEFAULT_MIN_TRIP_MINUTES = 5
 DEFAULT_STOP_SPEED_KMH = 5.0
-
-
-def get_default_user(db: Session) -> User:
-    """Get or create default user (no Clerk auth)."""
-    user = db.query(User).first()
-    if not user:
-        user = User(
-            clerk_user_id="default",
-            email="default@local",
-            name="Default User",
-        )
-        db.add(user)
-        db.commit()
-        db.refresh(user)
-    return user
 
 
 def get_or_create_trip_settings(user_id: int, db: Session) -> TripSettings:
@@ -173,9 +159,11 @@ class TripDetailResponse(TripResponse):
 
 
 @router.get("/settings", response_model=TripSettingsResponse)
-async def get_trip_settings(db: Session = Depends(get_db)):
-    """Get trip segmentation settings (uses default user)."""
-    user = get_default_user(db)
+async def get_trip_settings(
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Get trip segmentation settings for the authenticated user."""
     settings = get_or_create_trip_settings(user.id, db)
     return TripSettingsResponse(
         stop_splits_trip_after_minutes=settings.stop_splits_trip_after_minutes,
@@ -188,9 +176,9 @@ async def get_trip_settings(db: Session = Depends(get_db)):
 async def update_trip_settings(
     body: TripSettingsUpdate,
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
-    """Update trip segmentation settings (uses default user)."""
-    user = get_default_user(db)
+    """Update trip segmentation settings for the authenticated user."""
     settings = get_or_create_trip_settings(user.id, db)
     if body.stop_splits_trip_after_minutes is not None:
         settings.stop_splits_trip_after_minutes = body.stop_splits_trip_after_minutes
@@ -213,6 +201,7 @@ async def get_suggested_trips(
     start_time: Optional[datetime] = Query(None, description="Start of time range (UTC)"),
     end_time: Optional[datetime] = Query(None, description="End of time range (UTC)"),
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     """
     Get suggested trip segments based on settings.
@@ -220,8 +209,7 @@ async def get_suggested_trips(
     Segments location history by stop duration: a stop longer than
     stop_splits_trip_after_minutes splits into a new trip.
     """
-    user = get_default_user(db)
-    device = verify_device_access(device_id, None, db)
+    device = verify_device_access(device_id, user, db)
     settings = get_or_create_trip_settings(user.id, db)
 
     if not start_time:
@@ -247,12 +235,15 @@ async def get_suggested_trips(
 
 
 @router.post("/start", response_model=TripResponse, status_code=201)
-async def start_trip(body: TripStartRequest, db: Session = Depends(get_db)):
+async def start_trip(
+    body: TripStartRequest,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
     """
     Start an active trip. Trip ends automatically when device stops sending (disconnects).
     """
-    user = get_default_user(db)
-    verify_device_access(body.device_id, None, db)
+    verify_device_access(body.device_id, user, db)
     # Check no other active trip for this device
     existing = db.query(Trip).filter(
         Trip.device_id == body.device_id,
@@ -278,12 +269,15 @@ async def start_trip(body: TripStartRequest, db: Session = Depends(get_db)):
 
 
 @router.post("", response_model=TripResponse, status_code=201)
-async def create_trip(body: TripCreate, db: Session = Depends(get_db)):
+async def create_trip(
+    body: TripCreate,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
     """
     Create a saved trip from a device's location history.
     """
-    user = get_default_user(db)
-    verify_device_access(body.device_id, None, db)
+    verify_device_access(body.device_id, user, db)
 
     # Compute distance and ensure locations exist
     total_distance, locations = compute_distance_for_device_time_range(
@@ -344,11 +338,12 @@ async def create_trip(body: TripCreate, db: Session = Depends(get_db)):
 async def list_trips(
     device_id: int = Query(..., description="Device ID (required - one can have many devices)"),
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     """
     List saved trips for a device. device_id required.
     """
-    verify_device_access(device_id, None, db)
+    verify_device_access(device_id, user, db)
     trips = (
         db.query(Trip)
         .filter(Trip.device_id == device_id)
@@ -363,10 +358,13 @@ async def get_trip(
     trip_id: int,
     device_id: int = Query(..., description="Device ID (required for context)"),
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     """
     Get trip metadata and route geometry. device_id required.
     """
+    verify_device_access(device_id, user, db)
+
     trip = db.query(Trip).filter(Trip.id == trip_id, Trip.device_id == device_id).first()
     if not trip:
         raise HTTPException(status_code=404, detail="Trip not found")
@@ -411,17 +409,19 @@ async def end_trip_manually(
     trip_id: int,
     device_id: int = Query(..., description="Device ID"),
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     """
     Manually end an active trip (e.g. before device disconnects).
     """
     from app.services.trip_service import end_active_trips_for_device
+    verify_device_access(device_id, user, db)
+
     trip = db.query(Trip).filter(Trip.id == trip_id, Trip.device_id == device_id).first()
     if not trip:
         raise HTTPException(status_code=404, detail="Trip not found")
     if trip.end_time is not None:
         return trip  # Already ended
-    verify_device_access(device_id, None, db)
     end_active_trips_for_device(device_id, db)
     db.refresh(trip)
     return trip
@@ -432,10 +432,13 @@ async def delete_trip(
     trip_id: int,
     device_id: int = Query(..., description="Device ID"),
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     """
     Delete a saved trip. device_id required. Location data is not affected.
     """
+    verify_device_access(device_id, user, db)
+
     trip = db.query(Trip).filter(Trip.id == trip_id, Trip.device_id == device_id).first()
     if not trip:
         raise HTTPException(status_code=404, detail="Trip not found")

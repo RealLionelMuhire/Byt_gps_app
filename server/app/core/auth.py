@@ -38,6 +38,7 @@ from sqlalchemy.orm import Session
 from app.core.config import settings
 from app.core.database import get_db
 from app.models.user import User, Role
+from app.models.device import Device
 
 logger = logging.getLogger(__name__)
 
@@ -131,7 +132,7 @@ async def require_auth(
     return clerk_user_id
 
 
-async def _get_current_user(
+async def get_current_user(
     clerk_user_id: str = Depends(require_auth),
     db: Session = Depends(get_db),
 ) -> User:
@@ -150,7 +151,7 @@ REQUIRE_TECHNICIAN_ROLES = {Role.SUPER_ADMIN, Role.ADMIN, Role.TECHNICIAN}
 
 
 async def require_admin(
-    user: User = Depends(_get_current_user),
+    user: User = Depends(get_current_user),
 ) -> User:
     """FastAPI dependency: require ADMIN or SUPER_ADMIN role."""
     if user.role not in REQUIRE_ADMIN_ROLES:
@@ -162,7 +163,7 @@ async def require_admin(
 
 
 async def require_technician(
-    user: User = Depends(_get_current_user),
+    user: User = Depends(get_current_user),
 ) -> User:
     """FastAPI dependency: require TECHNICIAN, ADMIN, or SUPER_ADMIN role."""
     if user.role not in REQUIRE_TECHNICIAN_ROLES:
@@ -174,7 +175,7 @@ async def require_technician(
 
 
 async def require_super_admin(
-    user: User = Depends(_get_current_user),
+    user: User = Depends(get_current_user),
 ) -> User:
     """FastAPI dependency: require SUPER_ADMIN role only."""
     if user.role != Role.SUPER_ADMIN:
@@ -183,3 +184,21 @@ async def require_super_admin(
             detail="Super admin access required.",
         )
     return user
+
+
+def user_can_access_device(user: User, device: Device) -> bool:
+    """True if `user` owns `device`, or holds an admin role."""
+    return user.role in REQUIRE_ADMIN_ROLES or device.user_id == user.id
+
+
+def require_device_access(device: Device, user: User) -> Device:
+    """
+    Raise 404 unless `user` owns `device` or holds an admin role.
+
+    Uses 404 (not 403) so a non-owner gets the same response whether the
+    device doesn't exist or simply isn't theirs — matching the existing
+    convention in get_device_status_by_imei_ownership().
+    """
+    if not user_can_access_device(user, device):
+        raise HTTPException(status_code=404, detail="Device not found")
+    return device

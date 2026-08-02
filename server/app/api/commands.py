@@ -6,8 +6,9 @@ from pydantic import BaseModel
 import logging
 
 from app.core.database import get_db
-from app.core.auth import require_auth
+from app.core.auth import get_current_user, require_device_access
 from app.models.device import Device
+from app.models.user import User
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -49,7 +50,7 @@ async def send_raw_command(
     body: CommandRequest,
     request: Request,
     db: Session = Depends(get_db),
-    _: str = Depends(require_auth),
+    user: User = Depends(get_current_user),
 ):
     """Send any SMS-compatible command to a connected device over TCP.
 
@@ -59,6 +60,7 @@ async def send_raw_command(
     device = db.query(Device).filter(Device.id == device_id).first()
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
+    require_device_access(device, user)
 
     tcp = _get_tcp_server(request)
     result = await tcp.send_command_to_device(device.imei, body.command)
@@ -84,11 +86,11 @@ async def toggle_vibration_alarm(
     body: AlarmToggleRequest,
     request: Request,
     db: Session = Depends(get_db),
-    _: str = Depends(require_auth),
+    user: User = Depends(get_current_user),
 ):
     """Enable or disable the vibration/shock alarm."""
     cmd = "vibrate123456 1" if body.enabled else "vibrate123456 0"
-    return await _send(device_id, cmd, "vibration alarm", request, db)
+    return await _send(device_id, cmd, "vibration alarm", request, db, user)
 
 
 @router.post("/{device_id}/alarm/lowbattery")
@@ -97,11 +99,11 @@ async def toggle_low_battery_alarm(
     body: AlarmToggleRequest,
     request: Request,
     db: Session = Depends(get_db),
-    _: str = Depends(require_auth),
+    user: User = Depends(get_current_user),
 ):
     """Enable or disable the low battery alarm."""
     cmd = "lowbattery123456 on" if body.enabled else "lowbattery123456 off"
-    return await _send(device_id, cmd, "low battery alarm", request, db)
+    return await _send(device_id, cmd, "low battery alarm", request, db, user)
 
 
 @router.post("/{device_id}/alarm/acc")
@@ -110,11 +112,11 @@ async def toggle_acc_alarm(
     body: AlarmToggleRequest,
     request: Request,
     db: Session = Depends(get_db),
-    _: str = Depends(require_auth),
+    user: User = Depends(get_current_user),
 ):
     """Enable or disable the ACC (ignition) on/off alarm."""
     cmd = "acc123456" if body.enabled else "noacc123456"
-    return await _send(device_id, cmd, "ACC alarm", request, db)
+    return await _send(device_id, cmd, "ACC alarm", request, db, user)
 
 
 @router.post("/{device_id}/alarm/overspeed")
@@ -123,11 +125,11 @@ async def toggle_overspeed_alarm(
     body: SpeedLimitRequest,
     request: Request,
     db: Session = Depends(get_db),
-    _: str = Depends(require_auth),
+    user: User = Depends(get_current_user),
 ):
     """Enable or disable the overspeed alarm. Set speed_kmh for the threshold."""
     cmd = f"speed123456 {body.speed_kmh:03d}" if body.enabled else "nospeed123456"
-    return await _send(device_id, cmd, "overspeed alarm", request, db)
+    return await _send(device_id, cmd, "overspeed alarm", request, db, user)
 
 
 @router.post("/{device_id}/alarm/displacement")
@@ -136,11 +138,11 @@ async def toggle_displacement_alarm(
     body: MovementAlarmRequest,
     request: Request,
     db: Session = Depends(get_db),
-    _: str = Depends(require_auth),
+    user: User = Depends(get_current_user),
 ):
     """Enable or disable the displacement/movement alarm. Set radius_meters for the trigger radius."""
     cmd = f"move123456 {body.radius_meters:04d}" if body.enabled else "nomove123456"
-    return await _send(device_id, cmd, "displacement alarm", request, db)
+    return await _send(device_id, cmd, "displacement alarm", request, db, user)
 
 
 @router.post("/{device_id}/alarm/sos")
@@ -149,12 +151,12 @@ async def configure_sos_alarm(
     body: AlarmToggleRequest,
     request: Request,
     db: Session = Depends(get_db),
-    _: str = Depends(require_auth),
+    user: User = Depends(get_current_user),
 ):
     """Configure SOS alarm mode. 0=off, 1=GPRS only, 2=GPRS+SMS, 3=GPRS+SMS+Call."""
     level = "1" if body.enabled else "0"
     cmd = f"KC123456 {level}"
-    return await _send(device_id, cmd, "SOS alarm", request, db)
+    return await _send(device_id, cmd, "SOS alarm", request, db, user)
 
 
 @router.post("/{device_id}/fuel/cut")
@@ -162,10 +164,10 @@ async def cut_fuel(
     device_id: int,
     request: Request,
     db: Session = Depends(get_db),
-    _: str = Depends(require_auth),
+    user: User = Depends(get_current_user),
 ):
     """Cut oil/electricity (immobilize vehicle). Only works when speed < 20 km/h and GPS is on (doc §6.4)."""
-    return await _send(device_id, "DYD,000000#", "cut fuel", request, db)
+    return await _send(device_id, "DYD,000000#", "cut fuel", request, db, user)
 
 
 @router.post("/{device_id}/fuel/restore")
@@ -173,10 +175,10 @@ async def restore_fuel(
     device_id: int,
     request: Request,
     db: Session = Depends(get_db),
-    _: str = Depends(require_auth),
+    user: User = Depends(get_current_user),
 ):
     """Restore oil/electricity (re-enable vehicle) (doc §6.5)."""
-    return await _send(device_id, "HFYD,000000#", "restore fuel", request, db)
+    return await _send(device_id, "HFYD,000000#", "restore fuel", request, db, user)
 
 
 @router.post("/{device_id}/query/location")
@@ -184,10 +186,10 @@ async def query_location(
     device_id: int,
     request: Request,
     db: Session = Depends(get_db),
-    _: str = Depends(require_auth),
+    user: User = Depends(get_current_user),
 ):
     """Query current location from device (doc §6.3). Returns lat/lon/speed/course/datetime."""
-    return await _send(device_id, "DWXX#", "query location", request, db)
+    return await _send(device_id, "DWXX#", "query location", request, db, user)
 
 
 @router.post("/{device_id}/query/status")
@@ -195,9 +197,10 @@ async def query_status(
     device_id: int,
     request: Request,
     db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
     """Query current device status (battery, GPS, GSM, ACC)."""
-    return await _send(device_id, "STATUS#", "query status", request, db)
+    return await _send(device_id, "STATUS#", "query status", request, db, user)
 
 
 # ── Helper ─────────────────────────────────────────────────────────────────
@@ -209,10 +212,12 @@ async def _send(
     label: str,
     request: Request,
     db: Session,
+    user: User,
 ) -> dict:
     device = db.query(Device).filter(Device.id == device_id).first()
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
+    require_device_access(device, user)
 
     tcp = _get_tcp_server(request)
     result = await tcp.send_command_to_device(device.imei, command)
