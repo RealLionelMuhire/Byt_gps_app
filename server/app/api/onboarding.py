@@ -211,18 +211,17 @@ async def pair_device(
 
     # Conflict: device already claimed by a different user
     if device.user_id and device.user_id != user.id:
-        raise HTTPException(status_code=409, detail="Device already registered to another account.")
+        raise HTTPException(
+            status_code=409,
+            detail="This device is already registered to another account. Contact support if you believe this is an error.",
+        )
 
     # Guard: device must have proven it's functional (lifecycle != 'registered')
     # 'registered' means SIM was inserted but device never connected via TCP.
     if device.lifecycle == 'registered':
         raise HTTPException(
             status_code=409,
-            detail=(
-                "This device has not yet connected to the server. "
-                "Please power it on with the SIM inserted and wait for the signal indicator "
-                "before pairing. Contact support if the issue persists."
-            )
+            detail="This device hasn't connected to our servers yet. Please power it on and ensure it has network coverage.",
         )
 
     # PIN validation: if device has a pairing_pin set, the client must supply the correct one

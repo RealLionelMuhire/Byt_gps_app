@@ -154,7 +154,12 @@ async def handle_user_deleted(clerk_user_id: str, db: Session):
         devices = db.query(Device).filter(Device.user_id == user.id).all()
         for device in devices:
             device.user_id = None
-            device.lifecycle = "registered"  # Revert back to un-sold state
+            # 'in_stock', not 'registered' — this device already proved TCP
+            # connectivity to get to 'sold' in the first place; only its
+            # ownership is being cleared. 'registered' would wrongly claim
+            # it has never connected (see Device model's transition table:
+            # sold -> in_stock on customer removal, never sold -> registered).
+            device.lifecycle = "in_stock"
             logger.info(f"Freed device {device.imei} from deleted user {user.id}.")
 
         # Delete vehicles belonging to this user
