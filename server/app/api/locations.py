@@ -11,7 +11,7 @@ from app.core.database import get_db
 from app.core.auth import get_current_user, require_device_access
 from app.models.location import Location
 from app.models.device import Device
-from app.models.user import User
+from app.models.user import User, Role
 
 router = APIRouter()
 
@@ -24,6 +24,48 @@ def haversine_km(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
     a = sin(dlat / 2) ** 2 + cos(lat1) * cos(lat2) * sin(dlon / 2) ** 2
     c = 2 * asin(sqrt(a))
     return 6371 * c
+
+
+METERS_PER_DEGREE = 111_320.0  # approx meters per degree of latitude
+
+
+def _perpendicular_distance(point: "Location", start: "Location", end: "Location") -> float:
+    """Perpendicular distance from `point` to line (start, end), in degrees (lon/lat plane)."""
+    x, y = point.longitude, point.latitude
+    x1, y1 = start.longitude, start.latitude
+    x2, y2 = end.longitude, end.latitude
+    if x1 == x2 and y1 == y2:
+        return sqrt((x - x1) ** 2 + (y - y1) ** 2)
+    num = abs((y2 - y1) * x - (x2 - x1) * y + x2 * y1 - y2 * x1)
+    den = sqrt((y2 - y1) ** 2 + (x2 - x1) ** 2)
+    return num / den
+
+
+def douglas_peucker(points: List["Location"], epsilon: float) -> List["Location"]:
+    """
+    Ramer-Douglas-Peucker simplification (iterative/stack-based, to avoid
+    recursion-depth issues on long tracks). `epsilon` is the max perpendicular
+    distance (degrees) a point may deviate before being dropped. Endpoints kept.
+    """
+    if len(points) < 3:
+        return points
+    keep = [False] * len(points)
+    keep[0] = keep[-1] = True
+    stack = [(0, len(points) - 1)]
+    while stack:
+        start, end = stack.pop()
+        if end - start < 2:
+            continue
+        dmax, index = 0.0, start
+        for i in range(start + 1, end):
+            d = _perpendicular_distance(points[i], points[start], points[end])
+            if d > dmax:
+                index, dmax = i, d
+        if dmax > epsilon:
+            keep[index] = True
+            stack.append((start, index))
+            stack.append((index, end))
+    return [p for p, k in zip(points, keep) if k]
 
 
 def verify_device_access(device_id: int, user: User, db: Session) -> Device:
@@ -208,29 +250,38 @@ async def get_device_route(
     device_id: int,
     start_time: Optional[datetime] = Query(None),
     end_time: Optional[datetime] = Query(None),
-    simplify: bool = Query(False, description="Simplify route to reduce points"),
+    simplify: bool = Query(False, description="Simplify route via Douglas-Peucker to reduce point count"),
+    tolerance_meters: float = Query(
+        20.0, ge=1.0, le=1000.0,
+        description="Max deviation in meters a point may contribute before being dropped (only used when simplify=true)"
+    ),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
     """Get device route (optimized for map display)."""
     device = verify_device_access(device_id, user, db)
-    
+
     query = db.query(Location).filter(
         Location.device_id == device_id,
         Location.gps_valid == True
     )
-    
+
     if start_time:
         query = query.filter(Location.timestamp >= start_time)
     else:
         start_time = datetime.utcnow() - timedelta(hours=24)
         query = query.filter(Location.timestamp >= start_time)
-    
+
     if end_time:
         query = query.filter(Location.timestamp <= end_time)
-    
+
     locations = query.order_by(Location.timestamp.asc()).all()
-    
+
+    original_point_count = len(locations)
+    if simplify and original_point_count > 2:
+        epsilon_deg = tolerance_meters / METERS_PER_DEGREE
+        locations = douglas_peucker(locations, epsilon_deg)
+
     # Format as GeoJSON for easy map display
     features = []
     for loc in locations:
@@ -256,7 +307,9 @@ async def get_device_route(
             "device_name": device.name,
             "start_time": start_time.isoformat(),
             "end_time": (end_time or datetime.utcnow()).isoformat(),
-            "point_count": len(features)
+            "point_count": len(features),
+            "simplified": simplify,
+            "original_point_count": original_point_count
         }
     }
 
@@ -358,31 +411,21 @@ async def get_nearby_devices(
     latitude: float = Query(..., ge=-90, le=90),
     longitude: float = Query(..., ge=-180, le=180),
     radius_km: float = Query(10, ge=0.1, le=100, description="Search radius in kilometers"),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
 ):
-    """Find devices near a location"""
-    # This would use PostGIS spatial queries in production
-    # For now, simple distance calculation
-    from math import radians, cos, sin, asin, sqrt
-    
-    def haversine(lon1, lat1, lon2, lat2):
-        """Calculate distance between two points on Earth"""
-        lon1, lat1, lon2, lat2 = map(radians, [lon1, lat1, lon2, lat2])
-        dlon = lon2 - lon1
-        dlat = lat2 - lat1
-        a = sin(dlat/2)**2 + cos(lat1) * cos(lat2) * sin(dlon/2)**2
-        c = 2 * asin(sqrt(a))
-        km = 6371 * c
-        return km
-    
-    devices = db.query(Device).filter(
+    """Find devices near a location, scoped to the caller's own devices (admins see all)."""
+    query = db.query(Device).filter(
         Device.last_latitude.isnot(None),
         Device.last_longitude.isnot(None)
-    ).all()
-    
+    )
+    if user.role not in (Role.SUPER_ADMIN, Role.ADMIN):
+        query = query.filter(Device.user_id == user.id)
+    devices = query.all()
+
     nearby = []
     for device in devices:
-        distance = haversine(longitude, latitude, device.last_longitude, device.last_latitude)
+        distance = haversine_km(longitude, latitude, device.last_longitude, device.last_latitude)
         if distance <= radius_km:
             nearby.append({
                 "device_id": device.id,
