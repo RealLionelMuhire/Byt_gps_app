@@ -223,10 +223,44 @@ class GPSTrackerConnection:
                     device.status = 'online'
                     
                     db.commit()
-                    
+
+                    # Auto-start a trip the first time this device reports a
+                    # gps_valid fix at/above the owner's "moving" speed
+                    # threshold while it has no active trip. Mirrors the
+                    # auto-*end* logic in trip_service.py/main.py's stale
+                    # checker, which only ever closes a trip, never opens
+                    # one — without this, no Trip row is ever created unless
+                    # something calls POST /api/trips/start explicitly.
+                    if device.user_id and data['gps_valid']:
+                        from app.models.trip import Trip
+                        from app.api.trips import get_or_create_trip_settings
+
+                        trip_settings = get_or_create_trip_settings(device.user_id, db)
+                        if data['speed'] >= trip_settings.stop_speed_threshold_kmh:
+                            has_active_trip = (
+                                db.query(Trip)
+                                .filter(Trip.device_id == device.id, Trip.end_time.is_(None))
+                                .first()
+                            )
+                            if not has_active_trip:
+                                new_trip = Trip(
+                                    device_id=device.id,
+                                    user_id=device.user_id,
+                                    name=f"Trip {data['timestamp']:%Y-%m-%d %H:%M}",
+                                    start_time=data['timestamp'],
+                                    end_time=None,
+                                    total_distance_km=0.0,
+                                )
+                                db.add(new_trip)
+                                db.commit()
+                                logger.info(
+                                    "Auto-started trip for device %s at %s",
+                                    self.device_imei, data['timestamp'],
+                                )
+
                     # Broadcast to WebSocket clients
                     await self.server.broadcast_location_update(device.id, data)
-            
+
             finally:
                 db.close()
         

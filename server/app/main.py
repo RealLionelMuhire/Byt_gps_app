@@ -31,38 +31,72 @@ tcp_server = None
 
 
 async def _trip_stale_checker():
-    """Background task: end active trips when device stops sending (stale last_update)."""
+    """Background task: end active trips either when the device stops
+    sending entirely (stale last_update — the original check) or when it's
+    still connected but has been stopped (speed below the owner's
+    stop_speed_threshold_kmh) for stop_splits_trip_after_minutes. Without
+    the second condition, a trip that starts on movement (see
+    tcp_server.py's handle_location) would otherwise run forever as long as
+    the device keeps pinging while parked.
+    """
     from datetime import timedelta
-    from sqlalchemy import or_, and_
     from app.core.database import SessionLocal
     from app.models.trip import Trip
     from app.models.device import Device
+    from app.models.location import Location
     from app.services.trip_service import end_active_trips_for_device
+    from app.api.trips import get_or_create_trip_settings
 
     while True:
         try:
             await asyncio.sleep(60)  # Run every 60 seconds
-            cutoff = datetime.utcnow() - timedelta(seconds=settings.TRIP_AUTO_END_STALE_SECONDS)
+            now = datetime.utcnow()
+            stale_cutoff = now - timedelta(seconds=settings.TRIP_AUTO_END_STALE_SECONDS)
             db = SessionLocal()
             try:
-                # Devices with active trips and stale last_update (or last_connect if no update yet)
-                subq = db.query(Trip.device_id).filter(Trip.end_time.is_(None)).distinct()
-                stale_devices = (
-                    db.query(Device.id)
-                    .filter(
-                        Device.id.in_(subq),
-                        or_(
-                            Device.last_update < cutoff,
-                            and_(Device.last_update.is_(None), Device.last_connect < cutoff),
-                        ),
+                active_trips = db.query(Trip).filter(Trip.end_time.is_(None)).all()
+                for trip in active_trips:
+                    device = db.query(Device).filter(Device.id == trip.device_id).first()
+                    if not device:
+                        continue
+
+                    is_stale = (
+                        device.last_update < stale_cutoff
+                        if device.last_update is not None
+                        else (device.last_connect is not None and device.last_connect < stale_cutoff)
                     )
-                    .all()
-                )
-                for (device_id,) in stale_devices:
-                    ended = end_active_trips_for_device(device_id, db)
-                    if ended:
-                        logger.info("Auto-ended %d trip(s) for device %s (no update for %ds)",
-                                    ended, device_id, settings.TRIP_AUTO_END_STALE_SECONDS)
+
+                    reason = None
+                    if is_stale:
+                        reason = f"no update for {settings.TRIP_AUTO_END_STALE_SECONDS}s"
+                    else:
+                        # Still connected — check whether it's been stopped
+                        # long enough (per the owner's own trip settings) to
+                        # count as the trip having ended anyway.
+                        trip_settings = get_or_create_trip_settings(trip.user_id, db)
+                        last_moving = (
+                            db.query(Location)
+                            .filter(
+                                Location.device_id == trip.device_id,
+                                Location.gps_valid == True,
+                                Location.timestamp >= trip.start_time,
+                                Location.speed >= trip_settings.stop_speed_threshold_kmh,
+                            )
+                            .order_by(Location.timestamp.desc())
+                            .first()
+                        )
+                        reference_time = last_moving.timestamp if last_moving else trip.start_time
+                        stopped_for = timedelta(minutes=trip_settings.stop_splits_trip_after_minutes)
+                        if now - reference_time >= stopped_for:
+                            reason = f"stopped for {trip_settings.stop_splits_trip_after_minutes}m"
+
+                    if reason:
+                        ended = end_active_trips_for_device(trip.device_id, db)
+                        if ended:
+                            logger.info(
+                                "Auto-ended %d trip(s) for device %s (%s)",
+                                ended, trip.device_id, reason,
+                            )
             finally:
                 db.close()
         except asyncio.CancelledError:
