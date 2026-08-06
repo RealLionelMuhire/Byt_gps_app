@@ -2,6 +2,7 @@
 
 from typing import List, Optional, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 import secrets
@@ -72,6 +73,15 @@ class DeviceResponse(DeviceBase):
     battery_level: Optional[int]
     gsm_signal: Optional[int]
     created_at: datetime
+    # Aggregate fields against the trips table — only populated by
+    # list_devices (see its trip_count_subq/last_trip_at_subq), so the
+    # Flutter selector can show them without an N+1 call per device.
+    # Default to 0/None so every other endpoint returning a bare Device ORM
+    # object (get_device, create_device, etc.) keeps working unchanged —
+    # Pydantic falls back to these defaults for a Device instance that
+    # never had trip_count/last_trip_at set on it.
+    trip_count: int = 0
+    last_trip_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True
@@ -110,8 +120,25 @@ async def list_devices(
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
 
-    query = db.query(Device)
-    
+    # Correlated scalar subqueries rather than a JOIN + GROUP BY: a device
+    # with zero trips would be dropped by an inner join (or need an outer
+    # join anyway), and this keeps the existing single-table Device query
+    # untouched below — just two extra selected columns.
+    trip_count_subq = (
+        db.query(func.count(Trip.id))
+        .filter(Trip.device_id == Device.id)
+        .correlate(Device)
+        .scalar_subquery()
+    )
+    last_trip_at_subq = (
+        db.query(func.max(Trip.start_time))
+        .filter(Trip.device_id == Device.id)
+        .correlate(Device)
+        .scalar_subquery()
+    )
+
+    query = db.query(Device, trip_count_subq, last_trip_at_subq)
+
     # If not admin/super_admin, only show devices paired to this user
     if user.role not in (Role.SUPER_ADMIN, Role.ADMIN):
         query = query.filter(Device.user_id == user.id)
@@ -119,7 +146,15 @@ async def list_devices(
     if status:
         query = query.filter(Device.status == status)
 
-    devices = query.offset(skip).limit(limit).all()
+    rows = query.offset(skip).limit(limit).all()
+
+    devices = []
+    for device, trip_count, last_trip_at in rows:
+        # Transient (non-persisted) attributes — DeviceResponse picks them
+        # up via from_attributes exactly like a real column.
+        device.trip_count = trip_count or 0
+        device.last_trip_at = last_trip_at
+        devices.append(device)
     return devices
 
 

@@ -224,6 +224,22 @@ class GPSTrackerConnection:
                     
                     db.commit()
 
+                    # Broadcast to WebSocket clients — deliberately runs
+                    # before trip auto-start below, and nothing after this
+                    # point may ever raise into the same try/except that
+                    # guards it. A prior version had trip auto-start *before*
+                    # this call in the same unguarded block: any exception in
+                    # that bookkeeping silently skipped the broadcast
+                    # entirely (caught by this function's outer except,
+                    # logged server-side only) — location writes kept
+                    # succeeding while every live client silently stopped
+                    # receiving updates, with no client-visible symptom at
+                    # all. Broadcasting first, and isolating trip auto-start
+                    # in its own try/except below, makes that class of bug
+                    # structurally impossible regardless of what trip
+                    # auto-start does in the future.
+                    await self.server.broadcast_location_update(device.id, data)
+
                     # Auto-start a trip the first time this device reports a
                     # gps_valid fix at/above the owner's "moving" speed
                     # threshold while it has no active trip. Mirrors the
@@ -231,35 +247,38 @@ class GPSTrackerConnection:
                     # checker, which only ever closes a trip, never opens
                     # one — without this, no Trip row is ever created unless
                     # something calls POST /api/trips/start explicitly.
-                    if device.user_id and data['gps_valid']:
-                        from app.models.trip import Trip
-                        from app.api.trips import get_or_create_trip_settings
+                    try:
+                        if device.user_id and data['gps_valid']:
+                            from app.models.trip import Trip
+                            from app.api.trips import get_or_create_trip_settings
 
-                        trip_settings = get_or_create_trip_settings(device.user_id, db)
-                        if data['speed'] >= trip_settings.stop_speed_threshold_kmh:
-                            has_active_trip = (
-                                db.query(Trip)
-                                .filter(Trip.device_id == device.id, Trip.end_time.is_(None))
-                                .first()
-                            )
-                            if not has_active_trip:
-                                new_trip = Trip(
-                                    device_id=device.id,
-                                    user_id=device.user_id,
-                                    name=f"Trip {data['timestamp']:%Y-%m-%d %H:%M}",
-                                    start_time=data['timestamp'],
-                                    end_time=None,
-                                    total_distance_km=0.0,
+                            trip_settings = get_or_create_trip_settings(device.user_id, db)
+                            if data['speed'] >= trip_settings.stop_speed_threshold_kmh:
+                                has_active_trip = (
+                                    db.query(Trip)
+                                    .filter(Trip.device_id == device.id, Trip.end_time.is_(None))
+                                    .first()
                                 )
-                                db.add(new_trip)
-                                db.commit()
-                                logger.info(
-                                    "Auto-started trip for device %s at %s",
-                                    self.device_imei, data['timestamp'],
-                                )
-
-                    # Broadcast to WebSocket clients
-                    await self.server.broadcast_location_update(device.id, data)
+                                if not has_active_trip:
+                                    new_trip = Trip(
+                                        device_id=device.id,
+                                        user_id=device.user_id,
+                                        name=f"Trip {data['timestamp']:%Y-%m-%d %H:%M}",
+                                        start_time=data['timestamp'],
+                                        end_time=None,
+                                        total_distance_km=0.0,
+                                    )
+                                    db.add(new_trip)
+                                    db.commit()
+                                    logger.info(
+                                        "Auto-started trip for device %s at %s",
+                                        self.device_imei, data['timestamp'],
+                                    )
+                    except Exception as e:
+                        logger.error(
+                            "Trip auto-start failed for device %s: %s",
+                            self.device_imei, e, exc_info=True,
+                        )
 
             finally:
                 db.close()
