@@ -141,6 +141,19 @@ class ConnectionManager:
         to every fleet subscriber whose fleet includes device_id.
         Dead connections are pruned automatically from both registries.
         """
+        # TEMP DEBUG — remove once confirmed working. logger.warning (not
+        # .debug) so this shows regardless of configured LOG_LEVEL — the
+        # existing per-send failure logs below are .debug and may have been
+        # silently filtered out this whole time if LOG_LEVEL=INFO.
+        logger.warning(
+            "[BROADCAST] broadcast(device_id=%s): active_subscribers=%d "
+            "device_owners=%s fleet_subscriber_counts=%s",
+            device_id,
+            len(self.active.get(device_id, set())),
+            list(self.device_owners.get(device_id, set())),
+            {uid: len(s) for uid, s in self.fleet_subscribers.items()},
+        )
+
         clients = list(self.active.get(device_id, set()))
         if clients:
             dead: list[WebSocket] = []
@@ -164,9 +177,13 @@ class ConnectionManager:
             for ws in fleet_clients:
                 try:
                     await ws.send_json(payload)
+                    # TEMP DEBUG — remove once confirmed working.
+                    logger.warning(
+                        "[BROADCAST] sent to fleet subscriber user_id=%s ok", user_id,
+                    )
                 except Exception as exc:
-                    logger.debug(
-                        "WS fleet send failed for user %d (%s) — marking as dead",
+                    logger.warning(  # TEMP: bumped from .debug so it's visible
+                        "[BROADCAST] WS fleet send FAILED for user %d (%s) — marking as dead",
                         user_id,
                         exc,
                     )
@@ -289,6 +306,11 @@ async def fleet_stream(websocket: WebSocket, token: Optional[str] = Query(None))
     finally:
         db.close()
 
+    # TEMP DEBUG — remove once confirmed working.
+    logger.warning(
+        "[BROADCAST] fleet_stream: user_id=%s clerk_user_id=%s resolved device_ids=%s",
+        user.id, clerk_user_id, device_ids,
+    )
     await manager.connect_fleet(user.id, device_ids, websocket)
     try:
         while True:

@@ -496,7 +496,21 @@ class TCPServer:
     async def broadcast_location_update(self, device_id: int, data: Dict):
         """Broadcast location update to all WebSocket subscribers of this device."""
         if self.ws_manager is None:
+            # TEMP DEBUG — remove once confirmed working. This case was a
+            # silent no-op with zero logging before; if this ever fires,
+            # it's the whole answer (ws_manager never got wired up).
+            logger.warning(
+                "[BROADCAST] broadcast_location_update: self.ws_manager is "
+                "None for device_id=%s — broadcast skipped entirely",
+                device_id,
+            )
             return
+
+        # TEMP DEBUG — remove once confirmed working.
+        logger.warning(
+            "[BROADCAST] broadcast_location_update: device_id=%s speed=%s course=%s",
+            device_id, data.get("speed"), data.get("course"),
+        )
 
         ts = data.get("timestamp")
         payload = {
