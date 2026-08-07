@@ -43,6 +43,12 @@ class Device(Base):
     hardware_model = Column(String(50), nullable=True) # e.g. 'G900LS J16-4G', 'TK903ELE'
     sim_renewal_date = Column(DateTime, nullable=True) # When the SIM airtime/data expires
 
+    # Map marker glyph. Values: 'arrow' (default) | 'sedan' | 'truck_small' |
+    # 'truck_big' | 'bus' | 'animal' — validated at the API layer (see
+    # DeviceMarkerIconUpdate in app/api/devices.py), not a DB constraint,
+    # matching this model's existing convention for lifecycle/status.
+    marker_icon = Column(String(20), nullable=False, default='arrow')
+
     # Inventory lifecycle
     # Values: 'registered' | 'in_stock' | 'sold'
     lifecycle = Column(String(20), nullable=False, default='registered')

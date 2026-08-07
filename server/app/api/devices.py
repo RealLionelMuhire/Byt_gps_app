@@ -18,7 +18,7 @@ from app.models.trip import Trip
 from app.api.trips import TripResponse
 from app.core.config import settings
 from app.models.user import User, Role
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 
 router = APIRouter()
 
@@ -41,6 +41,9 @@ def _check_pair_rate_limit(ip: str):
     _pair_attempts[ip].append(now)
 
 
+VALID_MARKER_ICONS = {"arrow", "sedan", "truck_small", "truck_big", "bus", "animal"}
+
+
 # Pydantic schemas
 class DeviceBase(BaseModel):
     name: str
@@ -59,6 +62,24 @@ class DeviceUpdate(DeviceBase):
     pass
 
 
+class DeviceMarkerIconUpdate(BaseModel):
+    """Body for `PATCH /{device_id}` — a lightweight partial update covering
+    only marker_icon. PUT /{device_id} (DeviceUpdate) isn't a true partial
+    update: it requires resending `name` on every call, so it's a poor fit
+    for "just change the marker glyph"."""
+
+    marker_icon: str
+
+    @field_validator("marker_icon")
+    @classmethod
+    def marker_icon_valid(cls, v: str) -> str:
+        if v not in VALID_MARKER_ICONS:
+            raise ValueError(
+                f"marker_icon must be one of: {', '.join(sorted(VALID_MARKER_ICONS))}"
+            )
+        return v
+
+
 class DeviceResponse(DeviceBase):
     id: int
     imei: str
@@ -73,6 +94,7 @@ class DeviceResponse(DeviceBase):
     battery_level: Optional[int]
     gsm_signal: Optional[int]
     created_at: datetime
+    marker_icon: str  # arrow (default) | sedan | truck_small | truck_big | bus | animal
     # Aggregate fields against the trips table — only populated by
     # list_devices (see its trip_count_subq/last_trip_at_subq), so the
     # Flutter selector can show them without an N+1 call per device.
@@ -297,6 +319,33 @@ async def update_device(
         device.hardware_model = device_data.hardware_model
     if device_data.sim_renewal_date is not None:
         device.sim_renewal_date = device_data.sim_renewal_date
+    device.updated_at = datetime.utcnow()
+
+    db.commit()
+    db.refresh(device)
+
+    return device
+
+
+@router.patch("/{device_id}", response_model=DeviceResponse)
+async def update_device_marker_icon(
+    device_id: int,
+    body: DeviceMarkerIconUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """
+    Update just a device's marker_icon. Same ownership-or-admin check as
+    every other device endpoint (require_device_access) — see
+    DeviceMarkerIconUpdate's docstring for why this is PATCH rather than
+    reusing PUT.
+    """
+    device = db.query(Device).filter(Device.id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    require_device_access(device, user)
+
+    device.marker_icon = body.marker_icon
     device.updated_at = datetime.utcnow()
 
     db.commit()
