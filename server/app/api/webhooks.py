@@ -16,6 +16,7 @@ from app.models.device import Device
 from app.models.vehicle import Vehicle
 from app.models.subscription import Subscription, Payment
 from app.models.trip import Trip
+from app.api.auth import claim_pending_client_user
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -102,6 +103,18 @@ async def handle_user_upsert(data: dict, db: Session):
     last_name = data.get("last_name") or "Unknown"
 
     user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
+
+    # Adopt a pre-provisioned pending-invitation row (created by the admin
+    # dashboard) once the invited client actually signs up — this preserves
+    # any device assignments made against the pending row.
+    if user is None:
+        user = claim_pending_client_user(
+            db,
+            clerk_user_id=clerk_user_id,
+            email=email,
+            first_name=first_name,
+            last_name=last_name,
+        )
 
     try:
         if user:

@@ -56,6 +56,9 @@ class Device(Base):
     # User ownership (NULL = owned by company, set = owned by customer)
     user_id = Column(Integer, ForeignKey('users.id'), nullable=True, index=True)
 
+    # Subscription scheme linked to this device (admin-configured plan)
+    plan_id = Column(Integer, ForeignKey('subscription_plans.id'), nullable=True, index=True)
+
     # TCP connection status (independent of lifecycle)
     status = Column(String(20), default='offline')   # online | offline
     last_connect = Column(DateTime, nullable=True)    # Last TCP handshake received
@@ -75,6 +78,7 @@ class Device(Base):
 
     # Relationships
     user = relationship("User", backref="devices")
+    plan = relationship("SubscriptionPlan", foreign_keys=[plan_id])
     locations = relationship("Location", back_populates="device", cascade="all, delete-orphan")
 
     def __repr__(self):

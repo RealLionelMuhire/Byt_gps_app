@@ -3,6 +3,8 @@
 from typing import Optional, List
 from fastapi import APIRouter, Depends, HTTPException, Header, Query
 import httpx
+import secrets
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
 from datetime import datetime
@@ -102,7 +104,7 @@ async def sync_user(
         user = db.query(User).filter(
             User.clerk_user_id == user_data.clerk_user_id
         ).first()
-        
+
         # Resolve first/last name from either `name` or `first_name`/`last_name`
         resolved_first = user_data.first_name
         resolved_last = user_data.last_name
@@ -110,6 +112,19 @@ async def sync_user(
             parts = user_data.name.strip().split(" ", 1)
             resolved_first = parts[0]
             resolved_last = parts[1] if len(parts) > 1 else ""
+
+        # If the user signed up via an admin-sent Clerk invitation, there is a
+        # pre-provisioned local row keyed by a pending_inv_ placeholder — adopt
+        # it (keeps device assignments made by the admin) instead of creating a
+        # duplicate row.
+        if user is None:
+            user = claim_pending_client_user(
+                db,
+                clerk_user_id=user_data.clerk_user_id,
+                email=user_data.email,
+                first_name=resolved_first,
+                last_name=resolved_last,
+            )
 
         if user:
             # Update existing user
@@ -310,6 +325,151 @@ async def admin_create_user(
         db.rollback()
         logger.error(f"Database error during admin user creation: {str(e)}")
         raise HTTPException(status_code=500, detail="Database error occurred")
+
+
+# Prefix for the placeholder clerk_user_id used on pre-provisioned client
+# rows created when an admin sends a Clerk invitation. The row is "claimed"
+# (rewritten to the real Clerk user id) once the client accepts the invite
+# and signs up — see claim_pending_client_user().
+PENDING_USER_PREFIX = "pending_inv_"
+
+
+def claim_pending_client_user(
+    db: Session,
+    clerk_user_id: str,
+    email: str,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+) -> Optional[User]:
+    """
+    Adopt a pre-provisioned client row (created when an admin sent a Clerk
+    invitation) as the real Clerk user.
+
+    Looks up by email where clerk_user_id starts with PENDING_USER_PREFIX,
+    then rewrites clerk_user_id to the real one and refreshes identity. This
+    keeps any device assignments made against the pending row intact.
+
+    Returns the claimed User, or None if there is nothing to claim.
+    """
+    user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
+    if user:
+        return user  # already the real row
+
+    # Case-insensitive match: the pending row is stored lowercased, but the
+    # email arriving from Clerk/sync may preserve the case the client used.
+    pending = (
+        db.query(User)
+        .filter(
+            func.lower(User.email) == email.strip().lower(),
+            User.clerk_user_id.like(f"{PENDING_USER_PREFIX}%"),
+        )
+        .first()
+    )
+    if not pending:
+        return None
+
+    pending.clerk_user_id = clerk_user_id
+    if first_name:
+        pending.first_name = first_name
+    if last_name:
+        pending.last_name = last_name
+    pending.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(pending)
+    logger.info(
+        "Claimed pending client row id=%d (%s) as Clerk user %s",
+        pending.id, email, clerk_user_id,
+    )
+    return pending
+
+
+async def invite_clerk_client_and_create_local(
+    db: Session,
+    email: str,
+    first_name: Optional[str] = None,
+    last_name: Optional[str] = None,
+) -> User:
+    """
+    Invite a NEW client via Clerk's email invitation flow and pre-provision
+    their local user row (role USER) so a device can be assigned immediately.
+
+    - Sends a Clerk invitation email — the CLIENT sets their own password by
+      clicking the invite link. The admin never handles a password.
+    - Creates the local `users` row with a placeholder clerk_user_id
+      (`pending_inv_<invitation_id>`) so device assignment works right away.
+      When the client accepts the invitation, the user.created webhook and
+      /api/auth/sync adopt that row via claim_pending_client_user().
+
+    Dev fallback: when CLERK_SECRET_KEY is not configured, a local-only
+    pending row is created and no email is sent (logged).
+    Raises HTTPException on failure.
+    """
+    email = email.strip().lower()
+
+    # Refuse duplicates by email BEFORE sending anything to Clerk, so we never
+    # send an invitation that turns out to be for an already-existing client.
+    existing = db.query(User).filter(func.lower(User.email) == email).first()
+    if existing:
+        raise HTTPException(
+            status_code=409,
+            detail="A client with this email already exists. Search for them instead.",
+        )
+
+    pending_id = None
+
+    if settings.CLERK_SECRET_KEY:
+        try:
+            async with httpx.AsyncClient() as client:
+                payload = {"email_address": email}
+                if settings.CLERK_INVITATION_REDIRECT_URL:
+                    payload["redirect_url"] = settings.CLERK_INVITATION_REDIRECT_URL
+                response = await client.post(
+                    "https://api.clerk.com/v1/invitations",
+                    json=payload,
+                    headers={
+                        "Authorization": f"Bearer {settings.CLERK_SECRET_KEY}",
+                        "Content-Type": "application/json",
+                    },
+                    timeout=10.0,
+                )
+                if response.status_code != 200:
+                    raise HTTPException(
+                        status_code=response.status_code,
+                        detail=f"Failed to invite client via Clerk: {response.text[:200]}",
+                    )
+                pending_id = response.json().get("id")
+        except httpx.RequestError as e:
+            logger.error("Request to Clerk API failed: %s", e)
+            raise HTTPException(status_code=500, detail="Failed to communicate with Clerk API")
+    else:
+        pending_id = f"dev_{secrets.token_hex(8)}"
+        logger.warning(
+            "CLERK_SECRET_KEY not set — created local pending client %s (no invitation email sent)",
+            email,
+        )
+
+    if not pending_id:
+        raise HTTPException(status_code=500, detail="Clerk did not return an invitation ID")
+
+    user = User(
+        clerk_user_id=f"{PENDING_USER_PREFIX}{pending_id}",
+        email=email,
+        first_name=(first_name or "Unknown").strip(),
+        last_name=(last_name or "Unknown").strip(),
+        role=Role.USER,
+        onboarding_step=0,
+        onboarding_complete=False,
+        created_at=datetime.utcnow(),
+        updated_at=datetime.utcnow(),
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    logger.info(
+        "Invited new client %s (pending row id=%d, invitation=%s)",
+        email, user.id, pending_id,
+    )
+    return user
 
 
 # ── User Management (Admin only) ────────────────────────────────────────────

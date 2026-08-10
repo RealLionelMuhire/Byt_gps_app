@@ -153,7 +153,7 @@ class GPSTrackerConnection:
                         "Pre-register the device via the admin dashboard first."
                     )
                     # Track rejected IMEI for the dashboard
-                    self.server.record_rejection(imei, self.address[0])
+                    await self.server.record_rejection(imei, self.address[0])
                     
                     self.device_imei = None
                     self.authenticated = False
@@ -447,15 +447,19 @@ class TCPServer:
         self.ws_manager: Optional[object] = None
         # Track recently rejected IMEIs (max 20) for the admin dashboard
         self.rejected_imeis = []
+        self._rejection_lock = asyncio.Lock()
 
-    def record_rejection(self, imei: str, ip: str):
-        """Record an unregistered IMEI connection attempt."""
-        entry = {"imei": imei, "ip": ip, "time": datetime.utcnow()}
-        # Remove if already exists to update time
-        self.rejected_imeis = [r for r in self.rejected_imeis if r["imei"] != imei]
-        self.rejected_imeis.insert(0, entry)
-        # Keep only the last 20
-        self.rejected_imeis = self.rejected_imeis[:20]
+    async def record_rejection(self, imei: str, ip: str):
+        """Record an unregistered IMEI connection attempt.
+        Thread-safe via asyncio.Lock so concurrent connection handlers
+        can't corrupt the shared list."""
+        async with self._rejection_lock:
+            entry = {"imei": imei, "ip": ip, "time": datetime.utcnow()}
+            # Remove if already exists to update time
+            self.rejected_imeis = [r for r in self.rejected_imeis if r["imei"] != imei]
+            self.rejected_imeis.insert(0, entry)
+            # Keep only the last 20
+            self.rejected_imeis = self.rejected_imeis[:20]
     
     async def start(self):
         """Start TCP server"""

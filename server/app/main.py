@@ -17,6 +17,7 @@ from app.tcp_server import TCPServer
 from app.api import devices, locations, auth, commands, trips, webhooks
 from app.api import ws as ws_module
 from app.api import onboarding
+from app.api import subscriptions
 from app import dashboard
 
 # Configure logging
@@ -174,6 +175,7 @@ app.include_router(commands.router,   prefix="/api/devices", tags=["commands"])
 app.include_router(locations.router,  prefix="/api/locations", tags=["locations"])
 app.include_router(trips.router,      prefix="/api/trips",   tags=["trips"])
 app.include_router(webhooks.router,   prefix="/api/webhooks", tags=["webhooks"])
+app.include_router(subscriptions.router, prefix="/api/subscription-plans", tags=["subscriptions"])
 app.include_router(ws_module.router,  tags=["websocket"])
 app.include_router(dashboard.router,  tags=["dashboard"])
 

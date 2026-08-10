@@ -36,6 +36,26 @@
     .nav-links a:hover, .nav-links a.active { background: rgba(255,255,255,0.15); color: #fff; }
     .nav-links a.logout { color: #e94560; }
 
+    /* ── OWNER FILTER ── */
+    .filter-bar {
+      display: flex; gap: 8px; align-items: center;
+      background: #fff; border-radius: 10px; padding: 12px 16px;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.06); margin-bottom: 20px;
+    }
+    .filter-bar input {
+      flex: 1; max-width: 320px; border: 1.5px solid #e0e0e0; border-radius: 8px;
+      padding: 8px 12px; font-size: 13px; outline: none; transition: border-color 0.2s;
+    }
+    .filter-bar input:focus { border-color: #0f3460; }
+    .btn-filter {
+      background: #0f3460; color: #fff; border: none; border-radius: 8px;
+      padding: 9px 18px; font-size: 13px; font-weight: 600; cursor: pointer; transition: opacity 0.2s;
+    }
+    .btn-filter:hover { opacity: 0.88; }
+    .filter-clear { color: #888; font-size: 13px; text-decoration: none; white-space: nowrap; }
+    .filter-clear:hover { color: #e94560; }
+    .filter-hint { font-size: 12px; color: #aaa; margin-left: auto; }
+
     /* ── LAYOUT ── */
     .page { max-width: 1200px; margin: 0 auto; padding: 32px 24px; }
     .page-title { font-size: 26px; font-weight: 700; color: #1a1a2e; margin-bottom: 8px; }
@@ -104,9 +124,18 @@
       font-size: 13px;
       margin-bottom: 16px;
     }
+    .success-banner {
+      background: #f0fdf4;
+      border: 1px solid #bbf7d0;
+      color: #166534;
+      padding: 12px 16px;
+      border-radius: 8px;
+      font-size: 13px;
+      margin-bottom: 16px;
+    }
 
     /* ── TABLE ── */
-    .table-wrap { background: #fff; border-radius: 14px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); overflow: hidden; }
+    .table-wrap { background: #fff; border-radius: 14px; box-shadow: 0 2px 8px rgba(0,0,0,0.06); overflow-x: auto; }
     .table-header {
       padding: 18px 24px;
       border-bottom: 1px solid #f0f0f0;
@@ -166,6 +195,37 @@
       font-weight: 600;
     }
     .no-owner { color: #bbb; font-size: 13px; }
+
+    /* ── SUBSCRIPTION STATUS ── */
+    .sub-chip {
+      display: inline-block; font-size: 11px; padding: 3px 10px; border-radius: 12px;
+      font-weight: 600; letter-spacing: 0.3px; text-transform: uppercase;
+    }
+    .sub-active { background: #dcfce7; color: #166534; border: 1px solid #bbf7d0; }
+    .sub-expired { background: #fee2e2; color: #b91c1c; border: 1px solid #fecaca; }
+    .sub-none { background: #f3f4f6; color: #6b7280; border: 1px solid #e5e7eb; }
+    .btn-billing {
+      display: inline-block;
+      background: #0f3460; color: #fff; border: none; border-radius: 6px;
+      padding: 5px 12px; font-size: 12px; font-weight: 600; cursor: pointer;
+      text-decoration: none; transition: opacity 0.15s;
+    }
+    .btn-billing:hover { opacity: 0.88; }
+
+    /* ── PLAN LINK ── */
+    .plan-cell form { display: flex; gap: 5px; align-items: center; }
+    .plan-cell select {
+      padding: 6px 8px; border: 1.5px solid #e0e0e0; border-radius: 6px;
+      font-size: 12px; background: #fff; color: #333; outline: none; max-width: 120px;
+      transition: border-color 0.2s;
+    }
+    .plan-cell select:focus { border-color: #0f3460; }
+    .plan-chip {
+      display: inline-block; font-size: 11px; padding: 3px 10px; border-radius: 12px;
+      font-weight: 600; text-transform: uppercase; letter-spacing: 0.4px;
+      background: #eef4ff; color: #0f3460; border: 1px solid #c7d2fe;
+    }
+    .plan-chip.inactive { background: #f3f4f6; color: #9ca3af; border-color: #e5e7eb; }
     .btn-del {
       background: none;
       border: 1px solid #fca5a5;
@@ -202,6 +262,30 @@
     .lc-instock { background: #dcfce7; color: #166534; border: 1px solid #bbf7d0; }
     .lc-sold { background: #e0e7ff; color: #3730a3; border: 1px solid #c7d2fe; }
 
+    /* ── ASSIGN TO CLIENT ── */
+    .assign-box { display: flex; flex-direction: column; gap: 6px; margin-bottom: 6px; }
+    .assign-search { display: flex; gap: 6px; align-items: center; }
+    .assign-search input[list] {
+      flex: 1; min-width: 130px; padding: 7px 10px;
+      border: 1.5px solid #e0e0e0; border-radius: 6px;
+      font-size: 12px; outline: none; transition: border-color 0.2s;
+      background: #fff;
+    }
+    .assign-search input[list]:focus { border-color: #16a34a; }
+    .btn-new-client {
+      background: #0f3460; color: #fff; border: none;
+      padding: 7px 10px; border-radius: 6px; font-size: 12px;
+      font-weight: 600; cursor: pointer; width: 100%;
+      transition: opacity 0.15s;
+    }
+    .btn-new-client:hover { opacity: 0.88; }
+    .new-client-form { display: none; flex-direction: column; gap: 6px; }
+    .new-client-form input {
+      padding: 7px 10px; border: 1.5px solid #e0e0e0; border-radius: 6px;
+      font-size: 12px; outline: none; transition: border-color 0.2s;
+    }
+    .new-client-form input:focus { border-color: #0f3460; }
+
     @media(max-width:768px){
       .form-grid { grid-template-columns: 1fr; }
       .stats { flex-direction: column; }
@@ -215,6 +299,8 @@
     <div class="nav-links">
       <a href="/dashboard">📡 Fleet View</a>
       <a href="/admin/devices" class="active">📦 Device Inventory</a>
+      <a href="/admin/clients">👥 Clients</a>
+      <a href="/admin/plans">💳 Plans</a>
       <a href="/admin/logout" class="logout">Sign Out</a>
     </div>
   </nav>
@@ -242,6 +328,9 @@
     <!-- Add Device Form -->
     <div class="add-panel">
       <h2>➕ Add Device to Inventory</h2>
+      {% if success %}
+      <div class="success-banner">✅ {{ success }}</div>
+      {% endif %}
       {% if error %}
       <div class="error-banner">⚠️ {{ error }}</div>
       {% endif %}
@@ -300,6 +389,14 @@
       </div>
     </div>
 
+    <!-- Filter by Owner -->
+    <form method="GET" action="/admin/devices" class="filter-bar">
+      <input type="text" name="owner" value="{{ owner_filter }}" placeholder="Filter by client name or email…">
+      <button type="submit" class="btn-filter">Filter</button>
+      {% if owner_filter %}<a href="/admin/devices" class="filter-clear">✕ Clear ({{ owner_filter }})</a>{% endif %}
+      <span class="filter-hint">Showing {{ devices | length }} device(s)</span>
+    </form>
+
     <!-- Unregistered Devices -->
     {% if rejected_imeis %}
     <div class="rejected-panel">
@@ -334,6 +431,11 @@
         <h2>Whitelisted Devices</h2>
       </div>
       {% if devices %}
+      <datalist id="clients-datalist">
+        {% for c in clients %}
+        <option value="{{ c.email }}">{{ c.name }}</option>
+        {% endfor %}
+      </datalist>
       <table>
         <thead>
           <tr>
@@ -342,6 +444,8 @@
             <th>Pairing PIN & SIM</th>
             <th>Lifecycle</th>
             <th>Status</th>
+            <th>Plan</th>
+            <th>Subscription</th>
             <th>Owner</th>
             <th>Last Seen</th>
             <th>Actions</th>
@@ -371,6 +475,47 @@
                 {{ d.status | capitalize }}
               </span>
             </td>
+            <td class="plan-cell">
+              {% if d.plan %}
+                <span class="plan-chip {{ 'inactive' if not d.plan.is_active else '' }}">
+                  {{ d.plan.name }} · {{ '{:,.0f}'.format(d.plan.price) }} {{ d.plan.currency }}
+                </span>
+              {% else %}
+                <span class="no-owner">No plan</span>
+              {% endif %}
+              <form method="POST" action="/admin/devices/{{ d.imei }}/plan"
+                    onsubmit="return confirm('Change the subscription scheme for {{ d.imei }}? This affects billing.')">
+                <select name="plan_id" onchange="this.form.submit()">
+                  <option value="">— Unlink —</option>
+                  {% for p in plans %}
+                  <option value="{{ p.id }}" {% if d.plan and d.plan.slug == p.slug %}selected{% endif %}>
+                    {{ p.name }} ({{ p.slug }} · {{ '{:,.0f}'.format(p.price) }} {{ p.currency }}/{{ p.duration_value }}{{ p.duration_unit }})
+                  </option>
+                  {% endfor %}
+                </select>
+              </form>
+            </td>
+            <td>
+              {% if d.owner_email %}
+                {% if d.subscription_status == 'active' %}
+                  <span class="sub-chip sub-active">● Active</span>
+                {% elif d.subscription_status == 'expired' %}
+                  <span class="sub-chip sub-expired">● Expired</span>
+                {% else %}
+                  <span class="sub-chip sub-none">○ No sub</span>
+                {% endif %}
+                {% if d.subscription_plan_name %}
+                <br><small style="color:#555;">{{ d.subscription_plan_name }}
+                  {% if d.billing_type %}<span style="color:#999;">· {{ d.billing_type | replace('_', ' ') }}</span>{% endif %}
+                </small>
+                {% endif %}
+                {% if d.subscription_expires_at %}
+                <br><small style="color:#888;">until {{ d.subscription_expires_at }}</small>
+                {% endif %}
+              {% else %}
+                <span class="no-owner">—</span>
+              {% endif %}
+            </td>
             <td>
               {% if d.owner_email %}
                 <span class="owner-chip">{{ d.owner_name or d.owner_email }}</span>
@@ -380,6 +525,7 @@
             </td>
             <td style="font-size:13px; color:#888;">{{ d.last_seen_duration }}</td>
             <td>
+              <a href="/admin/devices/{{ d.imei }}/billing" class="btn-billing" style="display:inline-block; margin-bottom:4px;">💳 Billing</a>
               {% if d.lifecycle == 'registered' %}
               <form method="POST" action="/admin/devices/{{ d.imei }}/verify" style="display:inline;"
                     onsubmit="return confirm('Manually mark {{ d.imei }} as verified/in-stock and send a test command?')">
@@ -388,10 +534,11 @@
               {% endif %}
 
               {% if d.lifecycle == 'in_stock' %}
-              <button class="btn-quick-add" style="background:#16a34a; margin-bottom:4px;" 
-                      onclick="window.open('https://api.qrserver.com/v1/create-qr-code/?size=150x150&data=' + encodeURIComponent('{{ d.imei }}:{{ d.pairing_pin }}'), '_blank')">
+              <a href="https://api.qrserver.com/v1/create-qr-code/?size=150x150&data={{ d.imei }}:{{ d.pairing_pin }}"
+                 target="_blank" rel="noopener"
+                 class="btn-quick-add" style="background:#16a34a; margin-bottom:4px; display:inline-block;">
                 Print QR Label
-              </button>
+              </a>
               {% endif %}
               
               {% if d.owner_email %}
@@ -399,6 +546,26 @@
                     onsubmit="return confirm('WARNING: This will revoke ownership from the current user and reset the device to IN STOCK. Continue?')">
                 <button type="submit" class="btn-del" style="margin-bottom:4px; padding: 6px 12px; font-weight: 600;">Unpair & Reclaim</button>
               </form>
+              {% endif %}
+
+              {% if not d.owner_email %}
+              <div class="assign-box">
+                <form method="POST" action="/admin/devices/{{ d.imei }}/assign" class="assign-search">
+                  <input list="clients-datalist" name="client_email"
+                         placeholder="🔍 Search client…" required autocomplete="off">
+                  <button type="submit" class="btn-quick-add" style="background:#16a34a;">Assign</button>
+                </form>
+                <button type="button" class="btn-new-client" onclick="toggleNewClient(this)">＋ New Client</button>
+                <form method="POST" action="/admin/devices/{{ d.imei }}/assign-new" class="new-client-form">
+                  <input type="text" name="first_name" placeholder="First name" required>
+                  <input type="text" name="last_name" placeholder="Last name" required>
+                  <input type="email" name="email" placeholder="Client email" required>
+                  <div class="pin-hint" style="font-size:11px; line-height:1.4;">
+                    📧 We'll email them an invitation to set their own password.
+                  </div>
+                  <button type="submit" class="btn-quick-add" style="background:#16a34a; width:100%;">Invite &amp; Assign</button>
+                </form>
+              </div>
               {% endif %}
 
               {% if not d.owner_email %}
@@ -420,5 +587,19 @@
       {% endif %}
     </div>
   </div>
+
+  <script>
+    // Toggle the inline "New Client" registration form per device row
+    function toggleNewClient(btn) {
+      // Use a stable selector: find the parent .assign-box, then the form
+      var box = btn.closest('.assign-box');
+      if (!box) return;
+      var form = box.querySelector('.new-client-form');
+      if (!form) return;
+      var hidden = form.style.display === 'none' || form.style.display === '';
+      form.style.display = hidden ? 'flex' : 'none';
+      btn.textContent = hidden ? '✕ Cancel' : '＋ New Client';
+    }
+  </script>
 </body>
 </html>

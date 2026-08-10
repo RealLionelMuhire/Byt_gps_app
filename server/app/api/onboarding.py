@@ -30,15 +30,15 @@ from app.models.device import Device
 from app.models.vehicle import Vehicle
 from app.models.subscription import Subscription, Payment
 from app.api.devices import _check_pair_rate_limit
+from app.api.auth import claim_pending_client_user
+from app.api.subscriptions import plan_config, plan_purchasable
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
-# ── Config ────────────────────────────────────────────────────────────────────
-
-PLAN_PRICES = {"trial": 0, "basic": 5000, "fleet": 15000}   # RWF
-PLAN_DAYS   = {"trial": 14, "basic": 30,  "fleet": 30}
-PLAN_VEHICLES = {"trial": 1, "basic": 3, "fleet": None} # None = unlimited
+# Pricing/limits now come from the admin-configured subscription_plans table
+# (see app/api/subscriptions.py plan_config — DB plan wins, legacy values are
+# the fallback), so admin edits to a plan immediately affect billing here.
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
@@ -138,6 +138,18 @@ async def create_or_update_user(
 
     try:
         existing = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
+
+        # If the client was pre-provisioned via an admin Clerk invitation, adopt
+        # the pending row here (rather than creating a duplicate) — keeping any
+        # device assignment the admin already made.
+        if existing is None:
+            existing = claim_pending_client_user(
+                db,
+                clerk_user_id=clerk_user_id,
+                email=body.email,
+                first_name=body.firstName,
+                last_name=body.lastName,
+            )
 
         if existing:
             existing.first_name = body.firstName
@@ -315,14 +327,14 @@ async def create_vehicle(
     if not device:
         raise HTTPException(status_code=403, detail="Device not paired to your account")
 
-    # Enforce plan limits
+    # Enforce plan limits (admin-configured via subscription_plans)
     sub = db.query(Subscription).filter(
         Subscription.clerk_user_id == clerk_user_id,
         Subscription.status == "active"
     ).first()
     
     current_plan = sub.plan_id if sub else "trial"
-    vehicle_limit = PLAN_VEHICLES.get(current_plan, 1)
+    vehicle_limit = plan_config(db, current_plan)["max_devices"]
 
     if vehicle_limit is not None:
         current_vehicles_count = db.query(Vehicle).filter(Vehicle.clerk_user_id == clerk_user_id).count()
@@ -377,8 +389,13 @@ async def verify_payment(
 
     Requires FLUTTERWAVE_SECRET_KEY in server .env (never in the app).
     """
-    if body.planId not in PLAN_PRICES:
-        raise HTTPException(status_code=400, detail="Invalid planId")
+    if not plan_purchasable(db, body.planId):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid or unavailable planId — choose an active plan from the pricing screen.",
+        )
+
+    cfg = plan_config(db, body.planId)
 
     if not settings.FLUTTERWAVE_SECRET_KEY:
         logger.warning("FLUTTERWAVE_SECRET_KEY not set — skipping live verification (test mode)")
@@ -398,9 +415,9 @@ async def verify_payment(
         raise HTTPException(status_code=502, detail="Could not reach Flutterwave. Retry later.")
 
     data = fw.get("data", {})
-    amount_ok  = data.get("amount", 0) >= PLAN_PRICES[body.planId]
+    amount_ok  = data.get("amount", 0) >= cfg["price"]
     status_ok  = data.get("status") == "successful"
-    currency_ok = data.get("currency") == "RWF"
+    currency_ok = data.get("currency") == cfg["currency"]
 
     if not (fw.get("status") == "success" and status_ok and currency_ok and amount_ok):
         logger.warning("Payment verification FAILED for txRef=%s: %s", body.txRef, fw)
@@ -445,8 +462,11 @@ async def create_subscription(
     - For paid plans: assumes /api/payments/verify was called successfully beforehand
     - Marks onboarding_step=9 and onboarding_complete=true on the user record
     """
-    if body.planId not in PLAN_PRICES:
-        raise HTTPException(status_code=400, detail="Invalid planId")
+    if not plan_purchasable(db, body.planId):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid or unavailable planId — choose an active plan from the pricing screen.",
+        )
 
     # Check if an active subscription already exists
     existing_sub = db.query(Subscription).filter(
@@ -481,13 +501,31 @@ async def create_subscription(
         if ever_used:
             raise HTTPException(status_code=409, detail="Free trial already used. Please choose a paid plan.")
 
-    expires_at = datetime.utcnow() + timedelta(days=PLAN_DAYS[body.planId])
+    # For paid plans: enforce that a successful payment was made before
+    # activating the subscription. The mobile app should call
+    # /api/payments/verify first, but this backend check prevents a rogue
+    # or buggy client from skipping payment entirely.
+    if body.planId != "trial":
+        payment = db.query(Payment).filter(
+            Payment.clerk_user_id == clerk_user_id,
+            Payment.plan_id == body.planId,
+            Payment.status == "successful",
+        ).first()
+        if not payment:
+            raise HTTPException(
+                status_code=402,
+                detail="Payment required. Complete payment verification before activating a paid plan.",
+            )
+
+    cfg = plan_config(db, body.planId)
+    expires_at = datetime.utcnow() + timedelta(days=cfg["days"])
 
     try:
         subscription = Subscription(
             clerk_user_id=clerk_user_id,
             plan_id=body.planId,
             status="active",
+            price=cfg["price"],
             started_at=datetime.utcnow(),
             expires_at=expires_at,
         )
@@ -504,8 +542,8 @@ async def create_subscription(
         db.refresh(subscription)
 
         logger.info(
-            "Subscription activated: planId=%s user=%s expires=%s",
-            body.planId, clerk_user_id, expires_at.isoformat(),
+            "Subscription activated: planId=%s price=%.2f user=%s expires=%s",
+            body.planId, cfg["price"], clerk_user_id, expires_at.isoformat(),
         )
         return SubscriptionResponse(subscriptionId=subscription.id, expiresAt=expires_at)
 
@@ -527,8 +565,11 @@ async def upgrade_subscription(
     Upgrade an existing subscription to a higher tier.
     Assumes /api/payments/verify was called successfully beforehand.
     """
-    if body.planId not in PLAN_PRICES:
-        raise HTTPException(status_code=400, detail="Invalid planId")
+    if not plan_purchasable(db, body.planId):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid or unavailable planId — choose an active plan from the pricing screen.",
+        )
 
     # 1. Confirm payment record exists and is successful
     payment = db.query(Payment).filter(
@@ -540,14 +581,18 @@ async def upgrade_subscription(
     if not payment:
         raise HTTPException(status_code=402, detail="Payment not verified or not found")
 
-    # 2. Confirm upgrade (no downgrade allowed)
+    # 2. Confirm upgrade (different plan slug — the mobile app controls
+    # pricing-tier ordering, the backend just ensures they're not re-buying
+    # the same plan. Comparing live prices is fragile because admin edits
+    # to a plan would instantly change the comparison result for existing
+    # subscribers, unexpectedly blocking or allowing upgrades.)
     current_sub = db.query(Subscription).filter(
         Subscription.clerk_user_id == clerk_user_id,
         Subscription.status == "active"
     ).first()
 
-    if current_sub and PLAN_PRICES[body.planId] <= PLAN_PRICES[current_sub.plan_id]:
-        raise HTTPException(status_code=400, detail="Cannot downgrade. Choose a higher plan.")
+    if current_sub and current_sub.plan_id == body.planId:
+        raise HTTPException(status_code=400, detail="Already on this plan. Choose a different plan to upgrade.")
 
     # 3. Cancel current, create new
     try:
@@ -555,12 +600,14 @@ async def upgrade_subscription(
             current_sub.status = "cancelled"
             current_sub.updated_at = datetime.utcnow()
 
-        expires_at = datetime.utcnow() + timedelta(days=PLAN_DAYS[body.planId])
+        cfg = plan_config(db, body.planId)
+        expires_at = datetime.utcnow() + timedelta(days=cfg["days"])
         
         new_sub = Subscription(
             clerk_user_id=clerk_user_id,
             plan_id=body.planId,
             status="active",
+            price=cfg["price"],
             started_at=datetime.utcnow(),
             expires_at=expires_at,
         )
