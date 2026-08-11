@@ -74,8 +74,9 @@ async def _verify_clerk_token(token: str) -> Optional[str]:
     Verify a Clerk session JWT using the Clerk JWKS.
 
     Returns the Clerk user ID string on success, or None on failure.
-    Falls back to returning a placeholder on transient network errors
-    so a brief Clerk API outage does not lock out real users.
+    Fail-closed: if the JWKS server is unreachable the token is rejected
+    (the cached JWKS from a previous successful fetch is still tried first,
+    so this only applies when the cache is empty and the fetch fails).
     """
     if not settings.CLERK_SECRET_KEY:
         logger.warning(
@@ -84,9 +85,15 @@ async def _verify_clerk_token(token: str) -> Optional[str]:
         return "dev-user"
 
     jwks = await _get_jwks()
+    # Fail-closed: if the JWKS server is unreachable we reject the token
+    # rather than accepting it. A brief Clerk outage is preferable to an
+    # open auth bypass. The cached JWKS from the previous successful fetch
+    # is still tried by _get_jwks() first, so this only runs when the
+    # cache is empty AND the fetch fails (e.g. first request after restart
+    # during an outage).
     if not jwks:
-        logger.warning("AUTH: Could not fetch JWKS, allowing fallback")
-        return "network-error-fallback"
+        logger.error("AUTH: Could not fetch JWKS — rejecting token")
+        return None
 
     try:
         payload = jwt.decode(

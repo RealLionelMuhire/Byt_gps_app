@@ -73,6 +73,8 @@ Returns server health and live TCP connection counts. No auth required.
 ### `POST /api/auth/sync`
 Syncs a Clerk-authenticated user into the local database (upsert). Called automatically by the mobile app on every sign-in. **No auth header required.**
 
+If the user was pre-provisioned by an admin via the dashboard's *Invite & Assign* flow (their row has a `pending_inv_...` placeholder `clerk_user_id`), this endpoint **claims** that row — rewriting it to the real Clerk user ID so device assignments made by the admin stay intact.
+
 **Request:**
 ```json
 {
@@ -330,7 +332,7 @@ Server-side Flutterwave payment verification (Step 8, paid plans). Never trust c
 }
 ```
 
-`planId` values: `trial`, `basic`, `fleet`
+`planId` values are plan **slugs** — `trial`, `basic`, `fleet` by default, plus any custom schemes created by the admin (see Subscription Plans below). Prices/limits come from the admin-configured `subscription_plans` table.
 
 **Response `200`:**
 ```json
@@ -368,6 +370,8 @@ Activate a subscription plan for the current user (Step 8). Call after `/api/pay
 }
 ```
 
+**Response `402`:** Payment required — a successful payment record for this plan must exist before activating a paid subscription. Call `/api/payments/verify` first.
+
 **Response `409`:** Free trial already used.
 
 ---
@@ -384,7 +388,7 @@ Upgrade an existing subscription to a higher tier. Call after `/api/payments/ver
 ```
 
 **Response `201`:** Same as create subscription.  
-**Response `400`:** Cannot downgrade.  
+**Response `400`:** Already on this plan. Choose a different plan to upgrade.  
 **Response `402`:** Payment not verified.
 
 ---
@@ -437,6 +441,65 @@ Admin registers IMEI
 
 ---
 
+## Subscription Plan Endpoints (`/api/subscription-plans`)
+
+Admin-configurable subscription schemes. A plan defines a **billing type** (`one_time` = single payment, the length is how long it lasts; `recurrent` = recurring, the price is charged per length), a **price + currency** (e.g. `5000 RWF`), and a **length** (`duration_value` + `duration_unit`: day/week/month/year). Plans can be linked to GPS devices so each device's scheme is known.
+
+### `GET /api/subscription-plans`
+List subscription plans (auth required). The mobile app renders its pricing screen from this — **active plans only** by default.
+
+**Query params:**
+- `include_inactive` — admin only: also return deactivated plans (`true`)
+
+**Response `200`:**
+```json
+[
+  {
+    "id": 1,
+    "name": "Basic",
+    "slug": "basic",
+    "billing_type": "recurrent",
+    "price": 5000,
+    "currency": "RWF",
+    "duration_value": 1,
+    "duration_unit": "month",
+    "duration_days": 30,
+    "max_devices": 3,
+    "description": "Monthly plan. Up to 3 vehicles.",
+    "is_active": true
+  }
+]
+```
+
+### `POST /api/subscription-plans`
+Create a subscription scheme. **Admin only.**
+
+**Request:**
+```json
+{
+  "name": "Silver Monthly",
+  "slug": "silver",
+  "billing_type": "recurrent",
+  "price": 8000,
+  "currency": "RWF",
+  "duration_value": 1,
+  "duration_unit": "month",
+  "max_devices": 5,
+  "description": "Monthly plan for small fleets."
+}
+```
+
+**Response `201`:** The created plan object.  
+**Response `409`:** A plan with that slug already exists.
+
+### `PUT /api/subscription-plans/{plan_id}`
+Partial update of a scheme. **Admin only.** Any subset of fields may be sent (name, billing_type, price, currency, duration_value, duration_unit, max_devices, description, is_active).
+
+### `DELETE /api/subscription-plans/{plan_id}`
+Soft-delete (deactivate) a scheme. **Admin only.** Deactivated plans disappear from the mobile pricing screen but stay attached to linked devices. Reactivate via `PUT` with `is_active: true`.
+
+---
+
 ## Device Endpoints (`/api/devices`)
 
 All require `Authorization: Bearer <token>`.
@@ -446,8 +509,32 @@ List all devices visible to the authenticated user.
 
 **Query params:**
 - `status` — filter by `online` or `offline`
-- `lifecycle` filter is available via the admin dashboard
+- `lifecycle` — filter by `registered`, `in_stock`, or `sold`
+- `owner_id` — admin only: filter by the client (user_id) the device is assigned to
 - `skip` / `limit` — pagination (default limit: 100, max: 1000)
+
+**Visibility rule:** non-admin users only ever see the devices assigned to their own account (`user_id == me`). Admins see the full inventory.
+
+Each device object now carries a `subscription` block describing the owner's **payment scheme / subscription mode** (so the client's real billing state is never guessed at):
+
+```json
+{
+  "id": 7,
+  "imei": "358765012345678",
+  "name": "Fleet Tracker #42",
+  "plan": { "id": 2, "name": "Basic", "slug": "basic", "billing_type": "recurrent", "price": 5000, "currency": "RWF", "duration_value": 1, "duration_unit": "month", "duration_days": 30, "max_devices": 3, "description": null, "is_active": true },
+  "subscription": {
+    "status": "active",        // active | expired | none
+    "plan_slug": "basic",
+    "plan_name": "Basic",
+    "billing_type": "recurrent", // one_time | recurrent
+    "started_at": "2026-06-14T10:00:00Z",
+    "expires_at": "2026-07-14T10:00:00Z"
+  }
+}
+```
+
+`subscription.status` is derived from the owner's latest subscription record: `active` = unexpired subscription, `expired` = subscription lapsed or cancelled, `none` = no subscription on file (trial pending or unpaid).
 
 ---
 
@@ -498,18 +585,52 @@ Delete device and all associated location data. Status 204 on success.
 
 ---
 
-### `POST /api/devices/{device_id}/assign`
-Assign a device to the first user in the database (legacy/admin utility). Sets `lifecycle: "sold"`. No auth required.
+### `PUT /api/devices/{device_id}/plan`
+**Admin only.** Link (or unlink) an admin-configured subscription scheme to a device — e.g. the scheme the client is billed for on this unit.
 
-**Response `200`:**
+**Headers:** `Authorization: Bearer <token>` (ADMIN / SUPER_ADMIN)
+
+**Request:**
 ```json
-{
-  "message": "Device assigned successfully",
-  "device_id": 7,
-  "user_id": 1,
-  "lifecycle": "sold"
-}
+{ "plan_id": 2 }
 ```
+
+Send `{ "plan_id": null }` to unlink.  
+**Response `200`:** Full device object including `plan_id` and nested `plan`.
+**Response `404`:** Device or plan not found.
+
+---
+
+### `POST /api/devices/{device_id}/assign`
+**Admin only.** Assign an inventory device to a client account (role `USER`). One or many devices can be assigned per client, but a device can belong to **at most one client at a time** — assigning a device already owned by a *different* client returns `409`.
+
+**Headers:** `Authorization: Bearer <token>` (ADMIN / SUPER_ADMIN)
+
+**Request** — exactly one client identifier:
+```json
+{ "user_id": 42 }
+```
+```json
+{ "clerk_user_id": "user_2abc123xyz456def" }
+```
+```json
+{ "email": "client@example.com" }
+```
+
+**Response `200`:** Full device object with `user_id` set and `lifecycle: "sold"`.
+
+**Response `400`:** Target account is not a client (role ≠ `USER`).  
+**Response `404`:** Device or client not found.  
+**Response `409`:** Device is already assigned to another client (unassign it first).
+
+---
+
+### `POST /api/devices/{device_id}/unassign`
+**Admin only.** Reclaim a device from its client back to company stock. Clears `user_id`, resets `lifecycle` to `in_stock`, and issues a fresh pairing PIN for the next client. Idempotent (unassigning an unowned device is a no-op).
+
+**Headers:** `Authorization: Bearer <token>` (ADMIN / SUPER_ADMIN)
+
+**Response `200`:** Full device object with `user_id: null` and `lifecycle: "in_stock"`.
 
 ---
 
@@ -550,6 +671,48 @@ Get current device status including battery, signal, and last known location.
   }
 }
 ```
+
+---
+
+### `GET /api/devices/{device_id}/billing`
+Full **payment scheme / subscription mode** picture for a single device — the linked plan, the owner's current subscription state, and the payment history that matches this device's plan. Owner or admin only.
+
+**Response `200`:**
+```json
+{
+  "device_id": 7,
+  "imei": "358765012345678",
+  "name": "Fleet Tracker #42",
+  "lifecycle": "sold",
+  "status": "online",
+  "owner": {
+    "user_id": 42,
+    "name": "Jane Doe",
+    "email": "jane@example.com"
+  },
+  "plan": { "id": 2, "name": "Basic", "slug": "basic", "billing_type": "recurrent", "price": 5000, "currency": "RWF", "duration_value": 1, "duration_unit": "month", "duration_days": 30, "max_devices": 3, "description": null, "is_active": true },
+  "subscription": {
+    "status": "active",
+    "plan_slug": "basic",
+    "plan_name": "Basic",
+    "billing_type": "recurrent",
+    "started_at": "2026-06-14T10:00:00Z",
+    "expires_at": "2026-07-14T10:00:00Z"
+  },
+  "payments": [
+    {
+      "tx_ref": "FLW-TX-123456",
+      "plan_id": "basic",
+      "amount": 5000,
+      "currency": "RWF",
+      "status": "successful",
+      "verified_at": "2026-06-14T10:05:00Z"
+    }
+  ]
+}
+```
+
+Payments are the owner's records narrowed to this device's linked plan slug (all of the owner's payments when no plan is linked). Payments are created by the mobile app's Flutterwave verification flow — admins view the scheme, they never record payments manually.
 
 ---
 
@@ -1009,10 +1172,19 @@ Protected by Clerk-based session cookie. Only users with `ADMIN` or `SUPER_ADMIN
 | `GET /admin/login` | Clerk sign-in page |
 | `POST /admin/auth/verify` | Exchange Clerk JWT for session cookie |
 | `GET /admin/logout` | Clear session, redirect to login |
-| `GET /admin/devices` | Device inventory management UI (shows recent rejected connections) |
+| `GET /admin/devices` | Device inventory management UI (shows recent rejected connections; `?owner=` filters by assigned client) |
+| `GET /admin/clients` | Client directory — every customer with their assigned devices & plan (`?q=` searches by name/email) |
+| `GET /admin/devices/{imei}/billing` | Per-device payment scheme / subscription mode panel — linked plan (one-time vs recurrent, price, currency, length), owner's subscription state (active/expired/none + expiry), and payment history. Read-only (payments come from Flutterwave verification). |
+| `GET /admin/plans` | Subscription schemes — create, view, and activate/deactivate plans (mobile pricing + billing read from these) |
+| `POST /admin/plans/create` | Create a new subscription scheme (one-time or recurrent, price, currency, length, max devices) |
+| `POST /admin/plans/{plan_id}/toggle` | Activate / deactivate a plan |
+| `POST /admin/devices/{imei}/plan` | Link or unlink a subscription scheme to a device from the inventory page |
 | `POST /admin/devices` | Add a new device to the whitelist (accepts `sim_number`) |
+| `POST /admin/devices/{imei}/assign` | Assign an unowned device to an existing client account by email |
+| `POST /admin/devices/{imei}/assign-new` | Invite a NEW client (Clerk email invitation + local row, role USER) and assign the device in one step — the client sets their own password via the invite link |
 | `POST /admin/devices/{imei}/verify`| Manually promote from `registered` to `in_stock` and send test command |
 | `POST /admin/devices/{imei}/delete` | Remove an unpaired device |
+| `POST /admin/devices/{imei}/unpair` | Reclaim a device from its client (clear owner, reset PIN) |
 | `GET /dashboard` | Read-only fleet monitor (public) |
 
 ### `POST /admin/auth/verify`
