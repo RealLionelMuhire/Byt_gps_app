@@ -46,7 +46,7 @@ def _check_pair_rate_limit(ip: str):
     _pair_attempts[ip].append(now)
 
 
-VALID_MARKER_ICONS = {"arrow", "sedan", "truck_small", "truck_big", "bus", "animal"}
+VALID_MARKER_ICONS = {"arrow", "sedan", "truck_small", "truck_big", "bus", "animal", "motorcycle"}
 
 
 # Pydantic schemas
@@ -127,7 +127,7 @@ class DeviceResponse(DeviceBase):
     battery_level: Optional[int]
     gsm_signal: Optional[int]
     created_at: datetime
-    marker_icon: str  # arrow (default) | sedan | truck_small | truck_big | bus | animal
+    marker_icon: str  # arrow (default) | sedan | truck_small | truck_big | bus | animal | motorcycle
     # Aggregate fields against the trips table — only populated by
     # list_devices (see its trip_count_subq/last_trip_at_subq), so the
     # Flutter selector can show them without an N+1 call per device.

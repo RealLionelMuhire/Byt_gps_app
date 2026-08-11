@@ -6,4 +6,4 @@
 
 ALTER TABLE devices ADD COLUMN IF NOT EXISTS marker_icon VARCHAR(20) NOT NULL DEFAULT 'arrow';
 
-COMMENT ON COLUMN devices.marker_icon IS 'Map marker icon: arrow (default) | sedan | truck_small | truck_big | bus | animal';
+COMMENT ON COLUMN devices.marker_icon IS 'Map marker icon: arrow (default) | sedan | truck_small | truck_big | bus | animal | motorcycle';
