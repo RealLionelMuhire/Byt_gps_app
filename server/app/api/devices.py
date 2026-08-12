@@ -332,7 +332,7 @@ async def list_devices(
 
     # Batch-load the subscription mode for every device's owner so the
     # response's `subscription` block doesn't N+1 per row.
-    owner_ids = {d.user_id for d in rows if d.user_id}
+    owner_ids = {d[0].user_id for d in rows if d[0].user_id}
     owners = (
         db.query(User).filter(User.id.in_(owner_ids)).all() if owner_ids else []
     )
