@@ -110,6 +110,27 @@ class DeviceMarkerIconUpdate(BaseModel):
         return v
 
 
+class DeviceSubscriptionInfo(BaseModel):
+    """A device's payment scheme / subscription mode.
+
+    status:
+      active   — the owner has an unexpired subscription for this scheme
+      expired  — a subscription exists but has lapsed (or was cancelled)
+      none     — no subscription record at all (trial pending or unpaid)
+
+    `plan_slug` / `plan_name` / `billing_type` describe the scheme the
+    subscription was bought under (e.g. 'basic' / 'Basic' / 'recurrent');
+    they resolve to None when the plan was deleted or the slug is unknown.
+    """
+
+    status: str = "none"
+    plan_slug: Optional[str] = None
+    plan_name: Optional[str] = None
+    billing_type: Optional[str] = None
+    started_at: Optional[datetime] = None
+    expires_at: Optional[datetime] = None
+
+
 class DeviceResponse(DeviceBase):
     id: int
     imei: str
@@ -177,25 +198,7 @@ class DeviceOwnerInfo(BaseModel):
     email: str
 
 
-class DeviceSubscriptionInfo(BaseModel):
-    """A device's payment scheme / subscription mode.
 
-    status:
-      active   — the owner has an unexpired subscription for this scheme
-      expired  — a subscription exists but has lapsed (or was cancelled)
-      none     — no subscription record at all (trial pending or unpaid)
-
-    `plan_slug` / `plan_name` / `billing_type` describe the scheme the
-    subscription was bought under (e.g. 'basic' / 'Basic' / 'recurrent');
-    they resolve to None when the plan was deleted or the slug is unknown.
-    """
-
-    status: str = "none"
-    plan_slug: Optional[str] = None
-    plan_name: Optional[str] = None
-    billing_type: Optional[str] = None
-    started_at: Optional[datetime] = None
-    expires_at: Optional[datetime] = None
 
 
 class PaymentInfo(BaseModel):
