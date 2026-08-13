@@ -4,6 +4,7 @@ import logging
 from typing import List, Optional, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import func
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, selectinload
 from datetime import datetime, timedelta
 import secrets
@@ -332,24 +333,42 @@ async def list_devices(
 
     # Batch-load the subscription mode for every device's owner so the
     # response's `subscription` block doesn't N+1 per row.
-    owner_ids = {d[0].user_id for d in rows if d[0].user_id}
-    owners = (
-        db.query(User).filter(User.id.in_(owner_ids)).all() if owner_ids else []
-    )
-    clerk_by_owner = {u.id: u.clerk_user_id for u in owners}
-    clerk_ids = [c for c in clerk_by_owner.values() if c]
-    subs = (
-        db.query(Subscription)
-        .filter(Subscription.clerk_user_id.in_(clerk_ids))
-        .order_by(Subscription.created_at.desc())
-        .all()
-        if clerk_ids
-        else []
-    )
+    #
+    # This is pure enrichment: the device list must come back even when the
+    # subscription data can't be read (e.g. the DB is missing a column the
+    # Subscription model maps — like subscriptions.price before migration 015
+    # is applied — or a subscription-service hiccup). On any DB error we
+    # degrade to `subscription: {status: none}` for every device instead of
+    # 500ing the whole list; devices are the payload, subscription mode is
+    # optional metadata.
     latest_sub = {}
-    for s in subs:
-        latest_sub.setdefault(s.clerk_user_id, s)
-    plans_by_slug = _plans_by_slug(db)
+    plans_by_slug = {}
+    clerk_by_owner = {}
+    try:
+        owner_ids = {d[0].user_id for d in rows if d[0].user_id}
+        owners = (
+            db.query(User).filter(User.id.in_(owner_ids)).all() if owner_ids else []
+        )
+        clerk_by_owner = {u.id: u.clerk_user_id for u in owners}
+        clerk_ids = [c for c in clerk_by_owner.values() if c]
+        subs = (
+            db.query(Subscription)
+            .filter(Subscription.clerk_user_id.in_(clerk_ids))
+            .order_by(Subscription.created_at.desc())
+            .all()
+            if clerk_ids
+            else []
+        )
+        for s in subs:
+            latest_sub.setdefault(s.clerk_user_id, s)
+        plans_by_slug = _plans_by_slug(db)
+    except SQLAlchemyError as e:
+        logger.warning(
+            "Could not load subscription info for the device list — returning "
+            "devices without subscription data (%s: %s). Run the SQL migrations "
+            "in server/migrations/ (015 adds subscriptions.price).",
+            type(e).__name__, e,
+        )
 
     devices = []
     for device, trip_count, last_trip_at in rows:
