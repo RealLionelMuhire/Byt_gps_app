@@ -28,9 +28,16 @@ COMMENT ON COLUMN devices.plan_id IS
     'Subscription scheme linked to this device (admin-configured).';
 
 -- 3. Seed the default plans (match the legacy hardcoded values in onboarding.py)
-INSERT INTO subscription_plans (name, slug, billing_type, price, currency, duration_value, duration_unit, max_devices, description)
+--
+-- NOTE: the app's startup create_all() may have already created
+-- subscription_plans from the SQLAlchemy model, whose `is_active` column has
+-- only a client-side default (no server-side DEFAULT). Normalise the schema
+-- here and pass is_active explicitly so seeding succeeds either way.
+ALTER TABLE subscription_plans ALTER COLUMN is_active SET DEFAULT TRUE;
+
+INSERT INTO subscription_plans (name, slug, billing_type, price, currency, duration_value, duration_unit, max_devices, description, is_active)
 VALUES
-    ('Trial',  'trial', 'one_time',  0,      'RWF', 14, 'day',   1,    'Free 14-day trial. 1 vehicle.'),
-    ('Basic',  'basic', 'recurrent', 5000,   'RWF', 1,  'month', 3,    'Monthly plan. Up to 3 vehicles.'),
-    ('Fleet',  'fleet', 'recurrent', 15000,  'RWF', 1,  'month', NULL, 'Monthly plan. Unlimited vehicles.')
+    ('Trial',  'trial', 'one_time',  0,      'RWF', 14, 'day',   1,    'Free 14-day trial. 1 vehicle.', TRUE),
+    ('Basic',  'basic', 'recurrent', 5000,   'RWF', 1,  'month', 3,    'Monthly plan. Up to 3 vehicles.', TRUE),
+    ('Fleet',  'fleet', 'recurrent', 15000,  'RWF', 1,  'month', NULL, 'Monthly plan. Unlimited vehicles.', TRUE)
 ON CONFLICT (slug) DO NOTHING;
