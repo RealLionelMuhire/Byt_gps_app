@@ -17,6 +17,7 @@ from app.core.auth import require_auth, require_admin, get_current_user, require
 from app.models.device import Device
 from app.models.location import Location
 from app.models.trip import Trip
+from app.models.vehicle import Vehicle
 from app.models.subscription import SubscriptionPlan, Subscription, Payment
 from app.api.trips import TripResponse
 from app.api.subscriptions import SubscriptionPlanResponse
@@ -159,6 +160,19 @@ class DeviceResponse(DeviceBase):
     # never had trip_count/last_trip_at set on it.
     trip_count: int = 0
     last_trip_at: Optional[datetime] = None
+    # Registration-time vehicle info — lives on the separate `vehicles`
+    # table (see app/models/vehicle.py), not on Device itself, since it's
+    # captured by the mobile app's device-pairing flow (POST /api/vehicles)
+    # as a distinct step, not device creation. None whenever a device has
+    # no linked Vehicle row (e.g. in_stock/unpaired devices, or ones
+    # created directly via POST /{device_id} without ever going through
+    # onboarding). Populated by list_devices/get_device/get_device_by_imei
+    # via `_apply_vehicle_info` — same transient-attribute,
+    # avoid-N+1-via-batch-load pattern as trip_count/last_trip_at above.
+    nickname: Optional[str] = None
+    plate: Optional[str] = None
+    make: Optional[str] = None
+    model: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -269,6 +283,44 @@ def _build_subscription_info(
     )
 
 
+# ── Vehicle-info helpers (nickname/plate/make/model, DeviceResponse) ─────────
+# `Vehicle` is a separate table (captured by the mobile app's device-pairing
+# flow, POST /api/vehicles — see app/api/onboarding.py) linked by
+# `Vehicle.device_id -> Device.id`. Nothing enforces at most one Vehicle per
+# device (no unique constraint on vehicles.device_id), so "latest wins" —
+# same resolution `_latest_subscription`/`latest_sub.setdefault` already use
+# for the analogous one-user-many-subscriptions case above.
+
+def _latest_vehicle_by_device_id(db: Session, device_ids) -> dict:
+    """device_id -> most-recently-created Vehicle, batched for a whole page
+    of devices in one query — the list_devices equivalent of
+    `_latest_subscription`, sized to avoid an N+1 per row."""
+    if not device_ids:
+        return {}
+    vehicles = (
+        db.query(Vehicle)
+        .filter(Vehicle.device_id.in_(device_ids))
+        .order_by(Vehicle.created_at.desc())
+        .all()
+    )
+    by_device_id: dict = {}
+    for vehicle in vehicles:
+        by_device_id.setdefault(vehicle.device_id, vehicle)
+    return by_device_id
+
+
+def _apply_vehicle_info(device: Device, vehicle: Optional[Vehicle]) -> None:
+    """Sets DeviceResponse's nickname/plate/make/model as transient
+    attributes on `device` — same `from_attributes`-reads-anything trick
+    trip_count/subscription already rely on. `vehicle=None` (no linked
+    registration yet) leaves all four as None, which DeviceResponse already
+    defaults to."""
+    device.nickname = vehicle.nickname if vehicle else None
+    device.plate = vehicle.plate if vehicle else None
+    device.make = vehicle.make if vehicle else None
+    device.model = vehicle.model if vehicle else None
+
+
 @router.get("/", response_model=List[DeviceResponse])
 async def list_devices(
     skip: int = Query(0, ge=0),
@@ -370,6 +422,18 @@ async def list_devices(
             type(e).__name__, e,
         )
 
+    # Same "pure enrichment, never 500 the list over it" stance as the
+    # subscription block above.
+    try:
+        vehicle_by_device_id = _latest_vehicle_by_device_id(db, {d[0].id for d in rows})
+    except SQLAlchemyError as e:
+        logger.warning(
+            "Could not load vehicle info for the device list — returning "
+            "devices without nickname/plate/make/model (%s: %s).",
+            type(e).__name__, e,
+        )
+        vehicle_by_device_id = {}
+
     devices = []
     for device, trip_count, last_trip_at in rows:
         # Transient (non-persisted) attributes — DeviceResponse picks them
@@ -380,6 +444,7 @@ async def list_devices(
         device.subscription = _build_subscription_info(
             latest_sub.get(clerk) if clerk else None, plans_by_slug
         )
+        _apply_vehicle_info(device, vehicle_by_device_id.get(device.id))
         devices.append(device)
     return devices
 
@@ -523,6 +588,7 @@ async def get_device(
         _latest_subscription(db, owner.clerk_user_id) if owner else None,
         _plans_by_slug(db),
     )
+    _apply_vehicle_info(device, _latest_vehicle_by_device_id(db, {device.id}).get(device.id))
     return device
 
 
@@ -537,6 +603,7 @@ async def get_device_by_imei(
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
     require_device_access(device, user)
+    _apply_vehicle_info(device, _latest_vehicle_by_device_id(db, {device.id}).get(device.id))
     return device
 
 
