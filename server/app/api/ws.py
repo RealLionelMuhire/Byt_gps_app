@@ -77,6 +77,15 @@ class ConnectionManager:
         self.fleet_subscribers: Dict[int, Set[WebSocket]] = {}
         # device_id → set of user_ids whose fleet socket(s) want this device
         self.device_owners: Dict[int, Set[int]] = {}
+        # WebSocket → lock serializing sends to that one fleet connection.
+        # A fleet socket is shared across every device the user owns, so
+        # two devices reporting near-simultaneously (separate asyncio tasks,
+        # one per TCP connection) can both try to send_json() on the same
+        # socket concurrently. Starlette's WebSocket.send() has no internal
+        # lock, so this per-connection lock is what prevents interleaved
+        # frames / races — it does NOT serialize sends across different
+        # sockets, only concurrent sends to the same one.
+        self.fleet_locks: Dict[WebSocket, asyncio.Lock] = {}
 
     async def connect(self, device_id: int, ws: WebSocket) -> None:
         """Accept and register a new WebSocket subscriber for device_id."""
@@ -104,6 +113,7 @@ class ConnectionManager:
     ) -> None:
         """Accept and register a fleet-wide subscriber covering device_ids."""
         await ws.accept()
+        self.fleet_locks[ws] = asyncio.Lock()
         self.fleet_subscribers.setdefault(user_id, set()).add(ws)
         for device_id in device_ids:
             self.device_owners.setdefault(device_id, set()).add(user_id)
@@ -124,6 +134,7 @@ class ConnectionManager:
         """
         subscribers = self.fleet_subscribers.get(user_id, set())
         subscribers.discard(ws)
+        self.fleet_locks.pop(ws, None)
         if not subscribers:
             self.fleet_subscribers.pop(user_id, None)
             for device_id in device_ids:
@@ -141,19 +152,6 @@ class ConnectionManager:
         to every fleet subscriber whose fleet includes device_id.
         Dead connections are pruned automatically from both registries.
         """
-        # TEMP DEBUG — remove once confirmed working. logger.warning (not
-        # .debug) so this shows regardless of configured LOG_LEVEL — the
-        # existing per-send failure logs below are .debug and may have been
-        # silently filtered out this whole time if LOG_LEVEL=INFO.
-        logger.warning(
-            "[BROADCAST] broadcast(device_id=%s): active_subscribers=%d "
-            "device_owners=%s fleet_subscriber_counts=%s",
-            device_id,
-            len(self.active.get(device_id, set())),
-            list(self.device_owners.get(device_id, set())),
-            {uid: len(s) for uid, s in self.fleet_subscribers.items()},
-        )
-
         clients = list(self.active.get(device_id, set()))
         if clients:
             dead: list[WebSocket] = []
@@ -176,14 +174,11 @@ class ConnectionManager:
             dead_fleet: list[WebSocket] = []
             for ws in fleet_clients:
                 try:
-                    await ws.send_json(payload)
-                    # TEMP DEBUG — remove once confirmed working.
-                    logger.warning(
-                        "[BROADCAST] sent to fleet subscriber user_id=%s ok", user_id,
-                    )
+                    async with self.fleet_locks[ws]:
+                        await ws.send_json(payload)
                 except Exception as exc:
-                    logger.warning(  # TEMP: bumped from .debug so it's visible
-                        "[BROADCAST] WS fleet send FAILED for user %d (%s) — marking as dead",
+                    logger.debug(
+                        "WS fleet send failed for user %d (%s) — marking as dead",
                         user_id,
                         exc,
                     )
@@ -306,11 +301,6 @@ async def fleet_stream(websocket: WebSocket, token: Optional[str] = Query(None))
     finally:
         db.close()
 
-    # TEMP DEBUG — remove once confirmed working.
-    logger.warning(
-        "[BROADCAST] fleet_stream: user_id=%s clerk_user_id=%s resolved device_ids=%s",
-        user.id, clerk_user_id, device_ids,
-    )
     await manager.connect_fleet(user.id, device_ids, websocket)
     try:
         while True:
