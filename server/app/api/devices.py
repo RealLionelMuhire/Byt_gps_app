@@ -383,6 +383,13 @@ async def list_devices(
 
     rows = query.offset(skip).limit(limit).all()
 
+    logger.info(
+        "Device list: user_id=%s role=%s admin=%s | total devices in DB=%s | "
+        "returned=%s",
+        user.id, user.role, is_admin, db.query(func.count(Device.id)).scalar(),
+        len(rows),
+    )
+
     # Batch-load the subscription mode for every device's owner so the
     # response's `subscription` block doesn't N+1 per row.
     #
@@ -415,6 +422,13 @@ async def list_devices(
             latest_sub.setdefault(s.clerk_user_id, s)
         plans_by_slug = _plans_by_slug(db)
     except SQLAlchemyError as e:
+        # Roll back the aborted transaction BEFORE doing anything else with
+        # this session: after a failed statement PostgreSQL refuses all
+        # further commands until the transaction is rolled back, so any
+        # follow-up query (vehicle enrichment, eager-loaded relations during
+        # response serialization) would otherwise die with
+        # InFailedSqlTransaction — see the matching pattern in onboarding.py.
+        db.rollback()
         logger.warning(
             "Could not load subscription info for the device list — returning "
             "devices without subscription data (%s: %s). Run the SQL migrations "

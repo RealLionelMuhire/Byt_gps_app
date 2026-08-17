@@ -2,6 +2,14 @@
 """
 Run database migrations for BYThron GPS server.
 
+Tracks applied migrations in a `schema_migrations` table so a migration file is
+never executed twice. Every migration in this repo is idempotent (safe to re-run
+— see 012_add_role_enum.sql, which was rewritten specifically so a re-run can
+never wipe users.role), so the very first run against a database migrated by the
+old untracked script simply re-applies everything once and records it; every
+subsequent run is a no-op. Use `--mark-all-applied` if you know the DB is fully
+migrated and want to skip that one re-run.
+
 Usage:
   # When DB runs in Docker (recommended):
   docker compose exec gps_server ./migrate
@@ -11,6 +19,13 @@ Usage:
 
   # Dry-run (show what would run):
   ./migrate --dry-run
+
+  # Re-run every migration regardless of what's recorded (e.g. after fixing a
+  # migration file — safe now that all migrations are idempotent):
+  ./migrate --force
+
+  # Record all current migration files as applied WITHOUT running them:
+  ./migrate --mark-all-applied
 
 Requires: psql (PostgreSQL client) in PATH
 Uses: DATABASE_URL from .env or environment
@@ -26,6 +41,13 @@ os.chdir(SERVER_DIR)
 MIGRATIONS_DIR = SERVER_DIR / "migrations"
 
 DEFAULT_DATABASE_URL = "postgresql://gps_user:gps_password@localhost:5432/gps_tracking"
+
+TRACKING_TABLE = "schema_migrations"
+TRACKING_TABLE_DDL = (
+    "CREATE TABLE IF NOT EXISTS schema_migrations ("
+    " filename TEXT PRIMARY KEY,"
+    " applied_at TIMESTAMPTZ NOT NULL DEFAULT NOW());"
+)
 
 
 def load_database_url() -> str:
@@ -52,36 +74,92 @@ def get_migration_files():
     return [f for f in files if f.name.endswith(".sql")]
 
 
-def run_migration(db_url: str, migration_file: Path, dry_run: bool) -> bool:
-    """Run a single migration file. Returns True on success."""
-    if dry_run:
-        print(f"  [dry-run] Would run: {migration_file.name}")
-        return True
+# ── psql helpers ─────────────────────────────────────────────────────────────
 
+def _psql(db_url: str, args: list, timeout: int = 60) -> subprocess.CompletedProcess:
     try:
-        result = subprocess.run(
-            ["psql", db_url, "-v", "ON_ERROR_STOP=1", "-f", str(migration_file)],
+        return subprocess.run(
+            ["psql", db_url, "-v", "ON_ERROR_STOP=1"] + args,
             capture_output=True,
             text=True,
-            timeout=60,
+            timeout=timeout,
         )
-        if result.returncode != 0:
-            print(f"  FAILED: {migration_file.name}", file=sys.stderr)
-            if result.stderr:
-                print(result.stderr, file=sys.stderr)
-            return False
-        print(f"  OK: {migration_file.name}")
-        return True
     except FileNotFoundError:
         print("  Error: psql not found. Install PostgreSQL client (e.g. postgresql-client).", file=sys.stderr)
-        return False
+        sys.exit(1)
     except subprocess.TimeoutExpired:
-        print(f"  FAILED: {migration_file.name} (timeout)", file=sys.stderr)
-        return False
+        print(f"  Error: psql timed out after {timeout}s.", file=sys.stderr)
+        sys.exit(1)
 
+
+def run_sql(db_url: str, sql: str) -> None:
+    """Run an inline SQL statement via psql. Exits on failure."""
+    result = _psql(db_url, ["-c", sql])
+    if result.returncode != 0:
+        print(f"  Error running SQL: {sql[:120]!r}", file=sys.stderr)
+        if result.stderr:
+            print(result.stderr, file=sys.stderr)
+        sys.exit(1)
+
+
+def query_sql(db_url: str, sql: str) -> list:
+    """Run a query and return trimmed result rows (tuples-only, unaligned)."""
+    result = _psql(db_url, ["-t", "-A", "-c", sql])
+    if result.returncode != 0:
+        print("  Error querying database:", file=sys.stderr)
+        if result.stderr:
+            print(result.stderr, file=sys.stderr)
+        sys.exit(1)
+    return [line.strip() for line in result.stdout.splitlines() if line.strip()]
+
+
+# ── Tracking helpers ─────────────────────────────────────────────────────────
+
+def tracking_table_exists(db_url: str) -> bool:
+    return query_sql(
+        db_url, f"SELECT to_regclass('public.{TRACKING_TABLE}') IS NOT NULL;"
+    )[0] == "t"
+
+
+def get_applied(db_url: str) -> set:
+    return set(query_sql(db_url, f"SELECT filename FROM {TRACKING_TABLE};"))
+
+
+def record_applied(db_url: str, filename: str) -> None:
+    safe = filename.replace("'", "''")
+    run_sql(
+        db_url,
+        f"INSERT INTO {TRACKING_TABLE} (filename) VALUES ('{safe}') "
+        f"ON CONFLICT (filename) DO NOTHING;",
+    )
+
+
+def mark_all_applied(db_url: str, migrations: list) -> None:
+    run_sql(db_url, TRACKING_TABLE_DDL)
+    for m in migrations:
+        record_applied(db_url, m.name)
+
+
+# ── Migration runner ─────────────────────────────────────────────────────────
+
+def run_migration(db_url: str, migration_file: Path) -> bool:
+    """Run a single migration file. Returns True on success."""
+    result = _psql(db_url, ["-f", str(migration_file)])
+    if result.returncode != 0:
+        print(f"  FAILED: {migration_file.name}", file=sys.stderr)
+        if result.stderr:
+            print(result.stderr, file=sys.stderr)
+        return False
+    print(f"  OK: {migration_file.name}")
+    return True
+
+
+# ── Main ─────────────────────────────────────────────────────────────────────
 
 def main():
     dry_run = "--dry-run" in sys.argv or "-n" in sys.argv
+    force = "--force" in sys.argv or "-f" in sys.argv
+    mark_all = "--mark-all-applied" in sys.argv
 
     db_url = load_database_url()
     if not db_url:
@@ -93,18 +171,46 @@ def main():
         print("No migration files found in migrations/")
         sys.exit(0)
 
-    print(f"Running migrations from {MIGRATIONS_DIR}")
+    print(f"Migrations directory: {MIGRATIONS_DIR}")
+
+    # Read-only discovery (safe in dry-run mode too)
+    table_existed = tracking_table_exists(db_url)
+    applied = get_applied(db_url) if table_existed else set()
+
+    if mark_all:
+        print(
+            f"Marking all {len(migrations)} migration(s) as applied "
+            f"(nothing will be run)."
+        )
+        if not dry_run:
+            mark_all_applied(db_url, migrations)
+        applied = {m.name for m in migrations}
+
+    if not table_existed and not mark_all and not dry_run:
+        run_sql(db_url, TRACKING_TABLE_DDL)
+
+    pending = [m for m in migrations if force or m.name not in applied]
+
     if dry_run:
-        print("(dry-run mode - no changes will be made)")
+        if pending:
+            print("  Would run:")
+            for m in pending:
+                print(f"    {m.name}")
+        else:
+            print("  Nothing to run — all migrations already applied.")
+        return
 
-    failed = False
-    for m in migrations:
-        if not run_migration(db_url, m, dry_run):
-            failed = True
-            break
+    if not pending:
+        print(f"All migrations already applied ({len(applied)} recorded).")
+        return
 
-    if failed:
-        sys.exit(1)
+    print(f"Running {len(pending)} pending migration(s)...")
+    for m in pending:
+        if not run_migration(db_url, m):
+            print("Stopping on failed migration — it was NOT recorded and will be retried next run.", file=sys.stderr)
+            sys.exit(1)
+        record_applied(db_url, m.name)
+
     print("Done.")
 
 

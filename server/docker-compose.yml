@@ -18,6 +18,8 @@ services:
       - "7018:7018"  # TCP for GPS trackers
     volumes:
       - ./app:/app/app
+      - ./migrations:/app/migrations   # Keep migrations + migrate in sync with the repo (no image rebuild needed)
+      - ./migrate:/app/migrate
       - ./logs:/app/logs
     restart: unless-stopped
 
