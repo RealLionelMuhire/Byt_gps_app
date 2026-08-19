@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     
     # Database
     DATABASE_URL: str = "postgresql://gps_user:gps_password@localhost:5432/gps_tracking"
+    # Direct/session-mode connection (bypasses the transaction pooler) — used for
+    # DDL/migrations. Falls back to DATABASE_URL if not set.
+    DIRECT_URL: Optional[str] = None
     
     # Security
     SECRET_KEY: str = "your-secret-key-change-this-in-production"

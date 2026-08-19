@@ -21,8 +21,8 @@ GPS Tracker Hardware
          │
          ▼
   ┌──────────────────┐
-  │  Neon PostgreSQL  │  (Serverless — PostGIS enabled)
-  │  + PostGIS        │
+  │  Supabase         │  (PostgreSQL — PostGIS enabled)
+  │  PostgreSQL       │
   └──────┬───────────┘
          │
          ▼
@@ -50,7 +50,7 @@ GPS Tracker Hardware
 | Trip detection & history | ✅ Live |
 | Subscription & billing (Flutterwave) | ✅ Live |
 | Admin web dashboard (Clerk login) | ✅ Live |
-| Neon serverless PostgreSQL | ✅ Live |
+| Supabase PostgreSQL | ✅ Live |
 | PostGIS spatial queries | ✅ Live |
 
 ---
@@ -60,7 +60,7 @@ GPS Tracker Hardware
 ### Prerequisites
 - Docker & Docker Compose installed
 - A [Clerk](https://clerk.com) project with dev/live API keys
-- A [Neon](https://neon.tech) serverless PostgreSQL database
+- A [Supabase](https://supabase.com) PostgreSQL database
 
 ### 1. Configure environment
 
@@ -75,8 +75,10 @@ nano .env   # Fill in the values below
 ```ini
 DEBUG=True
 
-# Neon serverless DB (enable PostGIS first — server does this automatically)
-DATABASE_URL=postgresql://user:password@ep-xxx.neon.tech/neondb?sslmode=require
+# Supabase DB (enable PostGIS first — server does this automatically)
+# DATABASE_URL: transaction-mode pooler (runtime) — DIRECT_URL: session-mode pooler (migrations)
+DATABASE_URL=postgresql://postgres.[project-ref]:[password]@aws-0-[region].pooler.supabase.com:6543/postgres
+DIRECT_URL=postgresql://postgres.[project-ref]:[password]@aws-0-[region].pooler.supabase.com:5432/postgres
 
 # Security
 SECRET_KEY=run-openssl-rand-hex-32-and-paste-here
@@ -177,7 +179,8 @@ User roles are managed via `GET /api/auth/users` (list) and `PUT /api/auth/users
 
 | Variable | Required | Description |
 |---|---|---|
-| `DATABASE_URL` | ✅ | Neon (or any PostgreSQL) connection string |
+| `DATABASE_URL` | ✅ | Supabase (or any PostgreSQL) connection string — transaction pooler for runtime |
+| `DIRECT_URL` | Optional | Supabase session-mode/direct connection string — used for migrations |
 | `SECRET_KEY` | ✅ | Random 32-byte hex string for signing session cookies |
 | `CLERK_SECRET_KEY` | ✅ | Clerk backend secret (`sk_live_...` or `sk_test_...`) |
 | `CLERK_PUBLISHABLE_KEY` | ✅ | Clerk frontend key (`pk_live_...`) — for admin login page |
@@ -195,14 +198,17 @@ User roles are managed via `GET /api/auth/users` (list) and `PUT /api/auth/users
 Migrations are plain SQL files in `migrations/`. Run them in order on first deployment:
 
 ```bash
-# SSH into server then:
-psql $DATABASE_URL -f server/migrations/001_add_clerk_auth.sql
-psql $DATABASE_URL -f server/migrations/002_add_trips_table.sql
+# Preferred: use the ./migrate script, which tracks what's applied
+./migrate
+
+# Or manually via psql, using DIRECT_URL (session mode — better for DDL than the
+# transaction pooler on DATABASE_URL):
+psql $DIRECT_URL -f server/migrations/001_add_clerk_auth.sql
+psql $DIRECT_URL -f server/migrations/002_add_trips_table.sql
 # ... up to the latest migration number
-psql $DATABASE_URL -f server/migrations/008_add_pairing_pin.sql
 ```
 
-On a fresh Neon database, the server's `init_db()` creates all tables automatically on first start (PostGIS is also enabled automatically).
+On a fresh Supabase database, the server's `init_db()` creates all tables automatically on first start (PostGIS is also enabled automatically).
 
 ---
 
@@ -239,7 +245,7 @@ PORT:   7018
 | Layer | Technology |
 |---|---|
 | Web framework | FastAPI + Uvicorn |
-| Database | PostgreSQL (Neon Serverless) + PostGIS |
+| Database | PostgreSQL (Supabase) + PostGIS |
 | ORM | SQLAlchemy |
 | Authentication | Clerk (JWT/JWKS) |
 | Payments | Flutterwave |

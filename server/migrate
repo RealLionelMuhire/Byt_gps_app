@@ -51,7 +51,14 @@ TRACKING_TABLE_DDL = (
 
 
 def load_database_url() -> str:
-    """Load DATABASE_URL from .env or environment. No app dependencies."""
+    """Load DIRECT_URL (preferred for DDL) or DATABASE_URL from .env or environment.
+
+    Migrations run DDL and multi-statement SQL files, which need a stable
+    session — so DIRECT_URL (session-mode/direct connection) is preferred over
+    DATABASE_URL when both are set (e.g. Supabase's transaction-mode pooler on
+    DATABASE_URL isn't a good fit for migrations).
+    """
+    values = {}
     env_file = SERVER_DIR / ".env"
     if env_file.exists():
         with open(env_file) as f:
@@ -59,11 +66,15 @@ def load_database_url() -> str:
                 line = line.strip()
                 if line and not line.startswith("#") and "=" in line:
                     key, _, value = line.partition("=")
-                    key = key.strip()
-                    value = value.strip().strip("'\"")
-                    if key == "DATABASE_URL":
-                        return value
-    return os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL)
+                    values[key.strip()] = value.strip().strip("'\"")
+
+    return (
+        values.get("DIRECT_URL")
+        or os.environ.get("DIRECT_URL")
+        or values.get("DATABASE_URL")
+        or os.environ.get("DATABASE_URL")
+        or DEFAULT_DATABASE_URL
+    )
 
 
 def get_migration_files():

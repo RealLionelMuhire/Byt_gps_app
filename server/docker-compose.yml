@@ -1,13 +1,13 @@
 name: bythron-prod
 services:
   # GPS Tracking Server
-  # Uses Neon serverless DB — no local postgres service needed.
+  # Uses Supabase PostgreSQL — no local postgres service needed.
   # All secrets are loaded from the .env file in this directory.
   gps_server:
     build: .
     container_name: gps_tracking_server_prod
     env_file:
-      - .env             # Loads DATABASE_URL, CLERK_*, ADMIN_*, etc.
+      - .env             # Loads DATABASE_URL, DIRECT_URL, CLERK_*, ADMIN_*, etc.
     environment:
       # These can be overridden here if needed, but .env takes precedence for secrets.
       HOST: 0.0.0.0
@@ -23,4 +23,4 @@ services:
       - ./logs:/app/logs
     restart: unless-stopped
 
-# No local postgres volume needed — using Neon serverless
+# No local postgres volume needed — using Supabase

@@ -9,19 +9,20 @@ from geoalchemy2 import Geometry
 
 from app.core.config import settings
 
-# Neon serverless works best with a small pool and explicit SSL.
-# pool_size=5 avoids exhausting Neon's free-tier connection limits.
-# pool_recycle prevents stale connections after Neon auto-suspends.
+# Supabase's pgbouncer pooler (transaction mode, port 6543) already multiplexes
+# connections server-side, so SQLAlchemy's own pool is kept small on top of it.
+# psycopg2 doesn't use server-side prepared statements, so it's safe to run
+# through transaction-mode pgbouncer without extra config.
 _connect_args = {}
-if "neon.tech" in settings.DATABASE_URL or "sslmode=require" in settings.DATABASE_URL:
+if "supabase.com" in settings.DATABASE_URL or "neon.tech" in settings.DATABASE_URL or "sslmode=require" in settings.DATABASE_URL:
     _connect_args = {"sslmode": "require"}
 
 engine = create_engine(
     settings.DATABASE_URL,
     pool_pre_ping=True,     # Verify connection liveness before use
-    pool_size=5,            # Neon free tier: keep pool small
+    pool_size=5,            # Keep small: pgbouncer already pools upstream
     max_overflow=10,
-    pool_recycle=300,       # Recycle after 5 min (Neon suspends idle computes)
+    pool_recycle=300,       # Recycle after 5 min to avoid stale pooled connections
     connect_args=_connect_args,
 )
 
@@ -46,7 +47,7 @@ def init_db():
     from sqlalchemy import text
 
     # Enable PostGIS extension first — required for geometry columns.
-    # On Neon (plain PostgreSQL), PostGIS is available but must be explicitly enabled.
+    # Supabase ships PostGIS but it must be explicitly enabled per-database.
     # On the local postgis/postgis Docker image it is already active, so this is a no-op.
     with engine.connect() as conn:
         conn.execute(text("CREATE EXTENSION IF NOT EXISTS postgis;"))
