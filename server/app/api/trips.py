@@ -97,6 +97,7 @@ class SuggestedTripResponse(BaseModel):
     start_lon: float
     end_lat: float
     end_lon: float
+    offline_seconds: float = 0.0
 
 
 class TripCreate(BaseModel):
@@ -152,6 +153,10 @@ class TripDetailResponse(TripResponse):
     device_name: str
     device_imei: str
     route: dict
+    # Total time offline within the trip span (route["gaps"]), surfaced
+    # separately from total_distance_km / duration — see route["gaps"] for
+    # the individual gap spans.
+    offline_seconds: float = 0.0
 
 
 # --- Endpoints ---
@@ -229,6 +234,7 @@ async def get_suggested_trips(
             start_lon=s.start_lon,
             end_lat=s.end_lat,
             end_lon=s.end_lon,
+            offline_seconds=s.offline_seconds,
         )
         for s in segments
     ]
@@ -373,9 +379,10 @@ async def get_trip(
     if end_time is None:
         # Active trip: use last location or now
         from app.models.location import Location
+        from app.api.locations import location_quality_filters
         last_loc = (
             db.query(Location)
-            .filter(Location.device_id == trip.device_id, Location.gps_valid == True)
+            .filter(*location_quality_filters(trip.device_id))
             .order_by(Location.timestamp.desc())
             .first()
         )
@@ -401,6 +408,7 @@ async def get_trip(
         device_name=trip.device.name,
         device_imei=trip.device.imei,
         route=route,
+        offline_seconds=route["properties"]["offline_seconds"],
     )
 
 

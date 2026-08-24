@@ -75,11 +75,11 @@ async def _trip_stale_checker():
                         # long enough (per the owner's own trip settings) to
                         # count as the trip having ended anyway.
                         trip_settings = get_or_create_trip_settings(trip.user_id, db)
+                        from app.api.locations import location_quality_filters
                         last_moving = (
                             db.query(Location)
                             .filter(
-                                Location.device_id == trip.device_id,
-                                Location.gps_valid == True,
+                                *location_quality_filters(trip.device_id),
                                 Location.timestamp >= trip.start_time,
                                 Location.speed >= trip_settings.stop_speed_threshold_kmh,
                             )

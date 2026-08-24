@@ -15,8 +15,52 @@ from app.protocol_parser import ProtocolParser
 from app.core.database import SessionLocal
 from app.models.device import Device
 from app.models.location import Location
+from app.models.location_quality_log import LocationQualityLog
+from app.api.locations import classify_outlier, compute_quality_log_fields
+from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
+
+
+def _evaluate_incoming_point(
+    db: Session, device_id: int, lon: float, lat: float, course: int, satellites: int, ts: datetime,
+) -> dict:
+    """
+    Look up the last 2 stored points for this device and classify the
+    incoming fix via the shared 3-point-window check (see classify_outlier
+    in app/api/locations.py — the same function the retroactive backfill
+    script uses, so live ingestion and backfill never disagree). May
+    retroactively flag the immediately preceding row (and its existing
+    quality-log entry, if any) in place when the pattern is a
+    jump-and-return.
+
+    Returns {"is_outlier": bool, "quality_fields": dict} for the new point —
+    the caller creates the Location row using is_outlier, then (once it has
+    the new row's id) a LocationQualityLog row using quality_fields.
+    """
+    prev_rows = (
+        db.query(Location)
+        .filter(Location.device_id == device_id)
+        .order_by(Location.timestamp.desc())
+        .limit(2)
+        .all()
+    )
+    prev1 = prev_rows[0] if prev_rows else None
+    prev2 = prev_rows[1] if len(prev_rows) > 1 else None
+
+    new_is_outlier, flag_prev1 = classify_outlier(prev2, prev1, lon, lat, ts)
+    if flag_prev1:
+        prev1.is_outlier = True
+        prev1_log = (
+            db.query(LocationQualityLog)
+            .filter(LocationQualityLog.location_id == prev1.id)
+            .first()
+        )
+        if prev1_log:
+            prev1_log.is_outlier = True
+
+    quality_fields = compute_quality_log_fields(prev1, lon, lat, course, satellites, ts)
+    return {"is_outlier": new_is_outlier, "quality_fields": quality_fields}
 
 
 class GPSTrackerConnection:
@@ -203,6 +247,11 @@ class GPSTrackerConnection:
                 device = db.query(Device).filter(Device.imei == self.device_imei).first()
                 
                 if device:
+                    evaluation = _evaluate_incoming_point(
+                        db, device.id, data['longitude'], data['latitude'],
+                        data['course'], data['satellites'], data['timestamp']
+                    )
+                    is_outlier = evaluation["is_outlier"]
                     # Create location record
                     location = Location(
                         device_id=device.id,
@@ -212,10 +261,19 @@ class GPSTrackerConnection:
                         course=data['course'],
                         satellites=data['satellites'],
                         gps_valid=data['gps_valid'],
-                        timestamp=data['timestamp']
+                        timestamp=data['timestamp'],
+                        is_outlier=is_outlier
                     )
                     db.add(location)
-                    
+                    db.flush()  # assigns location.id, needed for the quality-log FK below
+                    db.add(LocationQualityLog(
+                        location_id=location.id,
+                        device_id=device.id,
+                        timestamp=data['timestamp'],
+                        is_outlier=is_outlier,
+                        **evaluation["quality_fields"],
+                    ))
+
                     # Update device's last known location
                     device.last_latitude = data['latitude']
                     device.last_longitude = data['longitude']
@@ -332,6 +390,11 @@ class GPSTrackerConnection:
                 device = db.query(Device).filter(Device.imei == self.device_imei).first()
                 
                 if device:
+                    evaluation = _evaluate_incoming_point(
+                        db, device.id, data['longitude'], data['latitude'],
+                        data['course'], data['satellites'], data['timestamp']
+                    )
+                    is_outlier = evaluation["is_outlier"]
                     location = Location(
                         device_id=device.id,
                         latitude=data['latitude'],
@@ -342,10 +405,19 @@ class GPSTrackerConnection:
                         gps_valid=data['gps_valid'],
                         timestamp=data['timestamp'],
                         is_alarm=True,
-                        alarm_type=alarm_type
+                        alarm_type=alarm_type,
+                        is_outlier=is_outlier
                     )
                     db.add(location)
-                    
+                    db.flush()  # assigns location.id, needed for the quality-log FK below
+                    db.add(LocationQualityLog(
+                        location_id=location.id,
+                        device_id=device.id,
+                        timestamp=data['timestamp'],
+                        is_outlier=is_outlier,
+                        **evaluation["quality_fields"],
+                    ))
+
                     device.last_latitude = data['latitude']
                     device.last_longitude = data['longitude']
                     device.last_update = datetime.utcnow()

@@ -10,7 +10,7 @@ from sqlalchemy.orm import Session
 
 from app.models.trip import Trip
 from app.models.location import Location
-from app.api.locations import compute_distance_for_device_time_range
+from app.api.locations import compute_distance_for_device_time_range, location_quality_filters
 from app.services.geocoding import build_trip_display_name
 
 logger = logging.getLogger(__name__)
@@ -36,10 +36,7 @@ def end_active_trips_for_device(device_id: int, db: Session) -> int:
     # Get last GPS-valid location for this device
     last_loc = (
         db.query(Location)
-        .filter(
-            Location.device_id == device_id,
-            Location.gps_valid == True,
-        )
+        .filter(*location_quality_filters(device_id))
         .order_by(Location.timestamp.desc())
         .first()
     )

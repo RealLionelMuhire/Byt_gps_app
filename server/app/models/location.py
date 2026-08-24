@@ -26,6 +26,8 @@ class Location(Base):
     course = Column(Integer, default=0)  # 0-360 degrees
     satellites = Column(Integer, default=0)
     gps_valid = Column(Boolean, default=False)
+    # Implausible GPS jump (see MAX_PLAUSIBLE_SPEED_KMH in app/api/locations.py). Flagged, never deleted.
+    is_outlier = Column(Boolean, nullable=False, default=False)
     
     # Alarm info
     is_alarm = Column(Boolean, default=False)
