@@ -1,6 +1,8 @@
 """Location API endpoints"""
 
-from typing import List, Optional
+import asyncio
+import logging
+from typing import Dict, List, Optional, Tuple
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
@@ -13,7 +15,10 @@ from app.models.location import Location
 from app.models.location_quality_log import LocationQualityLog
 from app.models.device import Device
 from app.models.user import User, Role
+from app.services.trip_settings_service import get_or_create_trip_settings
+from app.services.geocoding import reverse_geocode_many
 
+logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -163,6 +168,37 @@ def compute_offline_gaps(
     return gaps
 
 
+def find_low_speed_runs(
+    locations: List["Location"], speed_threshold_kmh: float
+) -> List[Tuple[int, int]]:
+    """
+    Find maximal runs of consecutive points with speed < speed_threshold_kmh
+    (a point with speed=None is never considered stopped). Returns a list of
+    (start_idx, end_idx) pairs, end exclusive.
+
+    This is the "stopped" concept trip auto-segmentation already applies via
+    TripSettings.stop_speed_threshold_kmh (see detect_trip_segments), pulled
+    out as its own reusable primitive so period-route can classify stopped
+    spans using the identical threshold/comparison rather than a duplicated
+    inline check. detect_trip_segments itself is left on its own inline walk
+    (it interleaves this with a reporting-gap check over a shared index and
+    has no test coverage of its own) rather than being rewired onto this —
+    consolidating them is a follow-up, not bundled into this change.
+    """
+    runs: List[Tuple[int, int]] = []
+    i = 0
+    n = len(locations)
+    while i < n:
+        if locations[i].speed is not None and locations[i].speed < speed_threshold_kmh:
+            start = i
+            while i < n and locations[i].speed is not None and locations[i].speed < speed_threshold_kmh:
+                i += 1
+            runs.append((start, i))
+        else:
+            i += 1
+    return runs
+
+
 # Below this movement distance, the prev->curr bearing is dominated by GPS
 # position noise rather than actual heading, so a course-vs-bearing
 # comparison would be meaningless — treated as "not computable" instead.
@@ -263,6 +299,206 @@ def douglas_peucker(points: List["Location"], epsilon: float) -> List["Location"
             stack.append((start, index))
             stack.append((index, end))
     return [p for p, k in zip(points, keep) if k]
+
+
+# Max period-route span. Bounds worst-case query size and response size;
+# reject rather than silently truncate so callers know to narrow the range.
+MAX_PERIOD_DAYS = 30
+
+# Backstop for a "driving" segment that's still too large after (optional)
+# Douglas-Peucker simplification. DP alone handles the common case; this
+# only kicks in on pathologically dense/noisy segments.
+MAX_POINTS_PER_DRIVING_SEGMENT = 2000
+
+
+def _downsample_uniform(points: List["Location"], max_points: int) -> List["Location"]:
+    """Uniformly stride through points down to at most max_points, always
+    keeping the first and last point."""
+    if len(points) <= max_points:
+        return points
+    step = (len(points) - 1) / (max_points - 1)
+    indices = sorted({round(i * step) for i in range(max_points)})
+    return [points[i] for i in indices]
+
+
+def _make_driving_or_stopped_leftover(
+    points: List["Location"], simplify: bool, epsilon_deg: float
+) -> Optional[dict]:
+    """Build the segment for a run of points that fell between stop-runs
+    (i.e. wasn't classified "stopped"). A lone point can't form a driving
+    segment (no distance/duration to show), so it's reported as a
+    zero-duration "stopped" segment instead of being silently dropped."""
+    if not points:
+        return None
+    if len(points) == 1:
+        return _make_stopped_segment(points)
+    return _make_driving_segment(points, simplify, epsilon_deg)
+
+
+def _make_driving_segment(points: List["Location"], simplify: bool, epsilon_deg: float) -> dict:
+    distance_km = 0.0
+    for i in range(1, len(points)):
+        distance_km += haversine_km(
+            points[i - 1].longitude, points[i - 1].latitude,
+            points[i].longitude, points[i].latitude,
+        )
+    display_points = douglas_peucker(points, epsilon_deg) if (simplify and len(points) > 2) else points
+    if len(display_points) > MAX_POINTS_PER_DRIVING_SEGMENT:
+        display_points = _downsample_uniform(display_points, MAX_POINTS_PER_DRIVING_SEGMENT)
+    return {
+        "type": "driving",
+        "start_time": points[0].timestamp.isoformat(),
+        "end_time": points[-1].timestamp.isoformat(),
+        "duration_seconds": (points[-1].timestamp - points[0].timestamp).total_seconds(),
+        "distance_km": round(distance_km, 3),
+        "point_count": len(display_points),
+        "raw_point_count": len(points),
+        "points": [
+            {
+                "latitude": p.latitude,
+                "longitude": p.longitude,
+                "timestamp": p.timestamp.isoformat(),
+                "speed": p.speed,
+                "course": p.course,
+            }
+            for p in display_points
+        ],
+    }
+
+
+def _make_stopped_segment(points: List["Location"]) -> dict:
+    """Represents a stopped span as its centroid (mean lat/lon across the
+    run) rather than an arbitrary single point, so minor GPS jitter while
+    parked doesn't bias the reported position."""
+    lat = sum(p.latitude for p in points) / len(points)
+    lon = sum(p.longitude for p in points) / len(points)
+    return {
+        "type": "stopped",
+        "start_time": points[0].timestamp.isoformat(),
+        "end_time": points[-1].timestamp.isoformat(),
+        "duration_seconds": (points[-1].timestamp - points[0].timestamp).total_seconds(),
+        "latitude": lat,
+        "longitude": lon,
+        "point_count": len(points),
+    }
+
+
+def _make_offline_segment(gap: dict, last_known: "Location", next_known: "Location") -> dict:
+    return {
+        "type": "offline",
+        "start_time": gap["gap_start"].isoformat(),
+        "end_time": gap["gap_end"].isoformat(),
+        "duration_seconds": gap["gap_seconds"],
+        "last_known": {
+            "latitude": last_known.latitude,
+            "longitude": last_known.longitude,
+            "timestamp": last_known.timestamp.isoformat(),
+        },
+        "next_known": {
+            "latitude": next_known.latitude,
+            "longitude": next_known.longitude,
+            "timestamp": next_known.timestamp.isoformat(),
+        },
+    }
+
+
+def build_period_segments(
+    locations: List["Location"],
+    stop_speed_threshold_kmh: float,
+    min_stop_seconds: float,
+    simplify: bool = True,
+    tolerance_meters: float = 20.0,
+) -> List[dict]:
+    """
+    Build an ordered, typed timeline of "driving" / "stopped" / "offline"
+    segments spanning a whole period (potentially many trips), for the
+    Historical Routes period-route view.
+
+    Reuses the same primitives single-trip routes and auto-segmentation
+    already use, so this view never drifts from the location-quality work
+    done elsewhere:
+      - "offline": segment_locations_by_gap / compute_offline_gaps
+        (TIME_GAP_SEGMENT_BREAK_SECONDS — the teleport-fix threshold)
+      - "stopped": find_low_speed_runs (stop_speed_threshold_kmh — the same
+        setting trip auto-segmentation uses), filtered to runs lasting at
+        least min_stop_seconds so brief dips (e.g. a red light) don't
+        fragment "driving" into noise
+      - "driving": whatever's left between stops/gaps, optionally
+        Douglas-Peucker simplified per segment (never across a boundary)
+
+    Caller is responsible for pre-filtering to quality-passing, in-range,
+    chronologically-ordered locations (see location_quality_filters).
+    """
+    if not locations:
+        return []
+
+    epsilon_deg = tolerance_meters / METERS_PER_DEGREE
+    gap_segments = segment_locations_by_gap(locations)
+    offline_gaps = compute_offline_gaps(locations)
+
+    result: List[dict] = []
+    for idx, seg in enumerate(gap_segments):
+        stop_runs = [
+            (s, e) for (s, e) in find_low_speed_runs(seg, stop_speed_threshold_kmh)
+            if (seg[e - 1].timestamp - seg[s].timestamp).total_seconds() >= min_stop_seconds
+        ]
+        cursor = 0
+        for s, e in stop_runs:
+            leftover = _make_driving_or_stopped_leftover(seg[cursor:s], simplify, epsilon_deg)
+            if leftover:
+                result.append(leftover)
+            result.append(_make_stopped_segment(seg[s:e]))
+            cursor = e
+        leftover = _make_driving_or_stopped_leftover(seg[cursor:], simplify, epsilon_deg)
+        if leftover:
+            result.append(leftover)
+
+        if idx < len(offline_gaps):
+            result.append(_make_offline_segment(offline_gaps[idx], seg[-1], gap_segments[idx + 1][0]))
+
+    return result
+
+
+# Geocoding a whole period could, worst case, hit many genuinely distinct
+# driving-segment endpoints -- Nominatim allows only 1 req/sec, so cap total
+# geocoding wall-clock time per request rather than let it stall the
+# response indefinitely. Segments not resolved within the cap just fall
+# back to coordinate strings; the route itself is never blocked on this.
+# 45s comfortably covers ~20 distinct new locations (a full week's worth of
+# driving segments, typically) at ~1-2s each (network + fair-use delay);
+# a first-time 30-day period with many distinct stops may still exceed it
+# for some segments -- those just fall back, and get cached for next time
+# (the background geocoding thread isn't cancelled by the timeout, so the
+# DB cache still ends up warmed even for calls that fell back).
+PERIOD_ROUTE_GEOCODING_TIMEOUT_SECONDS = 45.0
+
+
+def _driving_segment_endpoints(segments: List[dict]) -> List[Tuple[float, float]]:
+    """Collect (lat, lon) for the start and end point of every "driving"
+    segment, for a single batched reverse-geocoding pass."""
+    coords: List[Tuple[float, float]] = []
+    for s in segments:
+        if s["type"] == "driving" and s["points"]:
+            coords.append((s["points"][0]["latitude"], s["points"][0]["longitude"]))
+            coords.append((s["points"][-1]["latitude"], s["points"][-1]["longitude"]))
+    return coords
+
+
+def _attach_driving_place_names(segments: List[dict], places: Dict[Tuple[float, float], Optional[str]]) -> None:
+    """Attach start_place/end_place/display_name to each "driving" segment
+    in place, from a {(lat, lon): place_name_or_None} lookup (see
+    reverse_geocode_many). Falls back to a coordinate string wherever
+    geocoding didn't resolve (failed, timed out, or no point data)."""
+    for s in segments:
+        if s["type"] != "driving" or not s["points"]:
+            continue
+        start_lat, start_lon = s["points"][0]["latitude"], s["points"][0]["longitude"]
+        end_lat, end_lon = s["points"][-1]["latitude"], s["points"][-1]["longitude"]
+        start_place = places.get((start_lat, start_lon)) or f"{start_lat:.4f}, {start_lon:.4f}"
+        end_place = places.get((end_lat, end_lon)) or f"{end_lat:.4f}, {end_lon:.4f}"
+        s["start_place"] = start_place
+        s["end_place"] = end_place
+        s["display_name"] = f"{start_place} → {end_place}"
 
 
 def verify_device_access(device_id: int, user: User, db: Session) -> Device:
@@ -683,6 +919,107 @@ async def get_device_route_line(
     result["properties"]["device_name"] = device.name
     result["properties"]["device_imei"] = device.imei
     return result
+
+
+@router.get("/{device_id}/period-route")
+async def get_period_route(
+    device_id: int,
+    start: datetime = Query(..., description="Period start (UTC)"),
+    end: datetime = Query(..., description="Period end (UTC)"),
+    simplify: bool = Query(True, description="Simplify driving segments via Douglas-Peucker to reduce point count"),
+    tolerance_meters: float = Query(
+        20.0, ge=1.0, le=1000.0,
+        description="Max deviation in meters a point may contribute before being dropped (only used when simplify=true)"
+    ),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """
+    Aggregate ALL trips/segments for a device within [start, end] into one
+    ordered, typed timeline for Historical Routes: "driving" (route points +
+    distance), "stopped" (location + duration), and "offline" (gap +
+    last/next known position) segments.
+
+    Unlike /route or /route-line, which return one flat time range with no
+    stop/offline typing, this classifies every span of the period using the
+    same settings and thresholds as trip auto-segmentation and the
+    teleport-fix gap logic (location_quality_filters, stop_speed_threshold_kmh,
+    min_stop_segment_minutes, TIME_GAP_SEGMENT_BREAK_SECONDS), so this view
+    never drifts from the rest of the location-quality work.
+    """
+    if end <= start:
+        raise HTTPException(status_code=400, detail="end must be after start")
+    if (end - start) > timedelta(days=MAX_PERIOD_DAYS):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Period exceeds max of {MAX_PERIOD_DAYS} days; narrow the start/end range."
+        )
+
+    device = verify_device_access(device_id, user, db)
+    settings = get_or_create_trip_settings(user.id, db)
+
+    query = db.query(Location).filter(*location_quality_filters(device_id))
+    query = query.filter(Location.timestamp >= start, Location.timestamp <= end)
+    locations = query.order_by(Location.timestamp.asc()).all()
+
+    segments = build_period_segments(
+        locations,
+        stop_speed_threshold_kmh=settings.stop_speed_threshold_kmh,
+        min_stop_seconds=settings.min_stop_segment_minutes * 60,
+        simplify=simplify,
+        tolerance_meters=tolerance_meters,
+    )
+
+    coords = _driving_segment_endpoints(segments)
+    if coords:
+        # `places` is passed into reverse_geocode_many and written into as
+        # each point resolves, so if the overall deadline fires mid-batch we
+        # still have whatever finished before it -- points resolved in time
+        # get real names, only the still-in-flight ones fall back to
+        # coordinates (see reverse_geocode_many's docstring). The background
+        # thread is not cancelled by the timeout and keeps populating both
+        # `places` (harmlessly, after the response has already been built
+        # from a stale read) and the DB cache for next time.
+        places: Dict[Tuple[float, float], Optional[str]] = {}
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(reverse_geocode_many, coords, places),
+                timeout=PERIOD_ROUTE_GEOCODING_TIMEOUT_SECONDS,
+            )
+        except Exception as e:
+            distinct_requested = len(set(coords))
+            logger.warning(
+                "Geocoding for period-route (device %s) did not finish within %.0fs "
+                "(%d/%d distinct point(s) resolved in time): %s",
+                device_id, PERIOD_ROUTE_GEOCODING_TIMEOUT_SECONDS,
+                len(places), distinct_requested, e,
+            )
+        _attach_driving_place_names(segments, places)
+
+    total_distance_km = round(sum(s["distance_km"] for s in segments if s["type"] == "driving"), 3)
+    total_offline_seconds = sum(s["duration_seconds"] for s in segments if s["type"] == "offline")
+
+    return {
+        "device_id": device.id,
+        "device_name": device.name,
+        "device_imei": device.imei,
+        "start_time": start.isoformat(),
+        "end_time": end.isoformat(),
+        "segments": segments,
+        "properties": {
+            "point_count_raw": len(locations),
+            "segment_count": len(segments),
+            "driving_segment_count": sum(1 for s in segments if s["type"] == "driving"),
+            "stopped_segment_count": sum(1 for s in segments if s["type"] == "stopped"),
+            "offline_segment_count": sum(1 for s in segments if s["type"] == "offline"),
+            "total_distance_km": total_distance_km,
+            "total_offline_seconds": total_offline_seconds,
+            "simplified": simplify,
+            "tolerance_meters": tolerance_meters,
+            "stop_speed_threshold_kmh": settings.stop_speed_threshold_kmh,
+            "min_stop_segment_minutes": settings.min_stop_segment_minutes,
+        },
+    }
 
 
 @router.get("/{device_id}/alarms", response_model=List[LocationResponse])

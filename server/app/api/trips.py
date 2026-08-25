@@ -20,33 +20,13 @@ from app.api.locations import (
 )
 from app.services.geocoding import build_trip_display_name
 from app.services.trip_detection import detect_trip_segments, SuggestedTrip
+from app.services.trip_settings_service import get_or_create_trip_settings
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
 
 # Max time for geocoding (2 calls × ~5s + 1s delay + buffer); fallback if exceeded
 GEOCODING_TIMEOUT_SECONDS = 15
-
-# Default trip settings (used when user has none)
-DEFAULT_STOP_SPLITS_MINUTES = 60
-DEFAULT_MIN_TRIP_MINUTES = 5
-DEFAULT_STOP_SPEED_KMH = 5.0
-
-
-def get_or_create_trip_settings(user_id: int, db: Session) -> TripSettings:
-    """Get user's trip settings, or create defaults."""
-    settings = db.query(TripSettings).filter(TripSettings.user_id == user_id).first()
-    if not settings:
-        settings = TripSettings(
-            user_id=user_id,
-            stop_splits_trip_after_minutes=DEFAULT_STOP_SPLITS_MINUTES,
-            minimum_trip_duration_minutes=DEFAULT_MIN_TRIP_MINUTES,
-            stop_speed_threshold_kmh=DEFAULT_STOP_SPEED_KMH,
-        )
-        db.add(settings)
-        db.commit()
-        db.refresh(settings)
-    return settings
 
 
 # --- Schemas ---
@@ -56,6 +36,7 @@ class TripSettingsResponse(BaseModel):
     stop_splits_trip_after_minutes: int
     minimum_trip_duration_minutes: int
     stop_speed_threshold_kmh: float
+    min_stop_segment_minutes: int
 
     class Config:
         from_attributes = True
@@ -65,6 +46,7 @@ class TripSettingsUpdate(BaseModel):
     stop_splits_trip_after_minutes: Optional[int] = None
     minimum_trip_duration_minutes: Optional[int] = None
     stop_speed_threshold_kmh: Optional[float] = None
+    min_stop_segment_minutes: Optional[int] = None
 
     @field_validator("stop_splits_trip_after_minutes")
     @classmethod
@@ -85,6 +67,13 @@ class TripSettingsUpdate(BaseModel):
     def speed_valid(cls, v):
         if v is not None and (v < 0 or v > 200):
             raise ValueError("Must be between 0 and 200 km/h")
+        return v
+
+    @field_validator("min_stop_segment_minutes")
+    @classmethod
+    def min_stop_segment_valid(cls, v):
+        if v is not None and (v < 0 or v > 1440):  # 0 to 24h
+            raise ValueError("Must be between 0 and 1440 minutes")
         return v
 
 
@@ -174,6 +163,7 @@ async def get_trip_settings(
         stop_splits_trip_after_minutes=settings.stop_splits_trip_after_minutes,
         minimum_trip_duration_minutes=settings.minimum_trip_duration_minutes,
         stop_speed_threshold_kmh=settings.stop_speed_threshold_kmh,
+        min_stop_segment_minutes=settings.min_stop_segment_minutes,
     )
 
 
@@ -191,12 +181,15 @@ async def update_trip_settings(
         settings.minimum_trip_duration_minutes = body.minimum_trip_duration_minutes
     if body.stop_speed_threshold_kmh is not None:
         settings.stop_speed_threshold_kmh = body.stop_speed_threshold_kmh
+    if body.min_stop_segment_minutes is not None:
+        settings.min_stop_segment_minutes = body.min_stop_segment_minutes
     db.commit()
     db.refresh(settings)
     return TripSettingsResponse(
         stop_splits_trip_after_minutes=settings.stop_splits_trip_after_minutes,
         minimum_trip_duration_minutes=settings.minimum_trip_duration_minutes,
         stop_speed_threshold_kmh=settings.stop_speed_threshold_kmh,
+        min_stop_segment_minutes=settings.min_stop_segment_minutes,
     )
 
 

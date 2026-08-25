@@ -9,5 +9,6 @@ from app.models.trip import Trip
 from app.models.trip_settings import TripSettings
 from app.models.vehicle import Vehicle
 from app.models.subscription import Subscription, Payment
+from app.models.geocode_cache import GeocodeCache
 
-__all__ = ['Device', 'Location', 'LocationQualityLog', 'User', 'Geofence', 'Trip', 'TripSettings', 'Vehicle', 'Subscription', 'Payment']
+__all__ = ['Device', 'Location', 'LocationQualityLog', 'User', 'Geofence', 'Trip', 'TripSettings', 'Vehicle', 'Subscription', 'Payment', 'GeocodeCache']

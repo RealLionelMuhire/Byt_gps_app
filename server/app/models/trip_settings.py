@@ -24,6 +24,12 @@ class TripSettings(Base):
     # Speed threshold (km/h): below this = "stopped" for segmentation
     stop_speed_threshold_kmh = Column(Float, nullable=False, default=5.0)
 
+    # Minimum duration (minutes) a low-speed run must last to be reported as
+    # its own "stopped" segment in period-route; shorter dips (e.g. a red
+    # light) are folded into the surrounding "driving" segment. Distinct
+    # from stop_splits_trip_after_minutes (when a stop splits into a new trip).
+    min_stop_segment_minutes = Column(Integer, nullable=False, default=10)
+
     # Relationship
     user = relationship("User", backref="trip_settings")
 

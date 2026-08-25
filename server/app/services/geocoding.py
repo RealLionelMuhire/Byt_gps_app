@@ -1,24 +1,34 @@
 """
 Reverse geocoding service using OpenStreetMap Nominatim.
 
-Used for generating human-readable trip names from GPS coordinates.
-Called only when trips are created/finalized, not per GPS point.
+Used for generating human-readable trip names from GPS coordinates, and for
+labeling period-route driving segments. Called only when trips are
+created/finalized or a period-route is requested, never per GPS point.
 
-Nominatim usage policy: max 1 request per second.
+Nominatim usage policy: max 1 request per second, and avoid re-querying the
+same location repeatedly. Resolved place names are cached both in-process
+(fast path within a single call/request) and in the geocode_cache DB table
+(durable across restarts and shared across worker processes), keyed by
+lat/lon rounded to 3 decimals (~100m) -- see GeocodeCache.
 """
 
 import logging
 import time
-from typing import Optional
+from typing import Dict, List, Optional, Tuple
 
 import httpx
+from sqlalchemy.exc import IntegrityError
 
 from app.core.config import settings
+from app.core.database import SessionLocal
+from app.models.geocode_cache import GeocodeCache
 
 logger = logging.getLogger(__name__)
 
-# In-memory cache: (rounded_lat, rounded_lon) -> place_name
-# Rounded to 3 decimals (~111m) to balance uniqueness vs cache hits
+# In-memory cache: (rounded_lat, rounded_lon) -> place_name. Fast path on
+# top of the DB cache -- avoids a DB round-trip for repeats within the same
+# process/request. Cleared on restart; the DB cache (GeocodeCache) is what
+# survives restarts and is shared across worker processes.
 _CACHE: dict[tuple[float, float], Optional[str]] = {}
 _CACHE_PRECISION = 3
 
@@ -81,17 +91,48 @@ def _format_fallback(lat: float, lon: float) -> str:
     return f"{lat:.4f}, {lon:.4f}"
 
 
-def reverse_geocode(lat: float, lon: float) -> Optional[str]:
-    """
-    Reverse-geocode a single point via Nominatim.
+def _db_cache_get(lat_rounded: float, lon_rounded: float) -> Optional[str]:
+    """Look up a rounded lat/lon in the persistent geocode cache."""
+    db = SessionLocal()
+    try:
+        row = (
+            db.query(GeocodeCache)
+            .filter(GeocodeCache.lat == lat_rounded, GeocodeCache.lon == lon_rounded)
+            .first()
+        )
+        return row.place_name if row else None
+    except Exception as e:
+        logger.warning("Geocode DB cache lookup failed: %s", e)
+        return None
+    finally:
+        db.close()
 
-    Returns a short place name (e.g. "Muhoza, Musanze") or None on error.
-    Does NOT raise; errors are logged and return None.
+
+def _db_cache_put(lat_rounded: float, lon_rounded: float, place_name: str) -> None:
+    """Persist a resolved place name to the geocode cache. Safe to call
+    concurrently from multiple processes -- a unique-constraint collision
+    just means another process already cached this point, which is fine."""
+    db = SessionLocal()
+    try:
+        db.add(GeocodeCache(lat=lat_rounded, lon=lon_rounded, place_name=place_name))
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+    except Exception as e:
+        db.rollback()
+        logger.warning("Failed to persist geocode cache entry: %s", e)
+    finally:
+        db.close()
+
+
+def _reverse_geocode_network(lat: float, lon: float) -> Optional[str]:
+    """
+    Perform the actual Nominatim HTTP call for (lat, lon). Caches the
+    result in-memory always, and in the DB cache only on success (a failed
+    lookup isn't a stable fact worth persisting forever -- it's retried
+    next time instead).
     """
     cache_key = (_round_coord(lat), _round_coord(lon))
-    if cache_key in _CACHE:
-        return _CACHE[cache_key]
-
     url = f"{settings.NOMINATIM_BASE_URL}/reverse"
     params = {"lat": lat, "lon": lon, "format": "json", "addressdetails": 1}
 
@@ -115,7 +156,70 @@ def reverse_geocode(lat: float, lon: float) -> Optional[str]:
     address = data.get("address") or {}
     place_name = _extract_place_name(address)
     _CACHE[cache_key] = place_name
+    if place_name:
+        _db_cache_put(cache_key[0], cache_key[1], place_name)
     return place_name
+
+
+def reverse_geocode(lat: float, lon: float) -> Optional[str]:
+    """
+    Reverse-geocode a single point via Nominatim (cache-first: in-memory,
+    then the DB cache, then a live network call).
+
+    Returns a short place name (e.g. "Muhoza, Musanze") or None on error.
+    Does NOT raise; errors are logged and return None.
+    """
+    return reverse_geocode_many([(lat, lon)])[(lat, lon)]
+
+
+def reverse_geocode_many(
+    coords: List[Tuple[float, float]],
+    results: Optional[Dict[Tuple[float, float], Optional[str]]] = None,
+) -> Dict[Tuple[float, float], Optional[str]]:
+    """
+    Reverse-geocode multiple points, returned keyed by the exact (lat, lon)
+    pairs given (duplicates included, so callers don't need to dedupe
+    first). Internally dedupes by rounded cache key (~100m cell -- see
+    _CACHE_PRECISION), so distinct inputs landing in the same cell share one
+    lookup / one Nominatim call.
+
+    Sleeps 1s only immediately before an actual Nominatim network call
+    (never for cache hits), so a batch of mostly-cached points isn't
+    throttled for repeats -- only genuinely new locations pay the fair-use
+    delay, in line with Nominatim's max-1-req/sec policy.
+
+    If `results` is passed in, entries are written into it as each point
+    resolves rather than only being visible once the whole batch completes.
+    Callers that run this in a background thread under an overall deadline
+    (e.g. asyncio.wait_for around asyncio.to_thread) should pass their own
+    dict and read it directly after a timeout, instead of only trusting
+    this function's return value -- otherwise points that resolved well
+    before the deadline get thrown away just because a later point in the
+    same batch was still in flight when the deadline fired.
+    """
+    if results is None:
+        results = {}
+    resolved_by_key: Dict[Tuple[float, float], Optional[str]] = {}
+    made_network_call = False
+
+    for lat, lon in coords:
+        key = (_round_coord(lat), _round_coord(lon))
+        if key not in resolved_by_key:
+            if key in _CACHE:
+                resolved_by_key[key] = _CACHE[key]
+            else:
+                db_hit = _db_cache_get(*key)
+                if db_hit is not None:
+                    _CACHE[key] = db_hit
+                    resolved_by_key[key] = db_hit
+                else:
+                    if made_network_call:
+                        time.sleep(1)
+                    resolved_by_key[key] = _reverse_geocode_network(lat, lon)
+                    made_network_call = True
+        results[(lat, lon)] = resolved_by_key[key]
+
+    return results
 
 
 def build_trip_display_name(
