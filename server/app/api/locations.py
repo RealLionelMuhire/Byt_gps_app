@@ -305,6 +305,15 @@ def douglas_peucker(points: List["Location"], epsilon: float) -> List["Location"
 # reject rather than silently truncate so callers know to narrow the range.
 MAX_PERIOD_DAYS = 30
 
+# How far back /since-last-stop looks to find the device's most recent
+# qualifying stop. Bounds the query so this stays a quick live-trail lookup
+# rather than paging through a device's whole history; comfortably covers a
+# full day's park/drive/re-park cycle for a vehicle that stops at least
+# daily. If no qualifying stop is found within this window, the earliest
+# point in the window is used as the trail start instead (see
+# get_route_since_last_stop).
+SINCE_LAST_STOP_LOOKBACK_HOURS = 48
+
 # Backstop for a "driving" segment that's still too large after (optional)
 # Douglas-Peucker simplification. DP alone handles the common case; this
 # only kicks in on pathologically dense/noisy segments.
@@ -457,6 +466,69 @@ def build_period_segments(
             result.append(_make_offline_segment(offline_gaps[idx], seg[-1], gap_segments[idx + 1][0]))
 
     return result
+
+
+def find_since_last_stop_window(
+    locations: List["Location"],
+    stop_speed_threshold_kmh: float,
+    min_stop_seconds: float,
+    fallback_start: datetime,
+) -> Tuple[List["Location"], datetime, Optional[dict], bool]:
+    """
+    Find the device's most recent qualifying stop within `locations`
+    (chronologically-ordered, quality-filtered, already bounded to the
+    caller's lookback window) and the live trail since it, for
+    /since-last-stop.
+
+    Gap-segments first (so a stop run never spans an offline gap), then
+    scans segments newest -> oldest so the most recent qualifying stop wins
+    even if the latest gap-segment (e.g. since coming back online) has no
+    stop of its own yet.
+
+    Returns (trail_locations, since_time, last_stop, currently_stopped):
+      - trail_locations: points from the stop's end (inclusive) to the end
+        of `locations`, or [] if still within that stop (no movement since)
+      - since_time: timestamp the trail starts from (the stop's end time,
+        or the earliest available point / fallback_start if no qualifying
+        stop was found)
+      - last_stop: {start_time, end_time, latitude, longitude} (centroid)
+        of the most recent qualifying stop, or None if none was found
+      - currently_stopped: True if the device hasn't moved since that stop
+    """
+    gap_segments = segment_locations_by_gap(locations)
+    seg_offsets = []
+    cursor = 0
+    for seg in gap_segments:
+        seg_offsets.append(cursor)
+        cursor += len(seg)
+
+    for seg_idx in range(len(gap_segments) - 1, -1, -1):
+        seg = gap_segments[seg_idx]
+        stop_runs = [
+            (s, e) for (s, e) in find_low_speed_runs(seg, stop_speed_threshold_kmh)
+            if (seg[e - 1].timestamp - seg[s].timestamp).total_seconds() >= min_stop_seconds
+        ]
+        if stop_runs:
+            s, e = stop_runs[-1]
+            last_stop = {
+                "start_time": seg[s].timestamp.isoformat(),
+                "end_time": seg[e - 1].timestamp.isoformat(),
+                "latitude": sum(p.latitude for p in seg[s:e]) / (e - s),
+                "longitude": sum(p.longitude for p in seg[s:e]) / (e - s),
+            }
+            # Only "still stopped" if this is the newest segment and the
+            # stop run reaches its last point — no movement (and no new
+            # offline gap) since.
+            currently_stopped = (seg_idx == len(gap_segments) - 1 and e == len(seg))
+            trail_start_idx = seg_offsets[seg_idx] + (e - 1)
+            trail_locations = [] if currently_stopped else locations[trail_start_idx:]
+            return trail_locations, locations[trail_start_idx].timestamp, last_stop, currently_stopped
+
+    if locations:
+        # No qualifying stop within the lookback window — fall back to the
+        # earliest point available rather than returning nothing.
+        return locations, locations[0].timestamp, None, False
+    return [], fallback_start, None, False
 
 
 # Geocoding a whole period could, worst case, hit many genuinely distinct
@@ -770,34 +842,22 @@ async def get_location_quality_log(
     )
 
 
-@router.get("/{device_id}/route")
-async def get_device_route(
-    device_id: int,
-    start_time: Optional[datetime] = Query(None),
-    end_time: Optional[datetime] = Query(None),
-    simplify: bool = Query(False, description="Simplify route via Douglas-Peucker to reduce point count"),
-    tolerance_meters: float = Query(
-        20.0, ge=1.0, le=1000.0,
-        description="Max deviation in meters a point may contribute before being dropped (only used when simplify=true)"
-    ),
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-):
-    """Get device route (optimized for map display)."""
-    device = verify_device_access(device_id, user, db)
-
-    query = db.query(Location).filter(*location_quality_filters(device_id))
-
-    if start_time:
-        query = query.filter(Location.timestamp >= start_time)
-    else:
-        start_time = datetime.utcnow() - timedelta(hours=24)
-        query = query.filter(Location.timestamp >= start_time)
-
-    if end_time:
-        query = query.filter(Location.timestamp <= end_time)
-
-    locations = query.order_by(Location.timestamp.asc()).all()
+def _build_route_response(
+    device: "Device",
+    locations: List["Location"],
+    start_time: datetime,
+    end_time: datetime,
+    simplify: bool,
+    tolerance_meters: float,
+) -> dict:
+    """
+    Build the simplified-route FeatureCollection shared by /route and
+    /since-last-stop: segment by gap, then (optionally) Douglas-Peucker
+    simplify within each segment — never blending simplification across a
+    segment break. Caller is responsible for pre-filtering to
+    quality-passing, in-range, chronologically-ordered locations (see
+    location_quality_filters).
+    """
     original_point_count = len(locations)
     epsilon_deg = tolerance_meters / METERS_PER_DEGREE
 
@@ -848,7 +908,7 @@ async def get_device_route(
             "device_id": device.id,
             "device_name": device.name,
             "start_time": start_time.isoformat(),
-            "end_time": (end_time or datetime.utcnow()).isoformat(),
+            "end_time": end_time.isoformat(),
             "point_count": len(features),
             "simplified": simplify,
             "original_point_count": original_point_count,
@@ -856,6 +916,40 @@ async def get_device_route(
             "offline_seconds": sum(g["gap_seconds"] for g in gaps)
         }
     }
+
+
+@router.get("/{device_id}/route")
+async def get_device_route(
+    device_id: int,
+    start_time: Optional[datetime] = Query(None),
+    end_time: Optional[datetime] = Query(None),
+    simplify: bool = Query(False, description="Simplify route via Douglas-Peucker to reduce point count"),
+    tolerance_meters: float = Query(
+        20.0, ge=1.0, le=1000.0,
+        description="Max deviation in meters a point may contribute before being dropped (only used when simplify=true)"
+    ),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Get device route (optimized for map display)."""
+    device = verify_device_access(device_id, user, db)
+
+    query = db.query(Location).filter(*location_quality_filters(device_id))
+
+    if start_time:
+        query = query.filter(Location.timestamp >= start_time)
+    else:
+        start_time = datetime.utcnow() - timedelta(hours=24)
+        query = query.filter(Location.timestamp >= start_time)
+
+    if end_time:
+        query = query.filter(Location.timestamp <= end_time)
+
+    locations = query.order_by(Location.timestamp.asc()).all()
+
+    return _build_route_response(
+        device, locations, start_time, end_time or datetime.utcnow(), simplify, tolerance_meters
+    )
 
 
 @router.get("/{device_id}/distance", response_model=DistanceResponse)
@@ -1020,6 +1114,61 @@ async def get_period_route(
             "min_stop_segment_minutes": settings.min_stop_segment_minutes,
         },
     }
+
+
+@router.get("/{device_id}/since-last-stop")
+async def get_route_since_last_stop(
+    device_id: int,
+    simplify: bool = Query(False, description="Simplify route via Douglas-Peucker to reduce point count"),
+    tolerance_meters: float = Query(
+        20.0, ge=1.0, le=1000.0,
+        description="Max deviation in meters a point may contribute before being dropped (only used when simplify=true)"
+    ),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """
+    Live "since last stop" trail: the route from the end of the device's
+    most recent sustained stop up to now, in the same FeatureCollection
+    format as /route (see _build_route_response) — including outlier
+    filtering and the simplify/tolerance_meters knobs.
+
+    Finds the stop using find_low_speed_runs (the same stop-detection
+    primitive period-route uses) with the caller's trip settings
+    (stop_speed_threshold_kmh, min_stop_segment_minutes), gap-segmenting
+    first so a run never spans an offline gap. Segments are scanned newest
+    -> oldest so the most recent qualifying stop wins even if the device's
+    latest gap-segment (e.g. since coming back online) has no stop of its
+    own yet.
+
+    If that stop is still ongoing (no movement since), the route is empty —
+    the client shows nothing until real movement resumes. If no qualifying
+    stop is found within SINCE_LAST_STOP_LOOKBACK_HOURS, the trail falls
+    back to the earliest point in that window.
+    """
+    device = verify_device_access(device_id, user, db)
+    settings = get_or_create_trip_settings(user.id, db)
+
+    now = datetime.utcnow()
+    lookback_start = now - timedelta(hours=SINCE_LAST_STOP_LOOKBACK_HOURS)
+
+    query = db.query(Location).filter(*location_quality_filters(device_id))
+    query = query.filter(Location.timestamp >= lookback_start, Location.timestamp <= now)
+    locations = query.order_by(Location.timestamp.asc()).all()
+
+    trail_locations, since_time, last_stop, currently_stopped = find_since_last_stop_window(
+        locations,
+        stop_speed_threshold_kmh=settings.stop_speed_threshold_kmh,
+        min_stop_seconds=settings.min_stop_segment_minutes * 60,
+        fallback_start=lookback_start,
+    )
+
+    response = _build_route_response(device, trail_locations, since_time, now, simplify, tolerance_meters)
+    response["properties"]["last_stop"] = last_stop
+    response["properties"]["currently_stopped"] = currently_stopped
+    response["properties"]["stop_speed_threshold_kmh"] = settings.stop_speed_threshold_kmh
+    response["properties"]["min_stop_segment_minutes"] = settings.min_stop_segment_minutes
+    return response
 
 
 @router.get("/{device_id}/alarms", response_model=List[LocationResponse])
