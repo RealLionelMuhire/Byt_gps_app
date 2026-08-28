@@ -18,7 +18,7 @@ A complete GPS tracking solution supporting **TK903ELE** and **G900LS J16-4G** G
 - **Remote Commands** — Send commands to devices over existing TCP connection (no SMS needed)
 - **Clerk Authentication** — Multi-user support with Clerk JWT integration
 - **Admin Dashboard** — Web UI for device inventory management
-- **Subscription Plans** — Trial / Basic / Fleet plans with Flutterwave payments
+- **Subscription Plans** — Trial / Basic / Fleet plans with IntouchPay mobile money payments
 - **Docker Deployment** — One-command setup with Docker Compose
 
 ## 🔐 Authentication
@@ -197,7 +197,7 @@ Interactive docs: **https://api.track-iq.tech/docs**
 - `GET /api/devices/{imei}/status` — Poll device status (by IMEI)
 - `POST /api/vehicles` — Register vehicle
 - `GET /api/vehicles` — List user's vehicles
-- `POST /api/payments/verify` — Verify Flutterwave payment
+- `POST /api/payments/initiate` — Start IntouchPay mobile money payment
 - `POST /api/subscriptions` — Activate subscription
 - `POST /api/subscriptions/upgrade` — Upgrade plan
 - `GET /api/billing` — Current plan + payment history
@@ -407,7 +407,7 @@ This project is licensed under the MIT License - see the LICENSE file for detail
 - [x] Multi-user support
 - [x] Remote command sending over TCP
 - [x] Trip management with auto-detection
-- [x] Subscription / billing (Flutterwave)
+- [x] Subscription / billing (IntouchPay)
 - [x] Distance calculation, route playback
 - [x] Geofence model (DB schema ready)
 

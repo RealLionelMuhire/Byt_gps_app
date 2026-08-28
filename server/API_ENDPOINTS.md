@@ -321,14 +321,14 @@ List all vehicles belonging to the authenticated user, with live device status.
 
 ---
 
-### `POST /api/payments/verify`
-Server-side Flutterwave payment verification (Step 8, paid plans). Never trust client-side success alone.
+### `POST /api/payments/initiate`
+Start an IntouchPay mobile money collection (Step 8, paid plans). This does NOT confirm payment — it dispatches a USSD approval prompt to the customer's phone and returns immediately. The payment is only confirmed later by `POST /api/webhooks/intouchpay` (or the cron reconciliation job).
 
 **Request:**
 ```json
 {
-  "txRef": "FLW-TX-123456",
-  "planId": "basic"
+  "planId": "basic",
+  "phone": "250781234567"
 }
 ```
 
@@ -337,23 +337,25 @@ Server-side Flutterwave payment verification (Step 8, paid plans). Never trust c
 **Response `200`:**
 ```json
 {
-  "verified": true,
-  "status": "successful"
+  "txRef": "IP1a2b3c4d...",
+  "status": "pending",
+  "message": "Approve the payment on your phone to continue."
 }
 ```
 
-**Response `200` (failed verification):**
+**Response `200` (rejected by IntouchPay):**
 ```json
 {
-  "verified": false,
-  "error": "Payment verification failed"
+  "txRef": "IP1a2b3c4d...",
+  "status": "failed",
+  "message": "Payment request was rejected."
 }
 ```
 
 ---
 
 ### `POST /api/subscriptions`
-Activate a subscription plan for the current user (Step 8). Call after `/api/payments/verify` for paid plans. Free trial does not require payment.
+Activate a subscription plan for the current user (Step 8). For paid plans, call after `/api/payments/initiate` and poll/retry this endpoint until the payment webhook has confirmed it. Free trial does not require payment.
 
 **Request:**
 ```json
@@ -370,7 +372,7 @@ Activate a subscription plan for the current user (Step 8). Call after `/api/pay
 }
 ```
 
-**Response `402`:** Payment required — a successful payment record for this plan must exist before activating a paid subscription. Call `/api/payments/verify` first.
+**Response `402`:** Payment required — a successful payment record for this plan must exist before activating a paid subscription. Call `/api/payments/initiate` and wait for confirmation first.
 
 **Response `409`:** Free trial already used.
 
@@ -712,7 +714,7 @@ Full **payment scheme / subscription mode** picture for a single device — the 
 }
 ```
 
-Payments are the owner's records narrowed to this device's linked plan slug (all of the owner's payments when no plan is linked). Payments are created by the mobile app's Flutterwave verification flow — admins view the scheme, they never record payments manually.
+Payments are the owner's records narrowed to this device's linked plan slug (all of the owner's payments when no plan is linked). Payments are created by the mobile app's IntouchPay payment flow — admins view the scheme, they never record payments manually.
 
 ---
 
@@ -1174,7 +1176,7 @@ Protected by Clerk-based session cookie. Only users with `ADMIN` or `SUPER_ADMIN
 | `GET /admin/logout` | Clear session, redirect to login |
 | `GET /admin/devices` | Device inventory management UI (shows recent rejected connections; `?owner=` filters by assigned client) |
 | `GET /admin/clients` | Client directory — every customer with their assigned devices & plan (`?q=` searches by name/email) |
-| `GET /admin/devices/{imei}/billing` | Per-device payment scheme / subscription mode panel — linked plan (one-time vs recurrent, price, currency, length), owner's subscription state (active/expired/none + expiry), and payment history. Read-only (payments come from Flutterwave verification). |
+| `GET /admin/devices/{imei}/billing` | Per-device payment scheme / subscription mode panel — linked plan (one-time vs recurrent, price, currency, length), owner's subscription state (active/expired/none + expiry), and payment history. Read-only (payments come from the IntouchPay payment flow). |
 | `GET /admin/plans` | Subscription schemes — create, view, and activate/deactivate plans (mobile pricing + billing read from these) |
 | `POST /admin/plans/create` | Create a new subscription scheme (one-time or recurrent, price, currency, length, max devices) |
 | `POST /admin/plans/{plan_id}/toggle` | Activate / deactivate a plan |

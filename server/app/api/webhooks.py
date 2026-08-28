@@ -5,6 +5,7 @@ This module handles real-time webhooks from Clerk to synchronize user deletions.
 """
 
 import logging
+from datetime import datetime
 from fastapi import APIRouter, Depends, HTTPException, Request, Header
 from sqlalchemy.orm import Session
 from svix.webhooks import Webhook, WebhookVerificationError
@@ -17,6 +18,7 @@ from app.models.vehicle import Vehicle
 from app.models.subscription import Subscription, Payment
 from app.models.trip import Trip
 from app.api.auth import claim_pending_client_user
+from app.services.intouchpay import get_transaction_status, classify_status, IntouchPayError
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -191,3 +193,96 @@ async def handle_user_deleted(clerk_user_id: str, db: Session):
         db.rollback()
         logger.error(f"Error while deleting user {clerk_user_id}: {e}")
         raise HTTPException(status_code=500, detail="Database error during deletion")
+
+
+# ── IntouchPay payment callback ────────────────────────────────────────────────
+
+# Ack body IntouchPay requires on every callback, success or not (per the
+# reference guide's "Webhooks & Callbacks" > Implementation section) — return
+# this even when we can't act on the payload, so IntouchPay doesn't retry
+# forever for a reason within our control.
+def _intouch_ack(request_id: str) -> dict:
+    return {"message": "success", "success": True, "request_id": request_id or ""}
+
+
+@router.post("/intouchpay", status_code=200)
+async def intouchpay_webhook(request: Request, db: Session = Depends(get_db)):
+    """
+    IntouchPay payment callback (POST /api/webhooks/intouchpay).
+
+    SECURITY NOTE: this callback carries no signature, shared secret, or
+    documented IP allowlist (see app/services/intouchpay.py module
+    docstring) — the only protection IntouchPay documents is that the
+    callback URL itself must be pre-registered/whitelisted with them. An
+    inbound POST here is therefore NEVER trusted directly: it is used only as
+    a trigger to re-check the transaction via get_transaction_status(), an
+    authenticated server-initiated call, and the Payment row is updated from
+    THAT response — never from this request's body.
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        logger.warning("IntouchPay webhook: invalid/non-JSON body")
+        return _intouch_ack("")
+
+    # Docs show the payload wrapped in "jsonpayload"; tolerate an unwrapped
+    # body too in case that varies between sandbox and production.
+    payload = body.get("jsonpayload", body) if isinstance(body, dict) else {}
+    tx_ref = payload.get("requesttransactionid")
+    provider_tx_id = payload.get("transactionid")
+    callback_status = (payload.get("status") or "").strip().lower()
+
+    logger.info(
+        "IntouchPay webhook received: tx_ref=%s provider_tx=%s status=%s responsecode=%s",
+        tx_ref, provider_tx_id, callback_status, payload.get("responsecode"),
+    )
+
+    if not tx_ref:
+        logger.warning("IntouchPay webhook missing requesttransactionid: %s", payload)
+        return _intouch_ack("")
+
+    payment = db.query(Payment).filter(Payment.tx_ref == tx_ref).first()
+    if not payment:
+        logger.warning("IntouchPay webhook for unknown tx_ref=%s", tx_ref)
+        return _intouch_ack(tx_ref)
+
+    if payment.status != "pending":
+        # Already resolved — IntouchPay may retry delivery; idempotent no-op.
+        logger.info(
+            "IntouchPay webhook for already-resolved payment tx_ref=%s (status=%s)",
+            tx_ref, payment.status,
+        )
+        return _intouch_ack(tx_ref)
+
+    try:
+        status_resp = await get_transaction_status(tx_ref, provider_tx_id)
+        classification = classify_status(status_resp)
+    except IntouchPayError as exc:
+        logger.error("IntouchPay reconciliation call failed for tx_ref=%s: %s", tx_ref, exc)
+        classification = "unknown"
+
+    if classification == "successful":
+        payment.status = "successful"
+        payment.verified_at = datetime.utcnow()
+        db.commit()
+        logger.info("IntouchPay payment confirmed successful: tx_ref=%s", tx_ref)
+    elif classification == "unknown" and callback_status in ("failed", "timeout"):
+        # Reconciliation could not independently confirm success (see the
+        # DOC GAP note in intouchpay.py — no documented decline code), and
+        # the callback itself claims failure/timeout. Safe to mark failed
+        # here even though the callback is unverified: this can only block
+        # re-use of a dead attempt, never grant unearned access, since
+        # activation always requires classification == "successful" above.
+        payment.status = "failed"
+        db.commit()
+        logger.info(
+            "IntouchPay payment marked failed (callback=%s, unconfirmed by reconciliation): tx_ref=%s",
+            callback_status, tx_ref,
+        )
+    else:
+        logger.info(
+            "IntouchPay payment still unresolved (classification=%s, callback=%s): tx_ref=%s — leaving pending for cron reconciliation",
+            classification, callback_status, tx_ref,
+        )
+
+    return _intouch_ack(tx_ref)

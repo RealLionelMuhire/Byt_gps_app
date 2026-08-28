@@ -48,7 +48,7 @@ GPS Tracker Hardware
 | Vehicle management | ✅ Live |
 | Real-time location via WebSocket | ✅ Live |
 | Trip detection & history | ✅ Live |
-| Subscription & billing (Flutterwave) | ✅ Live |
+| Subscription & billing (IntouchPay) | ✅ Live |
 | Admin web dashboard (Clerk login) | ✅ Live |
 | Supabase PostgreSQL | ✅ Live |
 | PostGIS spatial queries | ✅ Live |
@@ -88,7 +88,10 @@ CLERK_SECRET_KEY=sk_test_...
 CLERK_PUBLISHABLE_KEY=pk_test_...
 
 # Payments (optional for local dev)
-FLUTTERWAVE_SECRET_KEY=FLWSECK-...
+INTOUCH_USERNAME=your_username
+INTOUCH_ACCOUNT_NO=your_account_number
+INTOUCH_PARTNER_PASSWORD=your_partner_password
+INTOUCH_CALLBACK_URL=https://yourdomain.com/api/webhooks/intouchpay
 ```
 
 ### 2. Start the server
@@ -184,7 +187,10 @@ User roles are managed via `GET /api/auth/users` (list) and `PUT /api/auth/users
 | `SECRET_KEY` | ✅ | Random 32-byte hex string for signing session cookies |
 | `CLERK_SECRET_KEY` | ✅ | Clerk backend secret (`sk_live_...` or `sk_test_...`) |
 | `CLERK_PUBLISHABLE_KEY` | ✅ | Clerk frontend key (`pk_live_...`) — for admin login page |
-| `FLUTTERWAVE_SECRET_KEY` | For payments | Flutterwave secret key for payment verification |
+| `INTOUCH_USERNAME` | For payments | IntouchPay partner username |
+| `INTOUCH_ACCOUNT_NO` | For payments | IntouchPay account number |
+| `INTOUCH_PARTNER_PASSWORD` | For payments | IntouchPay partner password (hashed before use, never sent raw) |
+| `INTOUCH_CALLBACK_URL` | For payments | Webhook URL registered with IntouchPay for payment confirmation |
 | `ADMIN_SECRET` | Optional | Legacy header secret for `POST /api/auth/admin-create-user` |
 | `DEBUG` | Optional | `True` for local dev (disables HTTPS-only cookies) |
 | `LOG_LEVEL` | Optional | `INFO` (default) or `DEBUG` |
@@ -248,7 +254,7 @@ PORT:   7018
 | Database | PostgreSQL (Supabase) + PostGIS |
 | ORM | SQLAlchemy |
 | Authentication | Clerk (JWT/JWKS) |
-| Payments | Flutterwave |
+| Payments | IntouchPay |
 | Reverse proxy | Nginx + Certbot SSL |
 | Containerisation | Docker + Docker Compose |
 | Deployment | DigitalOcean Droplet |

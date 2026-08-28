@@ -217,7 +217,7 @@ class DeviceOwnerInfo(BaseModel):
 
 
 class PaymentInfo(BaseModel):
-    """A single verified payment (Flutterwave) belonging to the device owner."""
+    """A single verified payment (IntouchPay) belonging to the device owner."""
 
     tx_ref: str
     plan_id: str

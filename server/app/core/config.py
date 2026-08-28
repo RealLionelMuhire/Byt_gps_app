@@ -44,7 +44,16 @@ class Settings(BaseSettings):
 
     # Legacy admin secret (kept for fallback / non-Clerk environments)
     ADMIN_SECRET: Optional[str] = None
-    FLUTTERWAVE_SECRET_KEY: Optional[str] = None
+
+    # IntouchPay (Rwanda mobile money) — see app/services/intouchpay.py
+    # Sandbox and production are different hosts (not just different paths) —
+    # keep this True until a real test transaction has been confirmed working,
+    # then switch to False and swap in the live credentials.
+    INTOUCH_SANDBOX: bool = True
+    INTOUCH_USERNAME: Optional[str] = None
+    INTOUCH_ACCOUNT_NO: Optional[str] = None
+    INTOUCH_PARTNER_PASSWORD: Optional[str] = None
+    INTOUCH_CALLBACK_URL: Optional[str] = None
 
     @property
     def admin_user_ids(self) -> set:

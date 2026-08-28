@@ -556,7 +556,7 @@ async def admin_device_billing(request: Request, imei: str, db: Session = Depend
     Shows the linked plan (one-time vs recurrent, price, currency, length),
     the owner's subscription state (active / expired / none with expiry), and
     the payment history that matches this device's plan. Read-only — payments
-    are created via the Flutterwave verification flow in the mobile app, so
+    are created via the IntouchPay payment flow in the mobile app, so
     the admin only views the scheme, never records payments manually.
     """
     if not _check_admin(request, db):

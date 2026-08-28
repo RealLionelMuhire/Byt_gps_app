@@ -6,17 +6,21 @@ Routes:
     POST /api/devices/pair       — Step 5: pair GPS device by IMEI
     GET  /api/devices/{imei}/status — Step 6: poll for first signal
     POST /api/vehicles           — Step 7: register vehicle
-    POST /api/payments/verify    — Step 8 (paid): server-side Flutterwave verify
-    POST /api/subscriptions      — Step 8: activate plan
+    POST /api/payments/initiate  — Step 8 (paid): async mobile money request via
+                                    IntouchPay; the payment is only confirmed later
+                                    by POST /api/webhooks/intouchpay
+    POST /api/subscriptions      — Step 8: activate plan (checks for a
+                                    Payment row with status="successful",
+                                    however it got there)
 
 All routes require a valid Clerk Bearer token (via require_auth dependency).
 """
 
 import logging
+import uuid
 from datetime import datetime, timedelta
 from typing import Optional
 
-import httpx
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -24,7 +28,6 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from app.core.database import get_db
 from app.core.auth import require_auth
-from app.core.config import settings
 from app.models.user import User, Role
 from app.models.device import Device
 from app.models.vehicle import Vehicle
@@ -32,6 +35,7 @@ from app.models.subscription import Subscription, Payment
 from app.api.devices import _check_pair_rate_limit
 from app.api.auth import claim_pending_client_user
 from app.api.subscriptions import plan_config, plan_purchasable
+from app.services.intouchpay import request_payment as intouch_request_payment, IntouchPayError
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -79,15 +83,15 @@ class VehicleResponse(BaseModel):
     vehicleId: int
 
 
-class PaymentVerifyRequest(BaseModel):
-    txRef:  str
+class PaymentInitiateRequest(BaseModel):
     planId: str
+    phone:  str  # mobile money number, e.g. "250781234567"
 
 
-class PaymentVerifyResponse(BaseModel):
-    verified: bool
-    status:   Optional[str] = None
-    error:    Optional[str] = None
+class PaymentInitiateResponse(BaseModel):
+    txRef:  str
+    status: str   # "pending" | "failed"
+    message: Optional[str] = None
 
 
 class SubscriptionRequest(BaseModel):
@@ -370,24 +374,25 @@ async def create_vehicle(
         raise HTTPException(status_code=500, detail="Database error")
 
 
-# ── Endpoint 5: POST /api/payments/verify  (Step 8, paid plans) ───────────────
+# ── Endpoint 5: POST /api/payments/initiate  (Step 8, paid plans, IntouchPay) ──
 
-@router.post("/payments/verify", response_model=PaymentVerifyResponse)
-async def verify_payment(
-    body: PaymentVerifyRequest,
+@router.post("/payments/initiate", response_model=PaymentInitiateResponse)
+async def initiate_payment(
+    body: PaymentInitiateRequest,
     clerk_user_id: str = Depends(require_auth),
     db: Session = Depends(get_db),
 ):
     """
-    Server-side Flutterwave payment verification.
+    Start an IntouchPay mobile money collection.
 
-    NEVER trust client-side success alone.
-    This calls the Flutterwave API with the secret key and verifies:
-      - transaction status is "successful"
-      - currency is RWF
-      - amount matches the plan price
-
-    Requires FLUTTERWAVE_SECRET_KEY in server .env (never in the app).
+    This does NOT confirm payment — it only dispatches the USSD approval
+    prompt to the customer's phone and returns immediately. The Payment row
+    is created with status="pending" and
+    is only ever moved to "successful" by POST /api/webhooks/intouchpay (or,
+    if that never arrives, by the cron reconciliation job in
+    scripts/cron_expiry.py). The mobile app must poll/retry
+    POST /api/subscriptions afterwards — that endpoint already requires a
+    Payment with status="successful" for paid plans and is unchanged.
     """
     if not plan_purchasable(db, body.planId):
         raise HTTPException(
@@ -395,56 +400,63 @@ async def verify_payment(
             detail="Invalid or unavailable planId — choose an active plan from the pricing screen.",
         )
 
+    phone = body.phone.strip()
+    if not phone:
+        raise HTTPException(status_code=400, detail="phone is required")
+
     cfg = plan_config(db, body.planId)
 
-    if not settings.FLUTTERWAVE_SECRET_KEY:
-        logger.warning("FLUTTERWAVE_SECRET_KEY not set — skipping live verification (test mode)")
-        # In test mode, trust the client (remove this branch in production)
-        return PaymentVerifyResponse(verified=True, status="successful")
+    # Our own reference — IntouchPay requires this to be globally unique
+    # across every request ever sent to them.
+    tx_ref = f"IP{uuid.uuid4().hex}"
 
-    url = f"https://api.flutterwave.com/v3/transactions/verify_by_reference?tx_ref={body.txRef}"
     try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            resp = await client.get(
-                url,
-                headers={"Authorization": f"Bearer {settings.FLUTTERWAVE_SECRET_KEY}"},
-            )
-            fw = resp.json()
-    except Exception as exc:
-        logger.error("Flutterwave API error: %s", exc)
-        raise HTTPException(status_code=502, detail="Could not reach Flutterwave. Retry later.")
+        resp = await intouch_request_payment(
+            amount=cfg["price"],
+            phone=phone,
+            transaction_id=tx_ref,
+        )
+    except IntouchPayError as exc:
+        logger.error("IntouchPay requestpayment error for planId=%s user=%s: %s", body.planId, clerk_user_id, exc)
+        raise HTTPException(status_code=502, detail="Could not reach IntouchPay. Retry later.")
 
-    data = fw.get("data", {})
-    amount_ok  = data.get("amount", 0) >= cfg["price"]
-    status_ok  = data.get("status") == "successful"
-    currency_ok = data.get("currency") == cfg["currency"]
+    accepted = bool(resp.get("success")) and resp.get("responsecode") == "1000"
+    status = "pending" if accepted else "failed"
 
-    if not (fw.get("status") == "success" and status_ok and currency_ok and amount_ok):
-        logger.warning("Payment verification FAILED for txRef=%s: %s", body.txRef, fw)
-        return PaymentVerifyResponse(verified=False, error="Payment verification failed")
-
-    # Persist payment record (upsert on tx_ref to prevent duplicates)
     try:
-        existing_payment = db.query(Payment).filter(Payment.tx_ref == body.txRef).first()
-        if not existing_payment:
-            payment = Payment(
-                clerk_user_id=clerk_user_id,
-                tx_ref=body.txRef,
-                plan_id=body.planId,
-                amount=data.get("amount", 0),
-                currency="RWF",
-                status="successful",
-                verified_at=datetime.utcnow(),
-            )
-            db.add(payment)
-            db.commit()
+        payment = Payment(
+            clerk_user_id=clerk_user_id,
+            tx_ref=tx_ref,
+            plan_id=body.planId,
+            amount=cfg["price"],
+            currency=cfg["currency"],
+            status=status,
+            # Not yet "verified" — this timestamp marks when the request was
+            # initiated. It's overwritten with the real confirmation time once
+            # the webhook (or cron reconciliation) confirms success. Reusing
+            # this column avoids a schema change; Payment has no separate
+            # created_at field and GET /api/billing maps verified_at -> createdAt.
+            verified_at=datetime.utcnow(),
+        )
+        db.add(payment)
+        db.commit()
     except SQLAlchemyError as exc:
         db.rollback()
-        logger.error("DB error saving payment: %s", exc)
-        # Non-fatal: verification already passed, activation can still proceed
+        logger.error("DB error saving pending payment tx_ref=%s: %s", tx_ref, exc)
+        raise HTTPException(status_code=500, detail="Database error")
 
-    logger.info("Payment verified: txRef=%s planId=%s user=%s", body.txRef, body.planId, clerk_user_id)
-    return PaymentVerifyResponse(verified=True, status="successful")
+    if not accepted:
+        logger.warning("IntouchPay requestpayment rejected for tx_ref=%s: %s", tx_ref, resp)
+        return PaymentInitiateResponse(
+            txRef=tx_ref, status="failed",
+            message=resp.get("message") or "Payment request was rejected.",
+        )
+
+    logger.info("IntouchPay payment initiated: tx_ref=%s planId=%s user=%s", tx_ref, body.planId, clerk_user_id)
+    return PaymentInitiateResponse(
+        txRef=tx_ref, status="pending",
+        message=resp.get("message") or "Approve the payment on your phone to continue.",
+    )
 
 
 # ── Endpoint 6: POST /api/subscriptions  (Step 8) ─────────────────────────────
