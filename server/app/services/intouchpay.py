@@ -100,7 +100,12 @@ async def request_payment(amount: float, phone: str, transaction_id: str) -> dic
     The final result only ever arrives via the webhook callback (or a
     get_transaction_status() reconciliation call).
 
-    Raises IntouchPayError on network/transport failure.
+    Raises IntouchPayError only when IntouchPay is unreachable or returns a
+    body that isn't JSON. A structured error (e.g. a bad password) comes back
+    as a normal dict with success=False — IntouchPay uses non-2xx HTTP status
+    codes (e.g. 401) for some of these even though the docs' examples only
+    show 200 responses, so this never uses raise_for_status(): that would
+    discard the diagnostic responsecode/message in the body.
     """
     payload = {
         **_auth_fields(),
@@ -112,15 +117,22 @@ async def request_payment(amount: float, phone: str, transaction_id: str) -> dic
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
             resp = await client.post(_requestpayment_url(), json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-    except httpx.HTTPError as exc:
-        logger.error("IntouchPay requestpayment failed for tx=%s: %s", transaction_id, exc)
+    except httpx.RequestError as exc:
+        logger.error("IntouchPay requestpayment unreachable for tx=%s: %s", transaction_id, exc)
         raise IntouchPayError(str(exc)) from exc
 
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        logger.error(
+            "IntouchPay requestpayment returned non-JSON (status=%s) for tx=%s: %s",
+            resp.status_code, transaction_id, resp.text[:500],
+        )
+        raise IntouchPayError(f"Non-JSON response (HTTP {resp.status_code})") from exc
+
     logger.info(
-        "IntouchPay requestpayment: tx=%s responsecode=%s status=%s",
-        transaction_id, data.get("responsecode"), data.get("status"),
+        "IntouchPay requestpayment: tx=%s http=%s responsecode=%s status=%s",
+        transaction_id, resp.status_code, data.get("responsecode"), data.get("status"),
     )
     return data
 
@@ -138,7 +150,9 @@ async def get_transaction_status(request_transaction_id: str, transaction_id: Op
     sandbox that requesttransactionid alone is sufficient for a lookup before
     relying on this in production.
 
-    Raises IntouchPayError on network/transport failure.
+    Raises IntouchPayError only when IntouchPay is unreachable or returns a
+    body that isn't JSON — see the note in request_payment() about why
+    raise_for_status() is deliberately not used here.
     """
     payload = {
         **_auth_fields(),
@@ -148,15 +162,22 @@ async def get_transaction_status(request_transaction_id: str, transaction_id: Op
     try:
         async with httpx.AsyncClient(timeout=_TIMEOUT) as client:
             resp = await client.post(_status_url(), json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-    except httpx.HTTPError as exc:
-        logger.error("IntouchPay gettransactionstatus failed for tx=%s: %s", request_transaction_id, exc)
+    except httpx.RequestError as exc:
+        logger.error("IntouchPay gettransactionstatus unreachable for tx=%s: %s", request_transaction_id, exc)
         raise IntouchPayError(str(exc)) from exc
 
+    try:
+        data = resp.json()
+    except ValueError as exc:
+        logger.error(
+            "IntouchPay gettransactionstatus returned non-JSON (status=%s) for tx=%s: %s",
+            resp.status_code, request_transaction_id, resp.text[:500],
+        )
+        raise IntouchPayError(f"Non-JSON response (HTTP {resp.status_code})") from exc
+
     logger.info(
-        "IntouchPay gettransactionstatus: tx=%s responsecode=%s status=%s",
-        request_transaction_id, data.get("responsecode"), data.get("status"),
+        "IntouchPay gettransactionstatus: tx=%s http=%s responsecode=%s status=%s",
+        request_transaction_id, resp.status_code, data.get("responsecode"), data.get("status"),
     )
     return data
 
