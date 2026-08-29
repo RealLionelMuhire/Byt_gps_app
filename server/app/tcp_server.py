@@ -6,7 +6,6 @@ Handles binary protocol communication
 
 import asyncio
 import logging
-import httpx
 from typing import Dict, Optional, Set
 from datetime import datetime
 import struct
@@ -17,6 +16,7 @@ from app.models.device import Device
 from app.models.location import Location
 from app.models.location_quality_log import LocationQualityLog
 from app.api.locations import classify_outlier, compute_quality_log_fields
+from app.services.push_notifications import send_push_notification
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
@@ -616,7 +616,8 @@ class TCPServer:
     async def _send_push_notification(self, device_id: int, data: Dict) -> None:
         """
         Send an Expo push notification to the owner of a device when an alarm fires.
-        Looks up the owner's expo_push_token from the DB and posts to the Expo Push API.
+        Looks up the owner's expo_push_token from the DB and posts to the Expo Push API
+        (via the shared app.services.push_notifications helper).
         Non-fatal: any failure is logged but does not affect the WS broadcast.
         """
         ALARM_LABELS: Dict[str, tuple] = {
@@ -636,7 +637,7 @@ class TCPServer:
 
             from app.models.user import User
             user = db.query(User).filter(User.id == device.user_id).first()
-            if not user or not user.expo_push_token:
+            if not user:
                 return
 
             alarm_key = str(data.get("alarm_type", "")).lower()
@@ -646,33 +647,13 @@ class TCPServer:
             )
             body_text = f"{device.name} \u2022 {body_text}"
 
-            push_payload = {
-                "to": user.expo_push_token,
-                "title": title,
-                "body": body_text,
-                "sound": "default",
-                "priority": "high",
-                "channelId": "gps-alarms",
-                "data": {
-                    "type": "alarm",
-                    "device_id": device_id,
-                    "alarm_type": alarm_key,
-                },
-            }
-
-            async with httpx.AsyncClient(timeout=6.0) as client:
-                resp = await client.post(
-                    "https://exp.host/--/api/v2/push/send",
-                    json=push_payload,
-                    headers={"Content-Type": "application/json", "Accept": "application/json"},
-                )
-                if resp.status_code == 200:
-                    logger.info(
-                        "Push notification sent to user %d for device %d (alarm: %s)",
-                        user.id, device_id, alarm_key,
-                    )
-                else:
-                    logger.warning("Expo push API returned %d: %s", resp.status_code, resp.text[:200])
+            await send_push_notification(
+                user,
+                title=title,
+                body=body_text,
+                data={"type": "alarm", "device_id": device_id, "alarm_type": alarm_key},
+                channel_id="gps-alarms",
+            )
 
         except Exception as exc:
             logger.error("Failed to send push notification for device %d: %s", device_id, exc)

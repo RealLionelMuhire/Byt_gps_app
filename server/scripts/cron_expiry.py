@@ -8,8 +8,10 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 
 from app.core.config import settings
 from app.core.database import SessionLocal
-from app.models.subscription import Subscription, Payment
+from app.models.subscription import Subscription, Payment, SubscriptionPlan
+from app.models.user import User
 from app.services.intouchpay import get_transaction_status, classify_status, IntouchPayError
+from app.services.push_notifications import send_push_notification
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -20,6 +22,44 @@ logger = logging.getLogger(__name__)
 # app/api/webhooks.py and app/services/intouchpay.py for why.
 PENDING_RECONCILE_AFTER_MINUTES = 15   # start checking stuck-pending rows after this long
 PENDING_HARD_FAIL_AFTER_MINUTES = 24 * 60  # give up and mark failed after this long
+
+def _expiry_notification_copy(plan_id: str, plan_name: str) -> tuple:
+    if plan_id == "trial":
+        return (
+            "⏳ Your free trial has ended",
+            "Add a payment method to keep tracking your vehicles.",
+        )
+    return (
+        "⚠️ Your plan has expired",
+        f"Your {plan_name} plan has expired. Renew to keep tracking your vehicles.",
+    )
+
+
+async def _notify_expired_users(clerk_user_ids_and_plans: list) -> None:
+    """Send the expiry push notification for each (clerk_user_id, plan_id) pair.
+    Runs after the DB commit so a slow/failing push never blocks or rolls back
+    the subscription-expiry update itself."""
+    if not clerk_user_ids_and_plans:
+        return
+    db = SessionLocal()
+    try:
+        plans_by_slug = {p.slug.lower(): p for p in db.query(SubscriptionPlan).all()}
+        for clerk_user_id, plan_id in clerk_user_ids_and_plans:
+            user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
+            if not user:
+                continue
+            plan = plans_by_slug.get((plan_id or "").lower())
+            plan_name = plan.name if plan else (plan_id or "").capitalize()
+            title, body = _expiry_notification_copy(plan_id, plan_name)
+            await send_push_notification(
+                user,
+                title=title,
+                body=body,
+                data={"type": "subscription_expired", "screen": "plan_upgrade"},
+            )
+    finally:
+        db.close()
+
 
 def check_expired_subscriptions():
     db = SessionLocal()
@@ -34,21 +74,25 @@ def check_expired_subscriptions():
             logger.info("No expired subscriptions found.")
             return
 
+        notify_targets = []
         for sub in expired_subs:
             logger.info(f"Expiring subscription for user {sub.clerk_user_id} (plan {sub.plan_id})")
             sub.status = "expired"
             sub.updated_at = datetime.utcnow()
-            
-            # Optional: send push notification via FCM here.
-            # send_fcm_notification(sub.clerk_user_id, "Plan expired", "Renew your plan to continue tracking your vehicles.", {"screen": "plan_upgrade"})
+            notify_targets.append((sub.clerk_user_id, sub.plan_id))
 
         db.commit()
         logger.info(f"Successfully expired {len(expired_subs)} subscriptions.")
     except Exception as e:
         db.rollback()
         logger.error(f"Error while checking expired subscriptions: {e}")
+        return
     finally:
         db.close()
+
+    # Notify after the DB commit — a slow/failing push must never block or
+    # roll back the subscription-expiry update itself.
+    asyncio.run(_notify_expired_users(notify_targets))
 
 async def _reconcile_pending_intouchpay_payments_async():
     db = SessionLocal()
