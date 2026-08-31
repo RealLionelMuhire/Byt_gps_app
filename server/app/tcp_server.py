@@ -12,6 +12,7 @@ import struct
 
 from app.protocol_parser import ProtocolParser
 from app.core.database import SessionLocal
+from app.models.alert_settings import AlertSettings
 from app.models.device import Device
 from app.models.location import Location
 from app.models.location_quality_log import LocationQualityLog
@@ -619,6 +620,14 @@ class TCPServer:
         Looks up the owner's expo_push_token from the DB and posts to the Expo Push API
         (via the shared app.services.push_notifications helper).
         Non-fatal: any failure is logged but does not affect the WS broadcast.
+
+        Filtered by AlertSettings (per-device push preferences \u2014 see
+        app/models/alert_settings.py): master switch, per-alarm-type mute,
+        and a min-severity threshold. A device with no AlertSettings row
+        gets everything (that's the model's documented default). This
+        filtering applies to the push path only \u2014 the WS broadcast in
+        broadcast_alarm() already happened before this method is called and
+        is unaffected.
         """
         ALARM_LABELS: Dict[str, tuple] = {
             "sos":          ("\U0001f198 SOS Alert",         "Emergency SOS triggered"),
@@ -627,6 +636,30 @@ class TCPServer:
             "acc":          ("\U0001f511 Ignition Change",    "Vehicle ignition changed state"),
             "overspeed":    ("\u26a1 Overspeed Alert",        "Vehicle exceeded the speed limit"),
             "displacement": ("\U0001f4cd Displacement Alert", "Vehicle moved outside the allowed radius"),
+        }
+
+        # Fixed severity per alarm type \u2014 not stored anywhere, just used to
+        # compare against AlertSettings.min_push_severity. Unknown alarm
+        # types (not in this dict) default to "medium" so a new alarm type
+        # isn't silently swallowed by a "high"-only filter nor always able
+        # to bypass a "medium" filter.
+        ALARM_SEVERITY: Dict[str, str] = {
+            "sos": "high",
+            "overspeed": "high",
+            "displacement": "high",
+            "acc": "medium",
+            "vibration": "low",
+            "low_battery": "low",
+        }
+        _SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2}
+
+        ALARM_SETTING_FIELDS = {
+            "sos": "sos_push_enabled",
+            "vibration": "vibration_push_enabled",
+            "low_battery": "low_battery_push_enabled",
+            "acc": "acc_push_enabled",
+            "overspeed": "overspeed_push_enabled",
+            "displacement": "displacement_push_enabled",
         }
 
         db = SessionLocal()
@@ -641,6 +674,21 @@ class TCPServer:
                 return
 
             alarm_key = str(data.get("alarm_type", "")).lower()
+
+            alert_settings = db.query(AlertSettings).filter(AlertSettings.device_id == device_id).first()
+            if alert_settings is not None:
+                if not alert_settings.push_notifications_enabled:
+                    return
+
+                setting_field = ALARM_SETTING_FIELDS.get(alarm_key)
+                if setting_field is not None and not getattr(alert_settings, setting_field):
+                    return
+
+                severity = ALARM_SEVERITY.get(alarm_key, "medium")
+                min_rank = _SEVERITY_RANK.get(alert_settings.min_push_severity, 0)
+                if _SEVERITY_RANK[severity] < min_rank:
+                    return
+
             title, body_text = ALARM_LABELS.get(
                 alarm_key,
                 ("\U0001f6a8 Device Alarm", f"Alarm triggered: {alarm_key}")

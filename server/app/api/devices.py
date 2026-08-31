@@ -14,6 +14,7 @@ from collections import defaultdict
 
 from app.core.database import get_db
 from app.core.auth import require_auth, require_admin, get_current_user, require_device_access
+from app.models.alert_settings import AlertSettings
 from app.models.device import Device
 from app.models.location import Location
 from app.models.trip import Trip
@@ -1073,3 +1074,125 @@ async def get_device_diagnostics(
             last_interval_seconds=last_interval_seconds
         )
     )
+
+
+# ── Alert settings (per-device push-notification preferences) ─────────────
+# app/models/alert_settings.py: master switch, per-alarm-type mute,
+# min_push_severity. Read by TCPConnection._send_push_notification
+# (app/tcp_server.py) to filter outgoing push notifications — before these
+# two endpoints, nothing outside that one call site ever touched this
+# table; there was no way for a client to read or write it.
+
+_VALID_MIN_PUSH_SEVERITY = {"low", "medium", "high"}
+
+
+class AlertSettingsResponse(BaseModel):
+    device_id: int
+    push_notifications_enabled: bool
+    sos_push_enabled: bool
+    vibration_push_enabled: bool
+    low_battery_push_enabled: bool
+    acc_push_enabled: bool
+    overspeed_push_enabled: bool
+    displacement_push_enabled: bool
+    min_push_severity: str
+
+
+class AlertSettingsUpdate(BaseModel):
+    """Partial update — every field optional, only what's provided is
+    changed. Same convention as TripSettingsUpdate (app/api/trips.py)."""
+
+    push_notifications_enabled: Optional[bool] = None
+    sos_push_enabled: Optional[bool] = None
+    vibration_push_enabled: Optional[bool] = None
+    low_battery_push_enabled: Optional[bool] = None
+    acc_push_enabled: Optional[bool] = None
+    overspeed_push_enabled: Optional[bool] = None
+    displacement_push_enabled: Optional[bool] = None
+    min_push_severity: Optional[str] = None
+
+    @field_validator("min_push_severity")
+    @classmethod
+    def min_push_severity_valid(cls, v: Optional[str]) -> Optional[str]:
+        if v is not None and v not in _VALID_MIN_PUSH_SEVERITY:
+            raise ValueError(
+                f"min_push_severity must be one of: {', '.join(sorted(_VALID_MIN_PUSH_SEVERITY))}"
+            )
+        return v
+
+
+def _alert_settings_response(
+    device_id: int, settings_row: Optional[AlertSettings]
+) -> AlertSettingsResponse:
+    """Row-or-defaults — mirrors AlertSettings' own documented convention
+    ("absence of a row means everything enabled")."""
+    if settings_row is None:
+        return AlertSettingsResponse(
+            device_id=device_id,
+            push_notifications_enabled=True,
+            sos_push_enabled=True,
+            vibration_push_enabled=True,
+            low_battery_push_enabled=True,
+            acc_push_enabled=True,
+            overspeed_push_enabled=True,
+            displacement_push_enabled=True,
+            min_push_severity="low",
+        )
+    return AlertSettingsResponse(
+        device_id=device_id,
+        push_notifications_enabled=settings_row.push_notifications_enabled,
+        sos_push_enabled=settings_row.sos_push_enabled,
+        vibration_push_enabled=settings_row.vibration_push_enabled,
+        low_battery_push_enabled=settings_row.low_battery_push_enabled,
+        acc_push_enabled=settings_row.acc_push_enabled,
+        overspeed_push_enabled=settings_row.overspeed_push_enabled,
+        displacement_push_enabled=settings_row.displacement_push_enabled,
+        min_push_severity=settings_row.min_push_severity,
+    )
+
+
+@router.get("/{device_id}/alert_settings", response_model=AlertSettingsResponse)
+async def get_alert_settings(
+    device_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Read this device's push-notification preferences (master switch,
+    per-alarm-type mute, min_push_severity)."""
+    device = db.query(Device).filter(Device.id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    require_device_access(device, user)
+
+    settings_row = db.query(AlertSettings).filter(AlertSettings.device_id == device_id).first()
+    return _alert_settings_response(device_id, settings_row)
+
+
+@router.put("/{device_id}/alert_settings", response_model=AlertSettingsResponse)
+async def update_alert_settings(
+    device_id: int,
+    body: AlertSettingsUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Update this device's push-notification preferences. Creates the row
+    (with the documented all-enabled defaults) on first write for a device
+    that's never had one — same get-or-create convention as
+    TripSettings/get_or_create_trip_settings (app/api/trips.py)."""
+    device = db.query(Device).filter(Device.id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    require_device_access(device, user)
+
+    settings_row = db.query(AlertSettings).filter(AlertSettings.device_id == device_id).first()
+    if settings_row is None:
+        settings_row = AlertSettings(device_id=device_id)
+        db.add(settings_row)
+
+    update_data = body.model_dump(exclude_unset=True)
+    for field, value in update_data.items():
+        setattr(settings_row, field, value)
+
+    db.commit()
+    db.refresh(settings_row)
+    return _alert_settings_response(device_id, settings_row)
