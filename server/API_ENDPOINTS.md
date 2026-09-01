@@ -784,63 +784,70 @@ Send any raw SMS-compatible command to a connected device.
 ---
 
 ### `POST /api/devices/{device_id}/alarm/vibration`
-Enable or disable vibration/shock alarm.
+Enable or disable the vibration/motion-sensor alarm (`SENALM`).
 
-**Request:** `{ "enabled": true }`
-
----
-
-### `POST /api/devices/{device_id}/alarm/lowbattery`
-Enable or disable low battery alarm.
-
-**Request:** `{ "enabled": true }`
+**Request:** `{ "enabled": true, "mode": 0 }` — `mode`: `0`=GPRS only, `1`=SMS+GPRS, `2`=GPRS+SMS+Call. Defaults to `0`.
 
 ---
 
-### `POST /api/devices/{device_id}/alarm/acc`
-Enable or disable ACC (ignition on/off) alarm.
+### `POST /api/devices/{device_id}/alarm/power-cut`
+Enable or disable the power-cut alarm (`POWERALM`) — fires when the device's
+external power is disconnected. **Not** a battery-level alarm (this device
+has no such command); the endpoint used to live at `/alarm/lowbattery` with
+that (incorrect) description.
 
-**Request:** `{ "enabled": true }`
-
----
-
-### `POST /api/devices/{device_id}/alarm/overspeed`
-Enable or disable overspeed alarm with configurable threshold.
-
-**Request:** `{ "enabled": true, "speed_kmh": 100 }`
-
----
-
-### `POST /api/devices/{device_id}/alarm/displacement`
-Enable or disable displacement/movement alarm with configurable radius.
-
-**Request:** `{ "enabled": true, "radius_meters": 200 }`
+**Request:** `{ "enabled": true, "mode": 0, "detect_seconds": 5, "min_charge_seconds": 10 }`
+`mode`: `0`=GPRS only, `1`=SMS+GPRS, `2`=GPRS+SMS+Call. `detect_seconds` (T1, `2-60`):
+power-failure detection time. `min_charge_seconds` (T2, `1-3600`): minimum
+charge time before re-arming.
 
 ---
 
-### `POST /api/devices/{device_id}/alarm/sos`
-Enable or disable SOS alarm.
+### `POST /api/devices/{device_id}/alarm/ignition-on`
+Enable or disable the ignition-**ON** alarm (`ACCALM`) — fires when ACC turns on.
 
-**Request:** `{ "enabled": true }`
+**Request:** `{ "enabled": true, "mode": 0 }` — `mode`: `0`=GPRS, `1`=GPRS+SMS,
+`2`=GPRS+Call, `3`=GPRS+SMS+Call. Defaults to `0`.
 
 ---
+
+### `POST /api/devices/{device_id}/alarm/ignition-off`
+Enable or disable the ignition-**OFF** alarm (`ACCOFFALM`) — fires when ACC
+turns off. A separate, independently-armable alarm from ignition-on above —
+not two states of one setting.
+
+**Request:** same shape as `ignition-on`.
+
+---
+
+> **Removed 2026-09-01** (were never valid for the actual production
+> hardware, G900LS J16-4G — see `docs/usage/CONFIGURATION_GUIDE.md`'s
+> "Device 2" command reference): `POST /alarm/overspeed`,
+> `POST /alarm/displacement`, `POST /alarm/sos`. None has a corresponding
+> SMS command on this device — the previous `speed123456`/`move123456`/
+> `KC123456` strings didn't correspond to anything in its command set. SOS
+> has no software arm/disarm on this hardware at all (the physical button
+> always calls/texts the `CENTER` admin numbers, independent of any
+> setting); overspeed and displacement/geofence alarms aren't in this
+> device's documented command set at all.
 
 ### `POST /api/devices/{device_id}/fuel/cut`
-Cut oil/electricity to immobilize the vehicle. Only safe when speed < 20 km/h.
+Cut power to the relay to immobilize the vehicle (`RELAY,1#`). Only safe
+when speed < 20 km/h.
 
 No request body required.
 
 ---
 
 ### `POST /api/devices/{device_id}/fuel/restore`
-Restore oil/electricity (re-enable vehicle).
+Restore power to the relay (re-enable vehicle) (`RELAY,0#`).
 
 No request body required.
 
 ---
 
 ### `POST /api/devices/{device_id}/query/location`
-Request current location from device (device replies via TCP).
+Request current location from device via `WHERE#` (device replies via TCP).
 
 ---
 

@@ -6,7 +6,7 @@ from typing import Dict, List
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
 import logging
 
 from app.core.database import get_db
@@ -21,9 +21,15 @@ router = APIRouter()
 
 # ── CommandSettings enforcement (confirmation, admin_only, fuel_cut_enabled, rate limit) ──
 
-# The one destructive command in this file — DYD,000000# immobilizes the
-# vehicle (doc §6.4) — matched against CommandSettings.fuel_cut_enabled.
-_CUT_FUEL_COMMAND = "DYD,000000#"
+# The one destructive command in this file — RELAY,1# immobilizes the
+# vehicle. Confirmed against the actual G900LS J16-4G command list (the
+# production hardware — docs/usage/CONFIGURATION_GUIDE.md's "Device 2"
+# section, Fuel/Relay Control): `RELAY,1#` = cut, `RELAY,0#` = resume. The
+# previous DYD,000000#/HFYD,000000# pair came from a generic external GT06
+# protocol spec appendix and does not match this hardware's actual firmware
+# vocabulary — replaced 2026-09-01 after checking against the vendor's own
+# G900LS command sheet.
+_CUT_FUEL_COMMAND = "RELAY,1#"
 
 
 class _DefaultCommandSettings:
@@ -132,18 +138,68 @@ class CommandRequest(BaseModel):
         }
 
 
-class AlarmToggleRequest(BaseModel):
+# ── Alarm-mode request bodies ───────────────────────────────────────────────
+# The G900LS J16-4G command list (docs/usage/CONFIGURATION_GUIDE.md's
+# "Device 2" section) requires an alert-delivery `mode` on every alarm
+# command below — 0/1/2(/3) selecting GPRS-only vs. also SMS and/or a phone
+# call to the CENTER admin numbers. It is not optional in the wire command,
+# so every request model here carries it (defaulted to 0 = GPRS-only, the
+# cheapest option and the only one that's guaranteed to reach this backend
+# — SMS/Call modes notify the CENTER numbers directly from the device,
+# bypassing the server for that leg). No UI currently exposes changing it;
+# raise that as a follow-up if per-alarm delivery-mode selection is wanted.
+
+
+class VibrationAlarmRequest(BaseModel):
     enabled: bool
+    mode: int = 0  # 0=GPRS, 1=SMS+GPRS, 2=GPRS+SMS+Call — SENALM's own range.
+
+    @field_validator("mode")
+    @classmethod
+    def mode_valid(cls, v: int) -> int:
+        if v not in (0, 1, 2):
+            raise ValueError("mode must be 0 (GPRS), 1 (SMS+GPRS), or 2 (GPRS+SMS+Call)")
+        return v
 
 
-class SpeedLimitRequest(BaseModel):
+class IgnitionAlarmRequest(BaseModel):
     enabled: bool
-    speed_kmh: int = 120
+    mode: int = 0  # 0=GPRS,1=GPRS+SMS,2=GPRS+Call,3=GPRS+SMS+Call — ACCALM/ACCOFFALM's range.
+
+    @field_validator("mode")
+    @classmethod
+    def mode_valid(cls, v: int) -> int:
+        if v not in (0, 1, 2, 3):
+            raise ValueError("mode must be between 0 and 3")
+        return v
 
 
-class MovementAlarmRequest(BaseModel):
+class PowerCutAlarmRequest(BaseModel):
     enabled: bool
-    radius_meters: int = 200
+    mode: int = 0  # 0=GPRS, 1=SMS+GPRS, 2=GPRS+SMS+Call — POWERALM's own range.
+    detect_seconds: int = 5  # T1: power-failure detection time, 2-60s.
+    min_charge_seconds: int = 10  # T2: minimum charge time before re-arming, 1-3600s.
+
+    @field_validator("mode")
+    @classmethod
+    def mode_valid(cls, v: int) -> int:
+        if v not in (0, 1, 2):
+            raise ValueError("mode must be 0 (GPRS), 1 (SMS+GPRS), or 2 (GPRS+SMS+Call)")
+        return v
+
+    @field_validator("detect_seconds")
+    @classmethod
+    def detect_seconds_valid(cls, v: int) -> int:
+        if not (2 <= v <= 60):
+            raise ValueError("detect_seconds must be between 2 and 60")
+        return v
+
+    @field_validator("min_charge_seconds")
+    @classmethod
+    def min_charge_seconds_valid(cls, v: int) -> int:
+        if not (1 <= v <= 3600):
+            raise ValueError("min_charge_seconds must be between 1 and 3600")
+        return v
 
 
 def _get_tcp_server(request: Request):
@@ -188,85 +244,93 @@ async def send_raw_command(
 
 
 # ── Convenience endpoints for common alarm operations ──────────────────────
+#
+# All four below are confirmed against the G900LS J16-4G command list
+# (docs/usage/CONFIGURATION_GUIDE.md's "Device 2" section — the actual
+# production hardware). Three alarm types that used to live here —
+# overspeed, displacement, and SOS — were removed 2026-09-01: none of them
+# has a corresponding SMS command on this device.
+#   - SOS has no software arm/disarm at all on the G900LS — the physical
+#     SOS button always calls/texts the CENTER admin numbers regardless of
+#     any setting here. (The device can still report an SOS alarm_type
+#     byte over the wire protocol when the button is pressed — see
+#     app/protocol_parser.py's alarm_names — so it's still meaningful to
+#     mute its *push notification*; that's app/models/alert_settings.py's
+#     concern, unaffected by this change.)
+#   - Overspeed and displacement/geofence alarms are not in this device's
+#     documented command set at all — nothing here can arm or disarm them.
+#     (The GT06 wire protocol does define "Over speed"/"Enter fence"/"Exit
+#     fence" alarm bytes, so the device may still report them via some
+#     undocumented or firmware-default mechanism; alert_settings' mute
+#     toggles for these are left in place speculatively for that reason,
+#     but there's no known way to configure them from this backend.)
 
 
 @router.post("/{device_id}/alarm/vibration")
 async def toggle_vibration_alarm(
     device_id: int,
-    body: AlarmToggleRequest,
+    body: VibrationAlarmRequest,
     request: Request,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """Enable or disable the vibration/shock alarm."""
-    cmd = "vibrate123456 1" if body.enabled else "vibrate123456 0"
+    """Enable or disable the vibration/motion-sensor alarm (SENALM)."""
+    cmd = f"SENALM,ON,{body.mode}#" if body.enabled else "SENALM,OFF#"
     return await _send(device_id, cmd, "vibration alarm", request, db, user)
 
 
-@router.post("/{device_id}/alarm/lowbattery")
-async def toggle_low_battery_alarm(
+@router.post("/{device_id}/alarm/power-cut")
+async def toggle_power_cut_alarm(
     device_id: int,
-    body: AlarmToggleRequest,
+    body: PowerCutAlarmRequest,
     request: Request,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """Enable or disable the low battery alarm."""
-    cmd = "lowbattery123456 on" if body.enabled else "lowbattery123456 off"
-    return await _send(device_id, cmd, "low battery alarm", request, db, user)
+    """Enable or disable the power-cut alarm (POWERALM) — fires when the
+    device's external power is disconnected. Not a battery-level alarm
+    (the G900LS command list has no such command); previously exposed here
+    as "low battery", which was the wrong description for this command.
+    """
+    cmd = (
+        f"POWERALM,ON,{body.mode},{body.detect_seconds},{body.min_charge_seconds},#"
+        if body.enabled
+        else "POWERALM,OFF#"
+    )
+    return await _send(device_id, cmd, "power cut alarm", request, db, user)
 
 
-@router.post("/{device_id}/alarm/acc")
-async def toggle_acc_alarm(
+@router.post("/{device_id}/alarm/ignition-on")
+async def toggle_ignition_on_alarm(
     device_id: int,
-    body: AlarmToggleRequest,
+    body: IgnitionAlarmRequest,
     request: Request,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """Enable or disable the ACC (ignition) on/off alarm."""
-    cmd = "acc123456" if body.enabled else "noacc123456"
-    return await _send(device_id, cmd, "ACC alarm", request, db, user)
+    """Enable or disable the ignition-ON alarm (ACCALM) — fires when ACC
+    turns on. See toggle_ignition_off_alarm for the independent OFF alarm;
+    the G900LS models these as two separate, separately-armable alarms,
+    not one "ignition changed" alarm.
+    """
+    cmd = f"ACCALM,ON,{body.mode}#" if body.enabled else "ACCALM,OFF#"
+    return await _send(device_id, cmd, "ignition-on alarm", request, db, user)
 
 
-@router.post("/{device_id}/alarm/overspeed")
-async def toggle_overspeed_alarm(
+@router.post("/{device_id}/alarm/ignition-off")
+async def toggle_ignition_off_alarm(
     device_id: int,
-    body: SpeedLimitRequest,
+    body: IgnitionAlarmRequest,
     request: Request,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """Enable or disable the overspeed alarm. Set speed_kmh for the threshold."""
-    cmd = f"speed123456 {body.speed_kmh:03d}" if body.enabled else "nospeed123456"
-    return await _send(device_id, cmd, "overspeed alarm", request, db, user)
-
-
-@router.post("/{device_id}/alarm/displacement")
-async def toggle_displacement_alarm(
-    device_id: int,
-    body: MovementAlarmRequest,
-    request: Request,
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-):
-    """Enable or disable the displacement/movement alarm. Set radius_meters for the trigger radius."""
-    cmd = f"move123456 {body.radius_meters:04d}" if body.enabled else "nomove123456"
-    return await _send(device_id, cmd, "displacement alarm", request, db, user)
-
-
-@router.post("/{device_id}/alarm/sos")
-async def configure_sos_alarm(
-    device_id: int,
-    body: AlarmToggleRequest,
-    request: Request,
-    db: Session = Depends(get_db),
-    user: User = Depends(get_current_user),
-):
-    """Configure SOS alarm mode. 0=off, 1=GPRS only, 2=GPRS+SMS, 3=GPRS+SMS+Call."""
-    level = "1" if body.enabled else "0"
-    cmd = f"KC123456 {level}"
-    return await _send(device_id, cmd, "SOS alarm", request, db, user)
+    """Enable or disable the ignition-OFF alarm (ACCOFFALM) — fires when
+    ACC turns off. See toggle_ignition_on_alarm's doc for why this is a
+    separate endpoint rather than a second field on that one.
+    """
+    cmd = f"ACCOFFALM,ON,{body.mode}#" if body.enabled else "ACCOFFALM,OFF#"
+    return await _send(device_id, cmd, "ignition-off alarm", request, db, user)
 
 
 class FuelCutRequest(BaseModel):
@@ -284,7 +348,8 @@ async def cut_fuel(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """Cut oil/electricity (immobilize vehicle). Only works when speed < 20 km/h and GPS is on (doc §6.4).
+    """Cut fuel/relay (immobilize vehicle) via RELAY,1# — the G900LS J16-4G
+    command list's Fuel/Relay Control section.
 
     Requires {"confirm": true} in the body unless CommandSettings.require_confirmation_for_fuel_cut
     is disabled for this device (default: required).
@@ -301,7 +366,7 @@ async def cut_fuel(
             detail='Fuel cut requires confirmation — resend with {"confirm": true}',
         )
 
-    return await _send(device_id, "DYD,000000#", "cut fuel", request, db, user)
+    return await _send(device_id, _CUT_FUEL_COMMAND, "cut fuel", request, db, user)
 
 
 @router.post("/{device_id}/fuel/restore")
@@ -311,8 +376,8 @@ async def restore_fuel(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """Restore oil/electricity (re-enable vehicle) (doc §6.5)."""
-    return await _send(device_id, "HFYD,000000#", "restore fuel", request, db, user)
+    """Restore fuel/relay (re-enable vehicle) via RELAY,0#."""
+    return await _send(device_id, "RELAY,0#", "restore fuel", request, db, user)
 
 
 @router.post("/{device_id}/query/location")
@@ -322,8 +387,8 @@ async def query_location(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """Query current location from device (doc §6.3). Returns lat/lon/speed/course/datetime."""
-    return await _send(device_id, "DWXX#", "query location", request, db, user)
+    """Query current location from device via WHERE# (G900LS command list — returns latitude/longitude by SMS reply)."""
+    return await _send(device_id, "WHERE#", "query location", request, db, user)
 
 
 @router.post("/{device_id}/query/status")
