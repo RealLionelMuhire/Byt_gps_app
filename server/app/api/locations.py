@@ -1210,13 +1210,18 @@ async def get_nearby_devices(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """Find devices near a location, scoped to the caller's own devices (admins see all)."""
+    """Find devices near a location, scoped to the caller's company devices (admins see all)."""
+    from app.models.company import Membership
     query = db.query(Device).filter(
         Device.last_latitude.isnot(None),
         Device.last_longitude.isnot(None)
     )
     if user.role not in (Role.SUPER_ADMIN, Role.ADMIN):
-        query = query.filter(Device.user_id == user.id)
+        member_company_ids = [
+            m.company_id for m in
+            db.query(Membership.company_id).filter(Membership.user_id == user.id).all()
+        ]
+        query = query.filter(Device.company_id.in_(member_company_ids))
     devices = query.all()
 
     nearby = []

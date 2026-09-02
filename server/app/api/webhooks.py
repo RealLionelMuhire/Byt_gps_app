@@ -165,17 +165,28 @@ async def handle_user_deleted(clerk_user_id: str, db: Session):
     logger.info(f"Deleting user {user.id} ({user.email}) due to Clerk webhook.")
 
     try:
-        # Free up the user's devices so they can be paired by someone else
-        devices = db.query(Device).filter(Device.user_id == user.id).all()
-        for device in devices:
-            device.user_id = None
-            # 'in_stock', not 'registered' — this device already proved TCP
-            # connectivity to get to 'sold' in the first place; only its
-            # ownership is being cleared. 'registered' would wrongly claim
-            # it has never connected (see Device model's transition table:
-            # sold -> in_stock on customer removal, never sold -> registered).
-            device.lifecycle = "in_stock"
-            logger.info(f"Freed device {device.imei} from deleted user {user.id}.")
+        # Free up devices owned by companies where this user is the only OWNER
+        # (if there are other owners/members, devices stay with the company)
+        from app.models.company import Membership, Company
+        memberships = db.query(Membership).filter(Membership.user_id == user.id).all()
+        for m in memberships:
+            # Check if there are other owners in this company
+            other_owners = (
+                db.query(Membership)
+                .filter(
+                    Membership.company_id == m.company_id,
+                    Membership.user_id != user.id,
+                    Membership.company_role == 'OWNER',
+                )
+                .first()
+            )
+            if not other_owners:
+                # No other owner — free up company devices
+                devices = db.query(Device).filter(Device.company_id == m.company_id).all()
+                for device in devices:
+                    device.company_id = None
+                    device.lifecycle = "in_stock"
+                    logger.info(f"Freed device {device.imei} from deleted user {user.id} (company {m.company_id}).")
 
         # Delete vehicles belonging to this user
         db.query(Vehicle).filter(Vehicle.clerk_user_id == clerk_user_id).delete(synchronize_session=False)

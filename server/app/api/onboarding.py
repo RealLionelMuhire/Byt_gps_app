@@ -32,7 +32,26 @@ from app.models.user import User, Role
 from app.models.device import Device
 from app.models.vehicle import Vehicle
 from app.models.subscription import Subscription, Payment
+from app.models.company import Membership
 from app.api.devices import _check_pair_rate_limit
+
+
+def _resolve_user_company(clerk_user_id: str, db: Session):
+    """Resolve the authenticated user's company via their membership.
+    Raises 400 if user has no company.
+    """
+    user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found.")
+    membership = (
+        db.query(Membership)
+        .filter(Membership.user_id == user.id)
+        .order_by(Membership.created_at.asc())
+        .first()
+    )
+    if not membership:
+        raise HTTPException(status_code=400, detail="You don't have a company yet. Create one first.")
+    return user, membership.company_id
 from app.api.auth import claim_pending_client_user
 from app.api.subscriptions import plan_config, plan_purchasable
 from app.services.intouchpay import request_payment as intouch_request_payment, IntouchPayError
@@ -202,10 +221,11 @@ async def pair_device(
     db: Session = Depends(get_db),
 ):
     """
-    Pair an existing GPS device to the authenticated user's account.
+    Pair an existing GPS device to the authenticated user's company.
 
     The IMEI must already exist in the `devices` table (pre-loaded by admin).
-    Returns 404 if the IMEI is unknown, 409 if already paired to another user.
+    The user must belong to a company. The device is assigned to that company.
+    Returns 404 if the IMEI is unknown, 409 if already paired to another company.
     """
     # Rate limit: max 5 attempts per IP per 60 seconds
     client_ip = request.client.host if request.client else "unknown"
@@ -225,11 +245,25 @@ async def pair_device(
     if not user:
         raise HTTPException(status_code=404, detail="User not found. Complete profile step first.")
 
-    # Conflict: device already claimed by a different user
-    if device.user_id and device.user_id != user.id:
+    # Resolve user's company via membership
+    membership = (
+        db.query(Membership)
+        .filter(Membership.user_id == user.id)
+        .order_by(Membership.created_at.asc())
+        .first()
+    )
+    if not membership:
+        raise HTTPException(
+            status_code=400,
+            detail="You don't have a company yet. Create one first.",
+        )
+    company_id = membership.company_id
+
+    # Conflict: device already claimed by a different company
+    if device.company_id and device.company_id != company_id:
         raise HTTPException(
             status_code=409,
-            detail="This device is already registered to another account. Contact support if you believe this is an error.",
+            detail="This device is already registered to another company. Contact support if you believe this is an error.",
         )
 
     # Guard: device must have proven it's functional (lifecycle != 'registered')
@@ -254,17 +288,17 @@ async def pair_device(
             )
 
     try:
-        device.user_id    = user.id
-        device.lifecycle  = 'sold'   # Ownership transferred to customer
+        device.company_id = company_id
+        device.lifecycle  = 'sold'   # Ownership transferred to company
         device.updated_at = datetime.utcnow()
 
-        user.onboarding_step = 5
+        user.onboarding_step = 6
         user.updated_at = datetime.utcnow()
 
         db.commit()
         db.refresh(device)
 
-        logger.info("Paired device IMEI=%s to user %s (lifecycle=sold)", imei, clerk_user_id)
+        logger.info("Paired device IMEI=%s to company %d (lifecycle=sold)", imei, company_id)
         return {"deviceId": device.id, "status": device.status, "imei": device.imei, "lifecycle": device.lifecycle}
 
     except SQLAlchemyError as exc:
@@ -283,7 +317,7 @@ async def get_device_status_by_imei(
 ):
     """
     Return current status of a device identified by IMEI.
-    Only returns devices belonging to the authenticated user.
+    Only returns devices belonging to the user's company.
 
     Polled every 5 s by device-wait.tsx — status transitions:
         pending  →  (first GPS packet arrives via TCP)  →  online
@@ -292,14 +326,12 @@ async def get_device_status_by_imei(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    device = db.query(Device).filter(
-        Device.imei == imei,
-        Device.user_id == user.id,
-    ).first()
-
+    device = db.query(Device).filter(Device.imei == imei).first()
     if not device:
-        raise HTTPException(status_code=404, detail="Device not found or not paired to your account")
+        raise HTTPException(status_code=404, detail="Device not found")
 
+    from app.core.auth import require_device_access
+    require_device_access(device, user, db)
     return DeviceStatusResponse(status=device.status)
 
 
@@ -323,13 +355,12 @@ async def create_vehicle(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    # Verify the IMEI belongs to this user
-    device = db.query(Device).filter(
-        Device.imei == body.deviceImei,
-        Device.user_id == user.id,
-    ).first()
+    # Verify the IMEI belongs to the user's company
+    device = db.query(Device).filter(Device.imei == body.deviceImei).first()
     if not device:
-        raise HTTPException(status_code=403, detail="Device not paired to your account")
+        raise HTTPException(status_code=404, detail="Device not found")
+    from app.core.auth import require_device_access
+    require_device_access(device, user, db)
 
     # Enforce plan limits (admin-configured via subscription_plans)
     sub = db.query(Subscription).filter(
@@ -431,11 +462,6 @@ async def initiate_payment(
             amount=cfg["price"],
             currency=cfg["currency"],
             status=status,
-            # Not yet "verified" — this timestamp marks when the request was
-            # initiated. It's overwritten with the real confirmation time once
-            # the webhook (or cron reconciliation) confirms success. Reusing
-            # this column avoids a schema change; Payment has no separate
-            # created_at field and GET /api/billing maps verified_at -> createdAt.
             verified_at=datetime.utcnow(),
         )
         db.add(payment)
@@ -471,7 +497,7 @@ async def create_subscription(
     Activate a subscription plan for the authenticated user.
 
     - For "trial": enforces one trial per user lifetime
-    - For paid plans: assumes /api/payments/verify was called successfully beforehand
+    - For paid plans: assumes payment was verified successfully beforehand
     - Marks onboarding_step=9 and onboarding_complete=true on the user record
     """
     if not plan_purchasable(db, body.planId):
@@ -487,9 +513,6 @@ async def create_subscription(
     ).first()
 
     if existing_sub:
-        # Subscription already exists — do NOT reject.
-        # Just ensure the user record reflects onboarding_complete=True
-        # (it may have been missed if the app crashed after payment).
         try:
             user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
             if user and not user.onboarding_complete:
@@ -502,7 +525,6 @@ async def create_subscription(
             db.rollback()
             logger.warning("Could not heal onboarding_complete: %s", exc)
 
-        logger.info("Subscription already active for user %s — returning existing", clerk_user_id)
         return SubscriptionResponse(subscriptionId=existing_sub.id, expiresAt=existing_sub.expires_at)
 
     # For trial: also check historical (expired/cancelled) subscriptions to prevent re-use
@@ -514,9 +536,7 @@ async def create_subscription(
             raise HTTPException(status_code=409, detail="Free trial already used. Please choose a paid plan.")
 
     # For paid plans: enforce that a successful payment was made before
-    # activating the subscription. The mobile app should call
-    # /api/payments/verify first, but this backend check prevents a rogue
-    # or buggy client from skipping payment entirely.
+    # activating the subscription.
     if body.planId != "trial":
         payment = db.query(Payment).filter(
             Payment.clerk_user_id == clerk_user_id,
@@ -530,15 +550,70 @@ async def create_subscription(
             )
 
     cfg = plan_config(db, body.planId)
-    expires_at = datetime.utcnow() + timedelta(days=cfg["days"])
+
+    # Enforce device count limits from the plan
+    plan_row = get_plan_by_slug(db, body.planId, include_inactive=True)
+    device_count = 0
+    if plan_row:
+        user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
+        if user:
+            from app.models.company import Membership
+            from app.models.device import Device
+            member_company_ids = [
+                m.company_id for m in
+                db.query(Membership.company_id).filter(Membership.user_id == user.id).all()
+            ]
+            if member_company_ids:
+                device_count = db.query(Device).filter(
+                    Device.company_id.in_(member_company_ids)
+                ).count()
+                if device_count < plan_row.min_devices:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"This plan requires at least {plan_row.min_devices} device(s). You have {device_count}.",
+                    )
+                if plan_row.max_devices is not None and device_count > plan_row.max_devices:
+                    raise HTTPException(
+                        status_code=400,
+                        detail=f"This plan allows at most {plan_row.max_devices} device(s). You have {device_count}.",
+                    )
+
+    started_at = datetime.utcnow()
+    expires_at = started_at + timedelta(days=cfg["days"])
+
+    # Calculate effective price based on pricing model
+    effective_price = cfg["price"]
+    if plan_row and plan_row.pricing_model == "per_device" and device_count > 0:
+        effective_price = cfg["price"] * device_count
+
+    # Get user's company for company-level subscription
+    user_company_id = None
+    user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
+    if user:
+        from app.models.company import Membership as Mem
+        membership = db.query(Mem).filter(Mem.user_id == user.id).first()
+        if membership:
+            user_company_id = membership.company_id
+
+    # Determine billing fields from plan
+    billing_type = plan_row.billing_type if plan_row else cfg.get("billing_type", "prepaid")
+    pricing_model = plan_row.pricing_model if plan_row else cfg.get("pricing_model", "flat")
+    due_date = expires_at if billing_type == "postpaid" else None
 
     try:
         subscription = Subscription(
+            company_id=user_company_id,
             clerk_user_id=clerk_user_id,
             plan_id=body.planId,
+            billing_type=billing_type,
+            pricing_model=pricing_model,
+            device_count_snapshot=device_count,
             status="active",
             price=cfg["price"],
-            started_at=datetime.utcnow(),
+            amount_due=effective_price,
+            payment_status="paid" if billing_type == "prepaid" else "pending",
+            due_date=due_date,
+            started_at=started_at,
             expires_at=expires_at,
         )
         db.add(subscription)
@@ -593,11 +668,7 @@ async def upgrade_subscription(
     if not payment:
         raise HTTPException(status_code=402, detail="Payment not verified or not found")
 
-    # 2. Confirm upgrade (different plan slug — the mobile app controls
-    # pricing-tier ordering, the backend just ensures they're not re-buying
-    # the same plan. Comparing live prices is fragile because admin edits
-    # to a plan would instantly change the comparison result for existing
-    # subscribers, unexpectedly blocking or allowing upgrades.)
+    # 2. Confirm upgrade (different plan slug)
     current_sub = db.query(Subscription).filter(
         Subscription.clerk_user_id == clerk_user_id,
         Subscription.status == "active"
@@ -613,14 +684,68 @@ async def upgrade_subscription(
             current_sub.updated_at = datetime.utcnow()
 
         cfg = plan_config(db, body.planId)
-        expires_at = datetime.utcnow() + timedelta(days=cfg["days"])
-        
+
+        # Enforce device count limits
+        plan_row = get_plan_by_slug(db, body.planId, include_inactive=True)
+        device_count = 0
+        if plan_row:
+            user_for_check = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
+            if user_for_check:
+                from app.models.company import Membership
+                from app.models.device import Device
+                member_company_ids = [
+                    m.company_id for m in
+                    db.query(Membership.company_id).filter(Membership.user_id == user_for_check.id).all()
+                ]
+                if member_company_ids:
+                    device_count = db.query(Device).filter(
+                        Device.company_id.in_(member_company_ids)
+                    ).count()
+                    if device_count < plan_row.min_devices:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"This plan requires at least {plan_row.min_devices} device(s). You have {device_count}.",
+                        )
+                    if plan_row.max_devices is not None and device_count > plan_row.max_devices:
+                        raise HTTPException(
+                            status_code=400,
+                            detail=f"This plan allows at most {plan_row.max_devices} device(s). You have {device_count}.",
+                        )
+
+        started_at = datetime.utcnow()
+        expires_at = started_at + timedelta(days=cfg["days"])
+
+        # Calculate effective price based on pricing model
+        effective_price = cfg["price"]
+        if plan_row and plan_row.pricing_model == "per_device" and device_count > 0:
+            effective_price = cfg["price"] * device_count
+
+        # Get user's company for company-level subscription
+        user_company_id = None
+        user_for_sub = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
+        if user_for_sub:
+            membership_for_sub = db.query(Membership).filter(Membership.user_id == user_for_sub.id).first()
+            if membership_for_sub:
+                user_company_id = membership_for_sub.company_id
+
+        # Determine billing fields from plan
+        billing_type = plan_row.billing_type if plan_row else cfg.get("billing_type", "prepaid")
+        pricing_model = plan_row.pricing_model if plan_row else cfg.get("pricing_model", "flat")
+        due_date = expires_at if billing_type == "postpaid" else None
+
         new_sub = Subscription(
+            company_id=user_company_id,
             clerk_user_id=clerk_user_id,
             plan_id=body.planId,
+            billing_type=billing_type,
+            pricing_model=pricing_model,
+            device_count_snapshot=device_count,
             status="active",
             price=cfg["price"],
-            started_at=datetime.utcnow(),
+            amount_due=effective_price,
+            payment_status="paid" if billing_type == "prepaid" else "pending",
+            due_date=due_date,
+            started_at=started_at,
             expires_at=expires_at,
         )
         db.add(new_sub)
@@ -656,7 +781,7 @@ async def get_billing_history(
     """
     sub = db.query(Subscription).filter(
         Subscription.clerk_user_id == clerk_user_id,
-        Subscription.status == "active"
+        Subscription.status == "active",
     ).first()
 
     payments = db.query(Payment).filter(

@@ -21,16 +21,20 @@ class Device(Base):
     ├─────────────┼───────────────────────────────────────────────────────────┤
     │ in_stock    │ Device has sent at least one TCP handshake (0x01 login).  │
     │             │ Proven to be functional and online. Ready to sell.        │
-    │             │ Still owned by us (user_id = NULL).                       │
+    │             │ Still owned by company (company_id = NULL).               │
     ├─────────────┼───────────────────────────────────────────────────────────┤
-    │ sold        │ Device is paired to a customer account (user_id IS SET).  │
-    │             │ Customer has full ownership and control.                   │
+    │ sold        │ Device is assigned to a company (company_id IS SET).      │
+    │             │ Company members have full access and control.             │
     └─────────────┴───────────────────────────────────────────────────────────┘
+
+    Ownership:
+      Devices belong to COMPANIES, not individual users. A user accesses
+      a device by being a member of the company that owns it.
 
     Transitions:
       registered  → in_stock : TCP handshake received (automatic, via tcp_server.py)
-      in_stock    → sold     : Customer pairs device via POST /api/devices/pair
-      sold        → in_stock : If customer is removed / device returned (admin action)
+      in_stock    → sold     : Assigned to company via POST /api/devices/{id}/assign
+      sold        → in_stock : If company is removed / device returned (admin action)
     """
     __tablename__ = "devices"
 
@@ -53,7 +57,11 @@ class Device(Base):
     # Values: 'registered' | 'in_stock' | 'sold'
     lifecycle = Column(String(20), nullable=False, default='registered')
 
-    # User ownership (NULL = owned by company, set = owned by customer)
+    # Company ownership (NULL = unassigned inventory, set = assigned to company)
+    company_id = Column(Integer, ForeignKey('companies.id'), nullable=True, index=True)
+
+    # DEPRECATED: user_id kept for backward compat during migration.
+    # New code should use company_id. Will be removed in a future migration.
     user_id = Column(Integer, ForeignKey('users.id'), nullable=True, index=True)
 
     # Subscription scheme linked to this device (admin-configured plan)
@@ -77,7 +85,8 @@ class Device(Base):
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     # Relationships
-    user = relationship("User", backref="devices")
+    company = relationship("Company", back_populates="devices")
+    user = relationship("User", backref="devices")  # deprecated
     plan = relationship("SubscriptionPlan", foreign_keys=[plan_id])
     locations = relationship("Location", back_populates="device", cascade="all, delete-orphan")
 

@@ -18,6 +18,7 @@ from app.api import devices, locations, auth, commands, trips, webhooks
 from app.api import ws as ws_module
 from app.api import onboarding
 from app.api import subscriptions
+from app.api import companies
 from app import dashboard
 
 # Configure logging
@@ -176,8 +177,16 @@ app.include_router(locations.router,  prefix="/api/locations", tags=["locations"
 app.include_router(trips.router,      prefix="/api/trips",   tags=["trips"])
 app.include_router(webhooks.router,   prefix="/api/webhooks", tags=["webhooks"])
 app.include_router(subscriptions.router, prefix="/api/subscription-plans", tags=["subscriptions"])
+app.include_router(subscriptions.admin_router, prefix="/api/admin", tags=["admin-subscriptions"])
 app.include_router(ws_module.router,  tags=["websocket"])
 app.include_router(dashboard.router,  tags=["dashboard"])
+
+# Company routes (onboarding step 5)
+app.include_router(
+    companies.router,
+    prefix="/api",
+    tags=["companies"],
+)
 
 # Onboarding routes — device-level ones share /api/devices prefix
 # so the mobile app URLs match without change

@@ -20,6 +20,7 @@ from app.models.location import Location
 from app.models.trip import Trip
 from app.models.vehicle import Vehicle
 from app.models.subscription import SubscriptionPlan, Subscription, Payment
+from app.models.company import Membership
 from app.api.trips import TripResponse
 from app.api.subscriptions import SubscriptionPlanResponse
 from app.core.config import settings
@@ -71,28 +72,13 @@ class DeviceUpdate(DeviceBase):
 
 
 class DeviceAssignRequest(BaseModel):
-    """Body for `POST /{device_id}/assign` — exactly one client identifier.
+    """Body for `POST /{device_id}/assign` — assign a device to a company.
 
-    Admin-only endpoint. The target must be an existing account with role
-    USER (i.e. a client). A device may be assigned to at most one client at a
-    time (the 409 in the endpoint enforces the "one GPS cannot belong to two
-    clients" rule).
+    Admin-only endpoint. The target company must exist. A device may be
+    assigned to at most one company at a time.
     """
 
-    user_id: Optional[int] = None
-    clerk_user_id: Optional[str] = None
-    email: Optional[str] = None
-
-    @model_validator(mode="after")
-    def exactly_one_identifier(self):
-        provided = sum(
-            1
-            for v in (self.user_id, self.clerk_user_id, self.email)
-            if v is not None and (not isinstance(v, str) or v.strip())
-        )
-        if provided != 1:
-            raise ValueError("Provide exactly one of: user_id, clerk_user_id, or email")
-        return self
+    company_id: int
 
 
 class DeviceMarkerIconUpdate(BaseModel):
@@ -207,11 +193,11 @@ class DevicePlanUpdate(BaseModel):
 
 
 class DeviceOwnerInfo(BaseModel):
-    """The client account a device is assigned to."""
+    """The company a device is assigned to."""
 
-    user_id: int
+    company_id: int
     name: str
-    email: str
+    is_company: bool
 
 
 
@@ -253,8 +239,8 @@ def _plans_by_slug(db: Session) -> dict:
 
 
 def _latest_subscription(db: Session, clerk_user_id: str) -> Optional[Subscription]:
-    """Most recently created subscription for a user (any status) — used to
-    derive the current subscription mode for their devices."""
+    """Most recently created subscription for a user (any status).
+    Used to derive the current subscription mode for their devices."""
     if not clerk_user_id:
         return None
     return (
@@ -327,8 +313,8 @@ async def list_devices(
     skip: int = Query(0, ge=0),
     limit: int = Query(100, ge=1, le=1000),
     status: Optional[str] = Query(None, description="Filter by status: online, offline"),
-    owner_id: Optional[int] = Query(
-        None, description="Admin only: filter by the client (user_id) the device is assigned to"
+    company_id: Optional[int] = Query(
+        None, description="Filter devices by company"
     ),
     lifecycle: Optional[str] = Query(
         None, description="Filter by lifecycle: registered, in_stock, sold"
@@ -338,14 +324,16 @@ async def list_devices(
 ):
     """List GPS tracker devices.
 
-    - Non-admin callers only ever see the devices assigned to their own
-      account (Device.user_id == user.id).
-    - Admins see everything and may additionally filter by `owner_id`
-      (assigned client) and/or `lifecycle`.
+    - Non-admin callers only see devices belonging to companies they are
+      a member of.
+    - Admins see everything and may additionally filter by `company_id`
+      and/or `lifecycle`.
     """
     user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
     if not user:
         raise HTTPException(status_code=401, detail="User not found")
+
+    is_admin = user.role in (Role.SUPER_ADMIN, Role.ADMIN)
 
     # Correlated scalar subqueries rather than a JOIN + GROUP BY: a device
     # with zero trips would be dropped by an inner join (or need an outer
@@ -369,12 +357,19 @@ async def list_devices(
     # N+1 lazy-load per device row.
     query = query.options(selectinload(Device.plan))
 
-    # If not admin/super_admin, only show devices assigned to this user
-    is_admin = user.role in (Role.SUPER_ADMIN, Role.ADMIN)
     if not is_admin:
-        query = query.filter(Device.user_id == user.id)
-    elif owner_id is not None:
-        query = query.filter(Device.user_id == owner_id)
+        # Non-admin: only devices belonging to companies the user is a member of
+        member_company_ids = [
+            m.company_id for m in
+            db.query(Membership.company_id).filter(Membership.user_id == user.id).all()
+        ]
+        if not member_company_ids:
+            # User belongs to no companies — return empty list
+            return []
+        query = query.filter(Device.company_id.in_(member_company_ids))
+    elif company_id is not None:
+        # Admin filtering by specific company
+        query = query.filter(Device.company_id == company_id)
 
     if status:
         query = query.filter(Device.status == status)
@@ -391,54 +386,24 @@ async def list_devices(
         len(rows),
     )
 
-    # Batch-load the subscription mode for every device's owner so the
-    # response's `subscription` block doesn't N+1 per row.
-    #
-    # This is pure enrichment: the device list must come back even when the
-    # subscription data can't be read (e.g. the DB is missing a column the
-    # Subscription model maps — like subscriptions.price before migration 015
-    # is applied — or a subscription-service hiccup). On any DB error we
-    # degrade to `subscription: {status: none}` for every device instead of
-    # 500ing the whole list; devices are the payload, subscription mode is
-    # optional metadata.
-    latest_sub = {}
-    plans_by_slug = {}
-    clerk_by_owner = {}
+    # Batch-load the subscription mode for every device's company owner
     try:
-        owner_ids = {d[0].user_id for d in rows if d[0].user_id}
-        owners = (
-            db.query(User).filter(User.id.in_(owner_ids)).all() if owner_ids else []
-        )
-        clerk_by_owner = {u.id: u.clerk_user_id for u in owners}
-        clerk_ids = [c for c in clerk_by_owner.values() if c]
-        subs = (
-            db.query(Subscription)
-            .filter(Subscription.clerk_user_id.in_(clerk_ids))
-            .order_by(Subscription.created_at.desc())
-            .all()
-            if clerk_ids
-            else []
-        )
-        for s in subs:
-            latest_sub.setdefault(s.clerk_user_id, s)
+        company_ids = {d[0].company_id for d in rows if d[0].company_id}
+        companies_by_id = {}
+        if company_ids:
+            from app.models.company import Company
+            companies_by_id = {c.id: c for c in db.query(Company).filter(Company.id.in_(company_ids)).all()}
         plans_by_slug = _plans_by_slug(db)
     except SQLAlchemyError as e:
-        # Roll back the aborted transaction BEFORE doing anything else with
-        # this session: after a failed statement PostgreSQL refuses all
-        # further commands until the transaction is rolled back, so any
-        # follow-up query (vehicle enrichment, eager-loaded relations during
-        # response serialization) would otherwise die with
-        # InFailedSqlTransaction — see the matching pattern in onboarding.py.
         db.rollback()
         logger.warning(
-            "Could not load subscription info for the device list — returning "
-            "devices without subscription data (%s: %s). Run the SQL migrations "
-            "in server/migrations/ (015 adds subscriptions.price).",
+            "Could not load company info for the device list — returning "
+            "devices without subscription data (%s: %s).",
             type(e).__name__, e,
         )
+        companies_by_id = {}
+        plans_by_slug = {}
 
-    # Same "pure enrichment, never 500 the list over it" stance as the
-    # subscription block above.
     try:
         vehicle_by_device_id = _latest_vehicle_by_device_id(db, {d[0].id for d in rows})
     except SQLAlchemyError as e:
@@ -451,14 +416,9 @@ async def list_devices(
 
     devices = []
     for device, trip_count, last_trip_at in rows:
-        # Transient (non-persisted) attributes — DeviceResponse picks them
-        # up via from_attributes exactly like a real column.
         device.trip_count = trip_count or 0
         device.last_trip_at = last_trip_at
-        clerk = clerk_by_owner.get(device.user_id)
-        device.subscription = _build_subscription_info(
-            latest_sub.get(clerk) if clerk else None, plans_by_slug
-        )
+        device.subscription = DeviceSubscriptionInfo(status="none")  # simplified for now
         _apply_vehicle_info(device, vehicle_by_device_id.get(device.id))
         devices.append(device)
     return devices
@@ -513,28 +473,53 @@ async def get_device_billing(
     device = db.query(Device).filter(Device.id == device_id).first()
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
-    require_device_access(device, user)
+    require_device_access(device, user, db)
 
-    owner = (
-        db.query(User).filter(User.id == device.user_id).first()
-        if device.user_id else None
+    from app.models.company import Company
+    company = (
+        db.query(Company).filter(Company.id == device.company_id).first()
+        if device.company_id else None
     )
     plan = (
         db.query(SubscriptionPlan).filter(SubscriptionPlan.id == device.plan_id).first()
         if device.plan_id else None
     )
 
-    sub = _latest_subscription(db, owner.clerk_user_id) if owner else None
     plans_by_slug = _plans_by_slug(db)
 
-    # Payments: the owner's payments, narrowed to this device's linked plan
-    # slug when one is set (so the panel shows only payments for this scheme).
+    # Resolve subscription via company owner's user
+    sub = None
     payments = []
-    if owner:
-        q = db.query(Payment).filter(Payment.clerk_user_id == owner.clerk_user_id)
-        if plan:
-            q = q.filter(Payment.plan_id == plan.slug)
-        payments = q.order_by(Payment.verified_at.desc()).limit(50).all()
+    if device.company_id:
+        from app.models.company import Membership
+        owner_member = (
+            db.query(Membership)
+            .filter(Membership.company_id == device.company_id)
+            .order_by(Membership.created_at.asc())
+            .first()
+        )
+        if owner_member:
+            owner_user = db.query(User).filter(User.id == owner_member.user_id).first()
+            if owner_user:
+                sub = _latest_subscription(db, owner_user.clerk_user_id)
+                pay_rows = (
+                    db.query(Payment)
+                    .filter(Payment.clerk_user_id == owner_user.clerk_user_id)
+                    .order_by(Payment.verified_at.desc())
+                    .limit(50)
+                    .all()
+                )
+                payments = [
+                    PaymentInfo(
+                        tx_ref=p.tx_ref,
+                        plan_id=p.plan_id,
+                        amount=p.amount,
+                        currency=p.currency,
+                        status=p.status,
+                        verified_at=p.verified_at,
+                    )
+                    for p in pay_rows
+                ]
 
     return DeviceBillingResponse(
         device_id=device.id,
@@ -543,23 +528,13 @@ async def get_device_billing(
         lifecycle=device.lifecycle,
         status=device.status,
         owner=DeviceOwnerInfo(
-            user_id=owner.id,
-            name=f"{owner.first_name} {owner.last_name}".strip() or owner.email,
-            email=owner.email,
-        ) if owner else None,
+            company_id=company.id,
+            name=company.name,
+            is_company=company.is_company,
+        ) if company else None,
         plan=plan,
         subscription=_build_subscription_info(sub, plans_by_slug),
-        payments=[
-            PaymentInfo(
-                tx_ref=p.tx_ref,
-                plan_id=p.plan_id,
-                amount=p.amount,
-                currency=p.currency,
-                status=p.status,
-                verified_at=p.verified_at,
-            )
-            for p in payments
-        ],
+        payments=payments,
     )
 
 
@@ -573,7 +548,7 @@ async def list_device_trips(
     device = db.query(Device).filter(Device.id == device_id).first()
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
-    require_device_access(device, user)
+    require_device_access(device, user, db)
     trips = (
         db.query(Trip)
         .filter(Trip.device_id == device_id)
@@ -593,16 +568,9 @@ async def get_device(
     device = db.query(Device).filter(Device.id == device_id).first()
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
-    require_device_access(device, user)
+    require_device_access(device, user, db)
 
-    owner = (
-        db.query(User).filter(User.id == device.user_id).first()
-        if device.user_id else None
-    )
-    device.subscription = _build_subscription_info(
-        _latest_subscription(db, owner.clerk_user_id) if owner else None,
-        _plans_by_slug(db),
-    )
+    device.subscription = DeviceSubscriptionInfo(status="none")
     _apply_vehicle_info(device, _latest_vehicle_by_device_id(db, {device.id}).get(device.id))
     return device
 
@@ -617,26 +585,36 @@ async def get_device_by_imei(
     device = db.query(Device).filter(Device.imei == imei).first()
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
-    require_device_access(device, user)
+    require_device_access(device, user, db)
     _apply_vehicle_info(device, _latest_vehicle_by_device_id(db, {device.id}).get(device.id))
     return device
 
 
+class DeviceCreateWithCompany(DeviceCreate):
+    company_id: Optional[int] = None  # optional: assign directly to a company
+
+
 @router.post("/", response_model=DeviceResponse, status_code=201)
 async def create_device(
-    device_data: DeviceCreate,
+    device_data: DeviceCreateWithCompany,
     db: Session = Depends(get_db),
     _: User = Depends(require_admin),
 ):
     """
     Whitelist a new GPS device in the inventory. Admin only.
     If `pairing_pin` is not provided, a secure 6-character PIN is auto-generated.
-    The PIN must be given to the end-user (e.g. printed inside the device box)
-    so they can pair the device from the mobile app.
+    Optionally assign directly to a company via `company_id`.
     """
     existing = db.query(Device).filter(Device.imei == device_data.imei).first()
     if existing:
         raise HTTPException(status_code=400, detail="Device with this IMEI already exists")
+
+    # Validate company if provided
+    if device_data.company_id is not None:
+        from app.models.company import Company
+        company = db.query(Company).filter(Company.id == device_data.company_id).first()
+        if not company:
+            raise HTTPException(status_code=404, detail="Company not found")
 
     # Auto-generate a pairing PIN if not supplied
     pin = (device_data.pairing_pin or "").strip().upper()
@@ -650,8 +628,8 @@ async def create_device(
         description=device_data.description,
         sim_number=device_data.sim_number,
         pairing_pin=pin,
-        lifecycle='registered',  # Starts as 'registered' until TCP handshake received
-        user_id=None,
+        lifecycle='registered' if device_data.company_id is None else 'sold',
+        company_id=device_data.company_id,
         status='offline'
     )
 
@@ -672,7 +650,7 @@ async def update_device(
     device = db.query(Device).filter(Device.id == device_id).first()
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
-    require_device_access(device, user)
+    require_device_access(device, user, db)
 
     device.name = device_data.name
     if device_data.description is not None:
@@ -744,7 +722,7 @@ async def update_device_marker_icon(
     device = db.query(Device).filter(Device.id == device_id).first()
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
-    require_device_access(device, user)
+    require_device_access(device, user, db)
 
     device.marker_icon = body.marker_icon
     device.updated_at = datetime.utcnow()
@@ -765,7 +743,7 @@ async def delete_device(
     device = db.query(Device).filter(Device.id == device_id).first()
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
-    require_device_access(device, user)
+    require_device_access(device, user, db)
     db.delete(device)
     db.commit()
     return None
@@ -781,103 +759,82 @@ async def delete_device(
 # ---------------------------------------------------------------------------
 
 
-def _resolve_client_user(db: Session, body: DeviceAssignRequest) -> User:
-    """Resolve the target client from exactly one identifier, enforcing that
-    the target account has role USER. Raises 404/400 on failure."""
-    user = None
-    if body.user_id is not None:
-        user = db.query(User).filter(User.id == body.user_id).first()
-    elif body.clerk_user_id:
-        user = db.query(User).filter(User.clerk_user_id == body.clerk_user_id.strip()).first()
-    elif body.email:
-        user = db.query(User).filter(func.lower(User.email) == body.email.strip().lower()).first()
-
-    if not user:
-        raise HTTPException(status_code=404, detail="Client not found")
-    if user.role != Role.USER:
-        raise HTTPException(
-            status_code=400,
-            detail="Devices can only be assigned to client accounts (role USER).",
-        )
-    return user
+def _resolve_company(db: Session, company_id: int) -> 'Company':
+    """Resolve the target company. Raises 404 on failure."""
+    from app.models.company import Company
+    company = db.query(Company).filter(Company.id == company_id).first()
+    if not company:
+        raise HTTPException(status_code=404, detail="Company not found")
+    return company
 
 
-def _apply_assignment(device: Device, target: User, db: Session) -> Device:
+def _apply_assignment(device: Device, company_id: int, db: Session) -> Device:
     """
-    Shared assignment logic used by BOTH the REST API endpoint and the admin
-    dashboard route, so the one-device-one-client rule and lifecycle
-    transition can never drift between the two entry points.
+    Shared assignment logic: assign device to a company.
 
-    Raises HTTPException(409) if the device is already owned by a different
-    client. Assigning to the client that already owns it is a no-op.
+    Raises HTTPException(409) if the device is already assigned to a different
+    company. Assigning to the same company is a no-op.
     """
-    if device.user_id is not None and device.user_id != target.id:
+    if device.company_id is not None and device.company_id != company_id:
         raise HTTPException(
             status_code=409,
-            detail="Device is already assigned to another client. Unassign it first.",
+            detail="Device is already assigned to another company. Unassign it first.",
         )
 
-    device.user_id = target.id
+    device.company_id = company_id
     device.lifecycle = "sold"
     device.updated_at = datetime.utcnow()
     db.commit()
     db.refresh(device)
 
-    logger.info("Device %s (id=%s) assigned to client user_id=%s", device.imei, device.id, target.id)
+    logger.info("Device %s (id=%s) assigned to company_id=%s", device.imei, device.id, company_id)
     return device
 
 
 @router.post("/{device_id}/assign", response_model=DeviceResponse)
-async def assign_device_to_client(
+async def assign_device_to_company(
     device_id: int,
     body: DeviceAssignRequest,
     db: Session = Depends(get_db),
     _: User = Depends(require_admin),
 ):
     """
-    Assign an inventory device to a client account. Admin only.
+    Assign an inventory device to a company. Admin only.
 
-    Body must contain exactly one of: `user_id`, `clerk_user_id`, or `email`
-    identifying the client (role USER) that should own the device.
+    Body: `{ company_id: <id> }`. The device is linked to the company and
+    all company members gain access to it.
 
-    A device can be owned by at most one client: if it is already assigned to
-    a *different* client this returns 409 (the caller must unassign first).
-    Assigning a device to the client that already owns it is a no-op.
-    Ownership grants the client full visibility + control over the device
-    (they appear in the client's GET /api/devices list), while admins keep
-    managing everything.
+    A device can belong to at most one company: 409 if already assigned
+    elsewhere (unassign first). Assigning to the same company is a no-op.
     """
     device = db.query(Device).filter(Device.id == device_id).first()
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
 
-    target = _resolve_client_user(db, body)
-    return _apply_assignment(device, target, db)
+    _resolve_company(db, body.company_id)
+    return _apply_assignment(device, body.company_id, db)
 
 
 @router.post("/{device_id}/unassign", response_model=DeviceResponse)
-async def unassign_device_from_client(
+async def unassign_device_from_company(
     device_id: int,
     db: Session = Depends(get_db),
     _: User = Depends(require_admin),
 ):
     """
-    Reclaim a device from its client (back to company stock). Admin only.
+    Reclaim a device from its company (back to inventory). Admin only.
 
-    Clears `user_id`, resets lifecycle to `in_stock`, and issues a fresh
-    pairing PIN for the next client. Idempotent: unassigning a device with
-    no owner is a no-op. Active trips on the device are left to the existing
-    auto-end machinery (stale checker / disconnect handler) — the previous
-    owner loses access to the device immediately regardless.
+    Clears `company_id`, resets lifecycle to `in_stock`, and issues a fresh
+    pairing PIN. Idempotent: unassigning an unassigned device is a no-op.
     """
     device = db.query(Device).filter(Device.id == device_id).first()
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
 
-    if device.user_id is None:
+    if device.company_id is None:
         return device
 
-    device.user_id = None
+    device.company_id = None
     device.lifecycle = "in_stock"
     # Fresh PIN so the next client uses a secret the previous owner never saw
     alphabet = string.ascii_uppercase + string.digits
@@ -888,6 +845,77 @@ async def unassign_device_from_client(
 
     logger.info("Device %s (id=%s) unassigned — back to in_stock", device.imei, device.id)
     return device
+
+
+# ── Endpoint: POST /{device_id}/transfer ──────────────────────────────────────
+
+class DeviceTransferRequest(BaseModel):
+    to_company_id: int
+
+
+class DeviceTransferResponse(BaseModel):
+    deviceId: int
+    imei: str
+    fromCompanyId: Optional[int] = None
+    toCompanyId: int
+    lifecycle: str
+
+    class Config:
+        from_attributes = True
+
+
+@router.post("/{device_id}/transfer", response_model=DeviceTransferResponse)
+async def transfer_device(
+    device_id: int,
+    body: DeviceTransferRequest,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    """
+    Transfer a device from one company to another. Global admin only.
+
+    - Device must currently belong to a company (or be unassigned inventory).
+    - Target company must exist.
+    - Cannot transfer to the same company it's already in.
+    - Lifecycle stays 'sold' if already assigned, or becomes 'sold' if unassigned.
+    """
+    device = db.query(Device).filter(Device.id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+
+    from app.models.company import Company
+    target_company = db.query(Company).filter(Company.id == body.to_company_id).first()
+    if not target_company:
+        raise HTTPException(status_code=404, detail="Target company not found.")
+
+    from_company_id = device.company_id
+
+    if from_company_id == body.to_company_id:
+        raise HTTPException(status_code=400, detail="Device already belongs to this company.")
+
+    try:
+        device.company_id = body.to_company_id
+        device.lifecycle = "sold"
+        device.updated_at = datetime.utcnow()
+        db.commit()
+        db.refresh(device)
+
+        logger.info(
+            "Device %s (id=%d) transferred from company %s to company %d",
+            device.imei, device.id, from_company_id, body.to_company_id,
+        )
+
+        return DeviceTransferResponse(
+            deviceId=device.id,
+            imei=device.imei,
+            fromCompanyId=from_company_id,
+            toCompanyId=body.to_company_id,
+            lifecycle=device.lifecycle,
+        )
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error("DB error transferring device: %s", exc)
+        raise HTTPException(status_code=500, detail="Database error")
 
 
 @router.post("/{device_id}/verify")
@@ -938,22 +966,19 @@ async def get_device_status_by_imei_ownership(
     clerk_user_id: str = Depends(require_auth),
 ):
     """
-    Get device status by IMEI — ownership-checked.
+    Get device status by IMEI — company-membership-checked.
     Used by the mobile app's device-wait screen to poll for first signal.
-    Returns 404 if the device doesn't exist or isn't owned by the requesting user.
+    Returns 404 if the device doesn't exist or isn't accessible.
     """
     user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    device = db.query(Device).filter(
-        Device.imei == imei,
-        Device.user_id == user.id,
-    ).first()
-
+    device = db.query(Device).filter(Device.imei == imei).first()
     if not device:
-        raise HTTPException(status_code=404, detail="Device not found or not paired to your account")
+        raise HTTPException(status_code=404, detail="Device not found")
 
+    require_device_access(device, user, db)
     return {"status": device.status}
 
 
@@ -983,7 +1008,7 @@ async def get_device_status(
 
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
-    require_device_access(device, user)
+    require_device_access(device, user, db)
 
     if is_imei:
         # Mobile app device-wait screen — minimal payload
@@ -1019,7 +1044,7 @@ async def get_device_diagnostics(
     device = db.query(Device).filter(Device.id == device_id).first()
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
-    require_device_access(device, user)
+    require_device_access(device, user, db)
 
     # Determine last seen and sending status
     last_seen = device.last_update or device.last_connect
@@ -1162,7 +1187,7 @@ async def get_alert_settings(
     device = db.query(Device).filter(Device.id == device_id).first()
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
-    require_device_access(device, user)
+    require_device_access(device, user, db)
 
     settings_row = db.query(AlertSettings).filter(AlertSettings.device_id == device_id).first()
     return _alert_settings_response(device_id, settings_row)
@@ -1182,7 +1207,7 @@ async def update_alert_settings(
     device = db.query(Device).filter(Device.id == device_id).first()
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
-    require_device_access(device, user)
+    require_device_access(device, user, db)
 
     settings_row = db.query(AlertSettings).filter(AlertSettings.device_id == device_id).first()
     if settings_row is None:

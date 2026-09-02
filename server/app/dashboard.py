@@ -38,7 +38,7 @@ from app.models.device import Device
 from app.models.location import Location
 from app.models.user import User, Role
 from app.models.subscription import Subscription, SubscriptionPlan, Payment
-from app.api.devices import _resolve_client_user, _apply_assignment, DeviceAssignRequest
+from app.api.devices import _resolve_company, _apply_assignment, DeviceAssignRequest
 from app.api.auth import invite_clerk_client_and_create_local
 
 router = APIRouter()
@@ -266,22 +266,11 @@ def _build_device_data(devices, db, all_plans=None):
         for p in all_plans
     ]
 
-    # Batch-load owners + their latest subscription so per-device payment
-    # status (subscription mode) doesn't N+1 either.
-    owner_ids = {d.user_id for d in devices if d.user_id}
-    owners = db.query(User).filter(User.id.in_(owner_ids)).all() if owner_ids else []
-    owner_by_id = {u.id: u for u in owners}
-    clerk_ids = [u.clerk_user_id for u in owners if u.clerk_user_id]
-    subs = (
-        db.query(Subscription)
-        .filter(Subscription.clerk_user_id.in_(clerk_ids))
-        .order_by(Subscription.created_at.desc())
-        .all()
-        if clerk_ids else []
-    )
-    latest_sub_by_clerk = {}
-    for s in subs:
-        latest_sub_by_clerk.setdefault(s.clerk_user_id, s)
+    # Batch-load companies for device ownership display
+    from app.models.company import Company
+    company_ids = {d.company_id for d in devices if d.company_id}
+    companies = db.query(Company).filter(Company.id.in_(company_ids)).all() if company_ids else []
+    owner_by_id = {c.id: c for c in companies}
 
     now = datetime.utcnow()
     result = []
@@ -305,21 +294,11 @@ def _build_device_data(devices, db, all_plans=None):
         else:
             sending_status = "Offline"
 
-        owner = owner_by_id.get(device.user_id)
+        owner = owner_by_id.get(device.company_id)
 
         plan = plans.get(device.plan_id)
 
-        # Payment scheme / subscription mode for this device:
-        # status = active | expired | none, plus the subscription plan slug,
-        # name and expiry so the inventory shows the client's real payment state.
-        sub = latest_sub_by_clerk.get(owner.clerk_user_id) if owner else None
-        if sub is not None and sub.status == "active" and sub.expires_at and sub.expires_at > now:
-            subscription_status = "active"
-        elif sub is not None:
-            subscription_status = "expired"
-        else:
-            subscription_status = "none"
-        sub_plan = plans_by_slug.get((sub.plan_id or "").lower()) if sub else None
+        subscription_status = "none"
 
         result.append({
             "id": device.id,
@@ -497,10 +476,10 @@ async def admin_clients(request: Request, db: Session = Depends(get_db)):
 
     # Batch-load all assigned devices and active subscriptions so the page
     # does not N+1 per client row.
-    devices = db.query(Device).filter(Device.user_id.isnot(None)).all()
+    devices = db.query(Device).filter(Device.company_id.isnot(None)).all()
     by_owner = defaultdict(list)
     for dev in devices:
-        by_owner[dev.user_id].append(dev)
+        by_owner[dev.company_id].append(dev)
 
     subs = db.query(Subscription).filter(Subscription.status == "active").all()
     sub_by_clerk = {s.clerk_user_id: s for s in subs}
@@ -532,7 +511,7 @@ async def admin_clients(request: Request, db: Session = Depends(get_db)):
 
     total_assigned = sum(c["device_count"] for c in client_rows)
     unassigned_count = (
-        db.query(Device).filter(Device.user_id.is_(None)).count()
+        db.query(Device).filter(Device.company_id.is_(None)).count()
     )
 
     return templates.TemplateResponse("admin_clients.html", {
@@ -566,24 +545,40 @@ async def admin_device_billing(request: Request, imei: str, db: Session = Depend
     if not device:
         return RedirectResponse(url="/admin/devices", status_code=302)
 
-    owner = (
-        db.query(User).filter(User.id == device.user_id).first()
-        if device.user_id else None
+    from app.models.company import Company
+    company = (
+        db.query(Company).filter(Company.id == device.company_id).first()
+        if device.company_id else None
     )
     plan = (
         db.query(SubscriptionPlan).filter(SubscriptionPlan.id == device.plan_id).first()
         if device.plan_id else None
     )
 
-    # Latest subscription for the owner (any status) → current mode
+    # Latest subscription for the company owner (any status) → current mode
     sub = None
-    if owner:
-        sub = (
-            db.query(Subscription)
-            .filter(Subscription.clerk_user_id == owner.clerk_user_id)
-            .order_by(Subscription.created_at.desc())
+    payments = []
+    if company:
+        from app.models.company import Membership
+        owner_member = (
+            db.query(Membership)
+            .filter(Membership.company_id == company.id)
+            .order_by(Membership.created_at.asc())
             .first()
         )
+        if owner_member:
+            owner_user = db.query(User).filter(User.id == owner_member.user_id).first()
+            if owner_user:
+                sub = (
+                    db.query(Subscription)
+                    .filter(Subscription.clerk_user_id == owner_user.clerk_user_id)
+                    .order_by(Subscription.created_at.desc())
+                    .first()
+                )
+                q = db.query(Payment).filter(Payment.clerk_user_id == owner_user.clerk_user_id)
+                if plan:
+                    q = q.filter(Payment.plan_id == plan.slug)
+                payments = q.order_by(Payment.verified_at.desc()).limit(50).all()
 
     now = datetime.utcnow()
     if sub is not None and sub.status == "active" and sub.expires_at and sub.expires_at > now:
@@ -592,15 +587,6 @@ async def admin_device_billing(request: Request, imei: str, db: Session = Depend
         subscription_status = "expired"
     else:
         subscription_status = "none"
-
-    # Payment history narrowed to this device's linked plan slug (all the
-    # owner's payments when no plan is linked).
-    payments = []
-    if owner:
-        q = db.query(Payment).filter(Payment.clerk_user_id == owner.clerk_user_id)
-        if plan:
-            q = q.filter(Payment.plan_id == plan.slug)
-        payments = q.order_by(Payment.verified_at.desc()).limit(50).all()
 
     return templates.TemplateResponse("admin_device_billing.html", {
         "request": request,
@@ -784,14 +770,11 @@ async def admin_set_device_plan(
 async def admin_assign_device(
     imei: str,
     request: Request,
-    client_email: str = Form(...),
+    company_id: int = Form(...),
     db: Session = Depends(get_db),
 ):
     """
-    Assign an inventory device to a client account, by the client's email.
-    Reuses the same resolution + assignment logic as the REST API
-    (POST /api/devices/{device_id}/assign), which enforces the one-owner
-    rule and lifecycle transitions.
+    Assign an inventory device to a company, by company_id.
     """
     if not _check_admin(request, db):
         return RedirectResponse(url="/admin/login", status_code=302)
@@ -801,15 +784,13 @@ async def admin_assign_device(
         return RedirectResponse(url="/admin/devices", status_code=302)
 
     try:
-        target = _resolve_client_user(db, DeviceAssignRequest(email=client_email))
-        # Shared with the REST API — enforces the one-owner rule (409) and
-        # the lifecycle transition, so both entry points can't drift.
-        _apply_assignment(device, target, db)
-        logger.info("Admin dashboard: assigned device %s to client %s", imei, client_email)
+        _resolve_company(db, company_id)
+        _apply_assignment(device, company_id, db)
+        logger.info("Admin dashboard: assigned device %s to company %d", imei, company_id)
         return RedirectResponse(url="/admin/devices?assigned=1", status_code=302)
     except HTTPException as exc:
         return _render_admin_devices(
-            request, db, error=f"Could not assign to {client_email}: {exc.detail}"
+            request, db, error=f"Could not assign to company {company_id}: {exc.detail}"
         )
 
 
@@ -823,14 +804,7 @@ async def admin_register_client_and_assign(
     db: Session = Depends(get_db),
 ):
     """
-    Invite a NEW client and assign them the device in one action.
-
-    Sends a Clerk email invitation (the client sets their own password via the
-    invite link — the admin never handles a password), pre-provisions the
-    local client row (role USER) via the shared helper in api/auth.py, and
-    assigns the device using the same _apply_assignment helper as the REST
-    API. When the client accepts the invitation, their local row is claimed
-    by the webhook / sync flow, keeping the assignment intact.
+    Invite a NEW client, create a company for them, and assign the device.
     """
     if not _check_admin(request, db):
         return RedirectResponse(url="/admin/login", status_code=302)
@@ -839,30 +813,46 @@ async def admin_register_client_and_assign(
     if not device:
         return _render_admin_devices(request, db, error="Device not found.")
 
-    # Quick client-side-level validation before hitting Clerk
     email = (email or "").strip()
     if not email or "@" not in email:
         return _render_admin_devices(request, db, error="A valid client email is required.")
 
-    # Check the device is actually unassigned BEFORE creating the client, so
-    # a failed assignment never strands an orphan client account with no device.
-    if device.user_id is not None:
+    if device.company_id is not None:
         return _render_admin_devices(
             request, db,
-            error="Device is already assigned to another client. Unassign it first.",
+            error="Device is already assigned to another company. Unassign it first.",
         )
 
     try:
+        from app.models.company import Company, Membership, CompanyRole
         client = await invite_clerk_client_and_create_local(
             db,
             email=email,
             first_name=first_name,
             last_name=last_name,
         )
-        _apply_assignment(device, client, db)
+        # Create a company for the new client and assign the device
+        company = Company(
+            name=f"{first_name} {last_name}".strip() or email,
+            is_company=False,
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow(),
+        )
+        db.add(company)
+        db.flush()
+        membership = Membership(
+            user_id=client.id,
+            company_id=company.id,
+            company_role=CompanyRole.OWNER,
+            created_at=datetime.utcnow(),
+        )
+        db.add(membership)
+        db.flush()
+        _apply_assignment(device, company.id, db)
+        db.commit()
         logger.info(
-            "Admin dashboard: invited new client %s and assigned device %s",
-            email, imei,
+            "Admin dashboard: invited new client %s, created company %d, assigned device %s",
+            email, company.id, imei,
         )
         return RedirectResponse(url="/admin/devices?assigned=1", status_code=302)
     except HTTPException as exc:
@@ -988,8 +978,8 @@ async def admin_unpair_device(
         return RedirectResponse(url="/admin/login", status_code=302)
 
     device = db.query(Device).filter(Device.imei == imei).first()
-    if device and device.user_id:
-        device.user_id = None
+    if device and device.company_id:
+        device.company_id = None
         device.lifecycle = 'in_stock'
         device.pairing_pin = _generate_pin()
         device.updated_at = datetime.utcnow()

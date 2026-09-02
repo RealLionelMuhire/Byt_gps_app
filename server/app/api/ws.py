@@ -196,11 +196,17 @@ def _resolve_fleet_device_ids(db: Session, user: User) -> Set[int]:
     device_ids a /ws/fleet connection for `user` should receive.
 
     Mirrors the exact ownership rule GET /api/devices/ already applies:
-    SUPER_ADMIN/ADMIN see every device, everyone else sees only their own.
+    SUPER_ADMIN/ADMIN see every device, everyone else sees only devices
+    belonging to their companies.
     """
+    from app.models.company import Membership
     query = db.query(Device.id)
     if user.role not in (Role.SUPER_ADMIN, Role.ADMIN):
-        query = query.filter(Device.user_id == user.id)
+        member_company_ids = [
+            m.company_id for m in
+            db.query(Membership.company_id).filter(Membership.user_id == user.id).all()
+        ]
+        query = query.filter(Device.company_id.in_(member_company_ids))
     return {row[0] for row in query.all()}
 
 

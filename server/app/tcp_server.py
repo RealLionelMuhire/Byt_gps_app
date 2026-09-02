@@ -307,28 +307,37 @@ class GPSTrackerConnection:
                     # one — without this, no Trip row is ever created unless
                     # something calls POST /api/trips/start explicitly.
                     try:
-                        if device.user_id and data['gps_valid']:
+                        if device.company_id and data['gps_valid']:
                             from app.models.trip import Trip
                             from app.api.trips import get_or_create_trip_settings
+                            from app.models.company import Membership
 
-                            trip_settings = get_or_create_trip_settings(device.user_id, db)
-                            if data['speed'] >= trip_settings.stop_speed_threshold_kmh:
-                                has_active_trip = (
-                                    db.query(Trip)
-                                    .filter(Trip.device_id == device.id, Trip.end_time.is_(None))
-                                    .first()
-                                )
-                                if not has_active_trip:
-                                    new_trip = Trip(
-                                        device_id=device.id,
-                                        user_id=device.user_id,
-                                        name=f"Trip {data['timestamp']:%Y-%m-%d %H:%M}",
-                                        start_time=data['timestamp'],
-                                        end_time=None,
-                                        total_distance_km=0.0,
+                            # Find a company member to use for trip settings
+                            member = (
+                                db.query(Membership)
+                                .filter(Membership.company_id == device.company_id)
+                                .order_by(Membership.created_at.asc())
+                                .first()
+                            )
+                            if member:
+                                trip_settings = get_or_create_trip_settings(member.user_id, db)
+                                if data['speed'] >= trip_settings.stop_speed_threshold_kmh:
+                                    has_active_trip = (
+                                        db.query(Trip)
+                                        .filter(Trip.device_id == device.id, Trip.end_time.is_(None))
+                                        .first()
                                     )
-                                    db.add(new_trip)
-                                    db.commit()
+                                    if not has_active_trip:
+                                        new_trip = Trip(
+                                            device_id=device.id,
+                                            user_id=member.user_id,
+                                            name=f"Trip {data['timestamp']:%Y-%m-%d %H:%M}",
+                                            start_time=data['timestamp'],
+                                            end_time=None,
+                                            total_distance_km=0.0,
+                                        )
+                                        db.add(new_trip)
+                                        db.commit()
                                     logger.info(
                                         "Auto-started trip for device %s at %s",
                                         self.device_imei, data['timestamp'],
@@ -665,11 +674,21 @@ class TCPServer:
         db = SessionLocal()
         try:
             device = db.query(Device).filter(Device.id == device_id).first()
-            if not device or not device.user_id:
+            if not device or not device.company_id:
                 return
 
+            # Find a company member to send push notification to
+            from app.models.company import Membership
             from app.models.user import User
-            user = db.query(User).filter(User.id == device.user_id).first()
+            member = (
+                db.query(Membership)
+                .filter(Membership.company_id == device.company_id)
+                .order_by(Membership.created_at.asc())
+                .first()
+            )
+            if not member:
+                return
+            user = db.query(User).filter(User.id == member.user_id).first()
             if not user:
                 return
 

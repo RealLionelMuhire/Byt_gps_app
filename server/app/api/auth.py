@@ -15,6 +15,7 @@ from app.core.database import get_db
 from app.core.config import settings
 from app.core.auth import require_auth, require_admin
 from app.models.user import User, Role
+from app.models.company import Membership, Company
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -22,8 +23,7 @@ router = APIRouter()
 
 # Pydantic schemas
 class UserSyncRequest(BaseModel):
-    """Request body for user sync"""
-    clerk_user_id: str
+    """Request body for user sync. clerk_user_id comes from JWT, not body."""
     email: EmailStr
     first_name: Optional[str] = None
     last_name: Optional[str] = None
@@ -32,7 +32,6 @@ class UserSyncRequest(BaseModel):
     class Config:
         json_schema_extra = {
             "example": {
-                "clerk_user_id": "user_2abc123xyz456def",
                 "email": "user@example.com",
                 "name": "John Doe"
             }
@@ -57,6 +56,17 @@ class AdminCreateUserRequest(BaseModel):
         }
 
 
+class CompanyMembershipResponse(BaseModel):
+    """A single company membership entry."""
+    companyId: int
+    companyName: str
+    isCompany: bool
+    companyRole: str
+
+    class Config:
+        from_attributes = True
+
+
 class UserResponse(BaseModel):
     """User response model"""
     id: int
@@ -67,11 +77,43 @@ class UserResponse(BaseModel):
     role: str
     onboarding_step: Optional[int] = 0
     onboarding_complete: Optional[bool] = False
+    companies: List[CompanyMembershipResponse] = []
     created_at: datetime
     updated_at: datetime
     
     class Config:
         from_attributes = True
+
+
+def _build_user_response(user: User, db: Session) -> UserResponse:
+    """Build a UserResponse with companies populated from memberships."""
+    memberships = (
+        db.query(Membership, Company)
+        .join(Company, Membership.company_id == Company.id)
+        .filter(Membership.user_id == user.id)
+        .all()
+    )
+    return UserResponse(
+        id=user.id,
+        clerk_user_id=user.clerk_user_id,
+        email=user.email,
+        first_name=user.first_name,
+        last_name=user.last_name,
+        role=user.role.value,
+        onboarding_step=user.onboarding_step,
+        onboarding_complete=user.onboarding_complete,
+        companies=[
+            CompanyMembershipResponse(
+                companyId=company.id,
+                companyName=company.name,
+                isCompany=company.is_company,
+                companyRole=membership.company_role.value,
+            )
+            for membership, company in memberships
+        ],
+        created_at=user.created_at,
+        updated_at=user.updated_at,
+    )
 
 
 @router.post("/sync", response_model=UserResponse, status_code=200)
@@ -94,15 +136,15 @@ async def sync_user(
     """
     try:
         # Validate required fields
-        if not user_data.clerk_user_id or not user_data.email:
+        if not user_data.email:
             raise HTTPException(
                 status_code=400,
-                detail="Missing required fields: clerk_user_id and email are required"
+                detail="email is required"
             )
         
-        # Try to find existing user by clerk_user_id
+        # Try to find existing user by clerk_user_id (from JWT, NOT body)
         user = db.query(User).filter(
-            User.clerk_user_id == user_data.clerk_user_id
+            User.clerk_user_id == clerk_user_id
         ).first()
 
         # Resolve first/last name from either `name` or `first_name`/`last_name`
@@ -120,7 +162,7 @@ async def sync_user(
         if user is None:
             user = claim_pending_client_user(
                 db,
-                clerk_user_id=user_data.clerk_user_id,
+                clerk_user_id=clerk_user_id,
                 email=user_data.email,
                 first_name=resolved_first,
                 last_name=resolved_last,
@@ -128,7 +170,7 @@ async def sync_user(
 
         if user:
             # Update existing user
-            logger.info(f"Updating existing user: {user_data.clerk_user_id}")
+            logger.info(f"Updating existing user: {clerk_user_id}")
             user.email = user_data.email
             if resolved_first is not None:
                 user.first_name = resolved_first
@@ -140,9 +182,9 @@ async def sync_user(
             is_first_user = db.query(User).count() == 0
             initial_role = Role.SUPER_ADMIN if is_first_user else Role.USER
 
-            logger.info(f"Creating new user: {user_data.clerk_user_id}. Role: {initial_role.value}")
+            logger.info(f"Creating new user: {clerk_user_id}. Role: {initial_role.value}")
             user = User(
-                clerk_user_id=user_data.clerk_user_id,
+                clerk_user_id=clerk_user_id,
                 email=user_data.email,
                 first_name=resolved_first or "Unknown",
                 last_name=resolved_last or "Unknown",
@@ -165,7 +207,7 @@ async def sync_user(
         db.refresh(user)
         
         logger.info(f"User synced successfully: {user.clerk_user_id} (ID: {user.id})")
-        return user
+        return _build_user_response(user, db)
         
     except HTTPException:
         # Re-raise HTTP exceptions
@@ -208,7 +250,7 @@ async def get_user(
             detail=f"User not found: {clerk_user_id}"
         )
     
-    return user
+    return _build_user_response(user, db)
 
 
 @router.get("/me", response_model=UserResponse)
@@ -228,7 +270,7 @@ async def get_current_user(
             status_code=401,
             detail="User profile not found. Complete sign-up via POST /api/auth/sync first."
         )
-    return user
+    return _build_user_response(user, db)
 
 
 
@@ -319,7 +361,7 @@ async def admin_create_user(
         db.refresh(user)
 
         logger.info(f"Admin created new user successfully: {user.clerk_user_id} (ID: {user.id})")
-        return user
+        return _build_user_response(user, db)
 
     except SQLAlchemyError as e:
         db.rollback()
@@ -566,7 +608,7 @@ async def update_user_role(
     logger.info("User %d (%s) role changed from %s to %s by user %d",
                 target.id, target.email, old_role, new_role.value, current_user.id)
 
-    return target
+    return _build_user_response(target, db)
 
 
 # ── Push notification token ────────────────────────────────────────────────

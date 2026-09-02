@@ -36,9 +36,7 @@ def _expiry_notification_copy(plan_id: str, plan_name: str) -> tuple:
 
 
 async def _notify_expired_users(clerk_user_ids_and_plans: list) -> None:
-    """Send the expiry push notification for each (clerk_user_id, plan_id) pair.
-    Runs after the DB commit so a slow/failing push never blocks or rolls back
-    the subscription-expiry update itself."""
+    """Send the expiry push notification for each (clerk_user_id, plan_id) pair."""
     if not clerk_user_ids_and_plans:
         return
     db = SessionLocal()
@@ -90,8 +88,6 @@ def check_expired_subscriptions():
     finally:
         db.close()
 
-    # Notify after the DB commit — a slow/failing push must never block or
-    # roll back the subscription-expiry update itself.
     asyncio.run(_notify_expired_users(notify_targets))
 
 async def _reconcile_pending_intouchpay_payments_async():

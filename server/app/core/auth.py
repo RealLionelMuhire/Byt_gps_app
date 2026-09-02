@@ -39,6 +39,7 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.models.user import User, Role
 from app.models.device import Device
+from app.models.company import Membership
 
 logger = logging.getLogger(__name__)
 
@@ -193,19 +194,31 @@ async def require_super_admin(
     return user
 
 
-def user_can_access_device(user: User, device: Device) -> bool:
-    """True if `user` owns `device`, or holds an admin role."""
-    return user.role in REQUIRE_ADMIN_ROLES or device.user_id == user.id
+def user_can_access_device(user: User, device: Device, db: Session = None) -> bool:
+    """True if `user` holds an admin role, or is a member of the device's company.
 
-
-def require_device_access(device: Device, user: User) -> Device:
+    Legacy fallback: if device.company_id is not set but device.user_id is,
+    allow access when user.id matches (backward compat during migration).
     """
-    Raise 404 unless `user` owns `device` or holds an admin role.
+    if user.role in REQUIRE_ADMIN_ROLES:
+        return True
+    if device.company_id and db is not None:
+        return db.query(Membership).filter(
+            Membership.user_id == user.id,
+            Membership.company_id == device.company_id,
+        ).first() is not None
+    # Legacy fallback for devices not yet migrated
+    return device.user_id == user.id
 
-    Uses 404 (not 403) so a non-owner gets the same response whether the
+
+def require_device_access(device: Device, user: User, db: Session = None) -> Device:
+    """
+    Raise 404 unless `user` can access `device` (company member or admin).
+
+    Uses 404 (not 403) so a non-member gets the same response whether the
     device doesn't exist or simply isn't theirs — matching the existing
     convention in get_device_status_by_imei_ownership().
     """
-    if not user_can_access_device(user, device):
+    if not user_can_access_device(user, device, db):
         raise HTTPException(status_code=404, detail="Device not found")
     return device
