@@ -39,6 +39,7 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.models.user import User, Role
 from app.models.device import Device
+from app.models.vehicle import Vehicle
 
 logger = logging.getLogger(__name__)
 
@@ -209,3 +210,25 @@ def require_device_access(device: Device, user: User) -> Device:
     if not user_can_access_device(user, device):
         raise HTTPException(status_code=404, detail="Device not found")
     return device
+
+
+def user_can_access_vehicle(user: User, vehicle: Vehicle) -> bool:
+    """True if `user` owns `vehicle`, or holds an admin role.
+
+    Vehicle has no numeric owner FK (only `clerk_user_id`, the Clerk
+    subject string), unlike Device's `user_id`, so ownership is compared
+    on that field instead.
+    """
+    return user.role in REQUIRE_ADMIN_ROLES or vehicle.clerk_user_id == user.clerk_user_id
+
+
+def require_vehicle_access(vehicle: Vehicle, user: User) -> Vehicle:
+    """
+    Raise 404 unless `user` owns `vehicle` or holds an admin role.
+
+    Mirrors require_device_access: 404 (not 403) so a non-owner gets the
+    same response whether the vehicle doesn't exist or simply isn't theirs.
+    """
+    if not user_can_access_vehicle(user, vehicle):
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    return vehicle

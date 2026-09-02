@@ -761,11 +761,24 @@ async def delete_device(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    """Delete device"""
+    """
+    Delete device.
+
+    Any Vehicle rows still pointing at this device are unlinked
+    (device_id cleared) first rather than left dangling on a deleted
+    device_id — the vehicle's registration record (nickname/plate/make/
+    model) is kept, it just no longer resolves a live device until
+    re-paired.
+    """
     device = db.query(Device).filter(Device.id == device_id).first()
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
     require_device_access(device, user)
+
+    db.query(Vehicle).filter(Vehicle.device_id == device_id).update(
+        {"device_id": None, "updated_at": datetime.utcnow()}
+    )
+
     db.delete(device)
     db.commit()
     return None
@@ -855,6 +868,24 @@ async def assign_device_to_client(
     return _apply_assignment(device, target, db)
 
 
+def _release_device_to_inventory(device: Device) -> None:
+    """
+    Clear ownership and reset a device to `in_stock`, issuing a fresh
+    pairing PIN so the next client uses a secret the previous owner never
+    saw. Caller is responsible for commit/refresh.
+
+    Shared by the admin-only unassign endpoint below and by vehicle
+    deletion (app/api/onboarding.py delete_vehicle) — both release a
+    device back to inventory the same way, so the transition can't drift
+    between the two entry points.
+    """
+    device.user_id = None
+    device.lifecycle = "in_stock"
+    alphabet = string.ascii_uppercase + string.digits
+    device.pairing_pin = "".join(secrets.choice(alphabet) for _ in range(6))
+    device.updated_at = datetime.utcnow()
+
+
 @router.post("/{device_id}/unassign", response_model=DeviceResponse)
 async def unassign_device_from_client(
     device_id: int,
@@ -877,12 +908,7 @@ async def unassign_device_from_client(
     if device.user_id is None:
         return device
 
-    device.user_id = None
-    device.lifecycle = "in_stock"
-    # Fresh PIN so the next client uses a secret the previous owner never saw
-    alphabet = string.ascii_uppercase + string.digits
-    device.pairing_pin = "".join(secrets.choice(alphabet) for _ in range(6))
-    device.updated_at = datetime.utcnow()
+    _release_device_to_inventory(device)
     db.commit()
     db.refresh(device)
 

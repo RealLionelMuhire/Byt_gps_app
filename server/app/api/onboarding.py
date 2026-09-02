@@ -27,12 +27,18 @@ from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.core.database import get_db
-from app.core.auth import require_auth
+from app.core.auth import (
+    require_auth,
+    get_current_user,
+    user_can_access_device,
+    require_vehicle_access,
+    REQUIRE_ADMIN_ROLES,
+)
 from app.models.user import User, Role
 from app.models.device import Device
 from app.models.vehicle import Vehicle
 from app.models.subscription import Subscription, Payment
-from app.api.devices import _check_pair_rate_limit
+from app.api.devices import _check_pair_rate_limit, _release_device_to_inventory
 from app.api.auth import claim_pending_client_user
 from app.api.subscriptions import plan_config, plan_purchasable
 from app.services.intouchpay import request_payment as intouch_request_payment, IntouchPayError
@@ -81,6 +87,10 @@ class VehicleCreateRequest(BaseModel):
 
 class VehicleResponse(BaseModel):
     vehicleId: int
+
+
+class VehicleUpdateRequest(BaseModel):
+    nickname: str
 
 
 class PaymentInitiateRequest(BaseModel):
@@ -308,49 +318,54 @@ async def get_device_status_by_imei(
 @router.post("/vehicles", response_model=VehicleResponse, status_code=201)
 async def create_vehicle(
     body: VehicleCreateRequest,
-    clerk_user_id: str = Depends(require_auth),
+    user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
-    Register a vehicle and link it to the paired GPS device.
+    Register a vehicle and link it to a paired GPS device.
+
+    Ownership is checked with the same user_can_access_device helper
+    device routes use (RBAC fix): the device must be paired to *someone*,
+    and the caller must either be that owner or hold an admin role. This
+    lets an admin register a vehicle on a client's behalf — the vehicle
+    (and plan/vehicle-limit accounting) is then attributed to the device's
+    actual owner, not the admin.
     """
     for field, value in [("nickname", body.nickname), ("plate", body.plate),
                          ("make", body.make), ("model", body.model)]:
         if not value or not value.strip():
             raise HTTPException(status_code=400, detail=f"{field} is required")
 
-    user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="User not found")
-
-    # Verify the IMEI belongs to this user
-    device = db.query(Device).filter(
-        Device.imei == body.deviceImei,
-        Device.user_id == user.id,
-    ).first()
-    if not device:
+    device = db.query(Device).filter(Device.imei == body.deviceImei).first()
+    if device is None or device.user_id is None or not user_can_access_device(user, device):
         raise HTTPException(status_code=403, detail="Device not paired to your account")
 
-    # Enforce plan limits (admin-configured via subscription_plans)
+    owner = device.user
+    owner_clerk_id = owner.clerk_user_id
+
+    # Enforce plan limits (admin-configured via subscription_plans) —
+    # always against the device owner's plan/vehicle count, not the
+    # caller's, so an admin acting on a client's behalf doesn't get
+    # measured against their own (nonexistent) subscription.
     sub = db.query(Subscription).filter(
-        Subscription.clerk_user_id == clerk_user_id,
+        Subscription.clerk_user_id == owner_clerk_id,
         Subscription.status == "active"
     ).first()
-    
+
     current_plan = sub.plan_id if sub else "trial"
     vehicle_limit = plan_config(db, current_plan)["max_devices"]
 
     if vehicle_limit is not None:
-        current_vehicles_count = db.query(Vehicle).filter(Vehicle.clerk_user_id == clerk_user_id).count()
+        current_vehicles_count = db.query(Vehicle).filter(Vehicle.clerk_user_id == owner_clerk_id).count()
         if current_vehicles_count >= vehicle_limit:
             raise HTTPException(
-                status_code=403, 
+                status_code=403,
                 detail=f"Your {current_plan} plan only allows up to {vehicle_limit} vehicle(s). Please upgrade your plan."
             )
 
     try:
         vehicle = Vehicle(
-            clerk_user_id=clerk_user_id,
+            clerk_user_id=owner_clerk_id,
             device_id=device.id,
             nickname=body.nickname.strip(),
             plate=body.plate.strip().upper(),
@@ -359,13 +374,13 @@ async def create_vehicle(
         )
         db.add(vehicle)
 
-        user.onboarding_step = 7
-        user.updated_at = datetime.utcnow()
+        owner.onboarding_step = 7
+        owner.updated_at = datetime.utcnow()
 
         db.commit()
         db.refresh(vehicle)
 
-        logger.info("Vehicle created id=%d for user %s", vehicle.id, clerk_user_id)
+        logger.info("Vehicle created id=%d for user %s (by %s)", vehicle.id, owner_clerk_id, user.clerk_user_id)
         return VehicleResponse(vehicleId=vehicle.id)
 
     except SQLAlchemyError as exc:
@@ -680,40 +695,123 @@ async def get_billing_history(
     )
 
 
+# ── Vehicle serialization (shared by list + update) ───────────────────────────
+
+def _serialize_vehicle(v: Vehicle) -> dict:
+    device = v.device
+    return {
+        "id":        v.id,
+        "nickname":  v.nickname,
+        "plate":     v.plate,
+        "make":      v.make,
+        "model":     v.model,
+        "device": {
+            "id":        device.id      if device else None,
+            "imei":      device.imei    if device else None,
+            "status":    device.status  if device else "unknown",
+            "latitude":  device.last_latitude  if device else None,
+            "longitude": device.last_longitude if device else None,
+            "last_seen": device.last_update    if device else None,
+        } if device else None,
+        "created_at": v.created_at,
+    }
+
+
 # ── Bonus: GET /api/vehicles  (Dashboard) ─────────────────────────────────────
 
 @router.get("/vehicles")
 async def list_vehicles(
-    clerk_user_id: str = Depends(require_auth),
+    user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     """
-    Return all vehicles (with live device status) belonging to the authenticated user.
+    Return vehicles (with live device status) belonging to the authenticated
+    user — or, for admins, every vehicle in the system, matching the
+    admin-sees-everything pattern GET /api/devices already uses.
     """
-    vehicles = (
-        db.query(Vehicle)
-        .filter(Vehicle.clerk_user_id == clerk_user_id)
-        .all()
+    query = db.query(Vehicle)
+    if user.role not in REQUIRE_ADMIN_ROLES:
+        query = query.filter(Vehicle.clerk_user_id == user.clerk_user_id)
+
+    vehicles = query.all()
+    return {"vehicles": [_serialize_vehicle(v) for v in vehicles]}
+
+
+# ── PUT /api/vehicles/{id}  — rename (nickname only) ──────────────────────────
+
+@router.put("/vehicles/{vehicle_id}")
+async def update_vehicle(
+    vehicle_id: int,
+    body: VehicleUpdateRequest,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Rename a vehicle. `nickname` is the only editable field here —
+    plate/make/model stay immutable via this endpoint (making those
+    editable later is a deliberate future decision, not a default), and
+    deviceImei/device re-linking is intentionally excluded — that's a
+    separate re-pairing flow, not a plain edit.
+    """
+    nickname = body.nickname.strip()
+    if not nickname:
+        raise HTTPException(status_code=400, detail="nickname is required")
+
+    vehicle = db.query(Vehicle).filter(Vehicle.id == vehicle_id).first()
+    if not vehicle:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    require_vehicle_access(vehicle, user)
+
+    try:
+        vehicle.nickname = nickname
+        vehicle.updated_at = datetime.utcnow()
+        db.commit()
+        db.refresh(vehicle)
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error("DB error updating vehicle id=%d: %s", vehicle_id, exc)
+        raise HTTPException(status_code=500, detail="Database error")
+
+    logger.info("Vehicle %d nickname updated by %s", vehicle_id, user.clerk_user_id)
+    return _serialize_vehicle(vehicle)
+
+
+# ── DELETE /api/vehicles/{id}  — remove + release device to inventory ─────────
+
+@router.delete("/vehicles/{vehicle_id}", status_code=204)
+async def delete_vehicle(
+    vehicle_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    Delete a vehicle registration.
+
+    The linked device (if any) is released back to company inventory —
+    same unlink pattern as the admin-only POST /api/devices/{id}/unassign
+    (user_id cleared, lifecycle -> in_stock, fresh pairing PIN) — rather
+    than left dangling on a deleted Vehicle row. Deleting the vehicle is
+    how an owner gives up the device through this flow; re-pairing it (by
+    them or anyone else) requires the new PIN.
+    """
+    vehicle = db.query(Vehicle).filter(Vehicle.id == vehicle_id).first()
+    if not vehicle:
+        raise HTTPException(status_code=404, detail="Vehicle not found")
+    require_vehicle_access(vehicle, user)
+
+    device = vehicle.device
+    try:
+        db.delete(vehicle)
+        if device is not None:
+            _release_device_to_inventory(device)
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error("DB error deleting vehicle id=%d: %s", vehicle_id, exc)
+        raise HTTPException(status_code=500, detail="Database error")
+
+    logger.info(
+        "Vehicle %d deleted by %s (device %s released to inventory)",
+        vehicle_id, user.clerk_user_id, device.imei if device else "none",
     )
-
-    result = []
-    for v in vehicles:
-        device = v.device
-        result.append({
-            "id":        v.id,
-            "nickname":  v.nickname,
-            "plate":     v.plate,
-            "make":      v.make,
-            "model":     v.model,
-            "device": {
-                "id":        device.id      if device else None,
-                "imei":      device.imei    if device else None,
-                "status":    device.status  if device else "unknown",
-                "latitude":  device.last_latitude  if device else None,
-                "longitude": device.last_longitude if device else None,
-                "last_seen": device.last_update    if device else None,
-            } if device else None,
-            "created_at": v.created_at,
-        })
-
-    return {"vehicles": result}
+    return None
