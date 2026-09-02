@@ -1174,8 +1174,61 @@ async def get_device_alarms(
         query = query.filter(Location.timestamp <= end_time)
     
     alarms = query.order_by(Location.timestamp.desc()).limit(limit).all()
-    
+
     return alarms
+
+
+class RecentAlarmResponse(BaseModel):
+    id: int
+    device_id: int
+    device_name: str
+    alarm_type: Optional[str]
+    latitude: float
+    longitude: float
+    timestamp: datetime
+
+    class Config:
+        from_attributes = True
+
+
+@router.get("/alarms/recent", response_model=List[RecentAlarmResponse])
+async def get_recent_alarms(
+    limit: int = Query(20, ge=1, le=100),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """
+    Most recent alarm events across every device the caller can see (same
+    ownership rule as GET /api/devices/ — admins get every device, everyone
+    else only their own). Backs the Home dashboard's "Recent Alarms" card.
+
+    Unlike /{device_id}/alarms, this is fleet-wide (no single device_id) and
+    has no date-range window — just the newest `limit` alarm rows regardless
+    of age, since the dashboard only cares about "what happened most
+    recently," not a bounded period.
+    """
+    query = (
+        db.query(Location, Device.name)
+        .join(Device, Device.id == Location.device_id)
+        .filter(Location.is_alarm == True)
+    )
+    if user.role not in (Role.SUPER_ADMIN, Role.ADMIN):
+        query = query.filter(Device.user_id == user.id)
+
+    rows = query.order_by(Location.timestamp.desc()).limit(limit).all()
+
+    return [
+        RecentAlarmResponse(
+            id=location.id,
+            device_id=location.device_id,
+            device_name=device_name,
+            alarm_type=location.alarm_type,
+            latitude=location.latitude,
+            longitude=location.longitude,
+            timestamp=location.timestamp,
+        )
+        for location, device_name in rows
+    ]
 
 
 @router.get("/nearby")
