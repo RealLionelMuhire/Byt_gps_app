@@ -17,6 +17,7 @@ import time
 from typing import Dict, List, Optional, Tuple
 
 import httpx
+from sqlalchemy import tuple_
 from sqlalchemy.exc import IntegrityError
 
 from app.core.config import settings
@@ -104,6 +105,30 @@ def _db_cache_get(lat_rounded: float, lon_rounded: float) -> Optional[str]:
     except Exception as e:
         logger.warning("Geocode DB cache lookup failed: %s", e)
         return None
+    finally:
+        db.close()
+
+
+def _db_cache_get_many(
+    keys: List[Tuple[float, float]]
+) -> Dict[Tuple[float, float], str]:
+    """Batched counterpart to _db_cache_get -- one query (and one
+    connection) for many rounded lat/lon keys, instead of opening a
+    separate DB session per key in a loop. A key with no cached row simply
+    isn't present in the returned dict."""
+    if not keys:
+        return {}
+    db = SessionLocal()
+    try:
+        rows = (
+            db.query(GeocodeCache)
+            .filter(tuple_(GeocodeCache.lat, GeocodeCache.lon).in_(keys))
+            .all()
+        )
+        return {(row.lat, row.lon): row.place_name for row in rows}
+    except Exception as e:
+        logger.warning("Batched geocode DB cache lookup failed: %s", e)
+        return {}
     finally:
         db.close()
 
@@ -220,6 +245,62 @@ def reverse_geocode_many(
         results[(lat, lon)] = resolved_by_key[key]
 
     return results
+
+
+def reverse_geocode_many_cached_only(
+    coords: List[Tuple[float, float]],
+    results: Optional[Dict[Tuple[float, float], Optional[str]]] = None,
+) -> List[Tuple[float, float]]:
+    """
+    Like reverse_geocode_many, but never makes a Nominatim network call and
+    never sleeps -- only resolves points already known from the in-memory
+    or DB cache. Fast enough to call synchronously from a request handler
+    regardless of how many points are passed, unlike reverse_geocode_many
+    which can take ~1s per genuinely new point.
+
+    Writes cache hits into `results` (same convention as
+    reverse_geocode_many) and returns the coords that weren't cached, in
+    original unrounded form with duplicates included -- pass those to
+    reverse_geocode_many (e.g. via FastAPI's BackgroundTasks) to warm the
+    cache for next time without making the current request wait on it.
+
+    Does at most one DB round-trip total (via _db_cache_get_many), not one
+    per point -- a period with N distinct driving-segment endpoints used to
+    mean N separate DB sessions opened one at a time in a loop here.
+    """
+    if results is None:
+        results = {}
+    resolved_by_key: Dict[Tuple[float, float], Optional[str]] = {}
+
+    # Pass 1: in-memory cache only (no I/O) -- also collects the distinct
+    # keys that still need a DB check.
+    keys_needing_db: List[Tuple[float, float]] = []
+    for lat, lon in coords:
+        key = (_round_coord(lat), _round_coord(lon))
+        if key in _CACHE:
+            resolved_by_key[key] = _CACHE[key]
+        elif key not in resolved_by_key and key not in keys_needing_db:
+            keys_needing_db.append(key)
+
+    # Pass 2: one batched query for everything the in-memory cache missed.
+    if keys_needing_db:
+        db_hits = _db_cache_get_many(keys_needing_db)
+        for key in keys_needing_db:
+            place_name = db_hits.get(key)
+            if place_name is not None:
+                _CACHE[key] = place_name
+                resolved_by_key[key] = place_name
+
+    # Pass 3: assemble the per-input-coord result and the real misses.
+    missing: List[Tuple[float, float]] = []
+    for lat, lon in coords:
+        key = (_round_coord(lat), _round_coord(lon))
+        if key in resolved_by_key:
+            results[(lat, lon)] = resolved_by_key[key]
+        else:
+            missing.append((lat, lon))
+
+    return missing
 
 
 def build_trip_display_name(

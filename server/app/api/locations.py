@@ -1,9 +1,7 @@
 """Location API endpoints"""
 
-import asyncio
-import logging
 from typing import Dict, List, Optional, Tuple
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from datetime import datetime, timedelta
 from pydantic import BaseModel
@@ -16,9 +14,8 @@ from app.models.location_quality_log import LocationQualityLog
 from app.models.device import Device
 from app.models.user import User, Role
 from app.services.trip_settings_service import get_or_create_trip_settings
-from app.services.geocoding import reverse_geocode_many
+from app.services.geocoding import reverse_geocode_many, reverse_geocode_many_cached_only
 
-logger = logging.getLogger(__name__)
 router = APIRouter()
 
 
@@ -531,20 +528,6 @@ def find_since_last_stop_window(
     return [], fallback_start, None, False
 
 
-# Geocoding a whole period could, worst case, hit many genuinely distinct
-# driving-segment endpoints -- Nominatim allows only 1 req/sec, so cap total
-# geocoding wall-clock time per request rather than let it stall the
-# response indefinitely. Segments not resolved within the cap just fall
-# back to coordinate strings; the route itself is never blocked on this.
-# 45s comfortably covers ~20 distinct new locations (a full week's worth of
-# driving segments, typically) at ~1-2s each (network + fair-use delay);
-# a first-time 30-day period with many distinct stops may still exceed it
-# for some segments -- those just fall back, and get cached for next time
-# (the background geocoding thread isn't cancelled by the timeout, so the
-# DB cache still ends up warmed even for calls that fell back).
-PERIOD_ROUTE_GEOCODING_TIMEOUT_SECONDS = 45.0
-
-
 def _driving_segment_endpoints(segments: List[dict]) -> List[Tuple[float, float]]:
     """Collect (lat, lon) for the start and end point of every "driving"
     segment, for a single batched reverse-geocoding pass."""
@@ -1018,6 +1001,7 @@ async def get_device_route_line(
 @router.get("/{device_id}/period-route")
 async def get_period_route(
     device_id: int,
+    background_tasks: BackgroundTasks,
     start: datetime = Query(..., description="Period start (UTC)"),
     end: datetime = Query(..., description="Period end (UTC)"),
     simplify: bool = Query(True, description="Simplify driving segments via Douglas-Peucker to reduce point count"),
@@ -1066,28 +1050,20 @@ async def get_period_route(
 
     coords = _driving_segment_endpoints(segments)
     if coords:
-        # `places` is passed into reverse_geocode_many and written into as
-        # each point resolves, so if the overall deadline fires mid-batch we
-        # still have whatever finished before it -- points resolved in time
-        # get real names, only the still-in-flight ones fall back to
-        # coordinates (see reverse_geocode_many's docstring). The background
-        # thread is not cancelled by the timeout and keeps populating both
-        # `places` (harmlessly, after the response has already been built
-        # from a stale read) and the DB cache for next time.
+        # Cache-only lookup -- returns instantly, no Nominatim calls, so the
+        # response is never held up waiting on reverse geocoding (that used
+        # to cap out at PERIOD_ROUTE_GEOCODING_TIMEOUT_SECONDS = 45s, well
+        # past the mobile client's own request timeout, so a period with
+        # several previously-unseen locations reliably timed out client-side
+        # before this endpoint could even finish). Points not yet cached
+        # just fall back to coordinate strings this time (see
+        # _attach_driving_place_names) and get resolved for real in the
+        # background below, so the next request covering the same segments
+        # gets real names from cache.
         places: Dict[Tuple[float, float], Optional[str]] = {}
-        try:
-            await asyncio.wait_for(
-                asyncio.to_thread(reverse_geocode_many, coords, places),
-                timeout=PERIOD_ROUTE_GEOCODING_TIMEOUT_SECONDS,
-            )
-        except Exception as e:
-            distinct_requested = len(set(coords))
-            logger.warning(
-                "Geocoding for period-route (device %s) did not finish within %.0fs "
-                "(%d/%d distinct point(s) resolved in time): %s",
-                device_id, PERIOD_ROUTE_GEOCODING_TIMEOUT_SECONDS,
-                len(places), distinct_requested, e,
-            )
+        missing = reverse_geocode_many_cached_only(coords, places)
+        if missing:
+            background_tasks.add_task(reverse_geocode_many, missing)
         _attach_driving_place_names(segments, places)
 
     total_distance_km = round(sum(s["distance_km"] for s in segments if s["type"] == "driving"), 3)
