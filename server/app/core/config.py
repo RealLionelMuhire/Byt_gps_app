@@ -55,6 +55,13 @@ class Settings(BaseSettings):
     INTOUCH_PARTNER_PASSWORD: Optional[str] = None
     INTOUCH_CALLBACK_URL: Optional[str] = None
 
+    # Firebase Cloud Messaging (push notifications) — see app/services/push_notifications.py.
+    # Set exactly one of these to enable FCM sending; if neither is set, FCM sending
+    # is skipped (falls back to Expo, or no-ops) rather than crashing on startup.
+    # JSON content takes precedence over the path if both happen to be set.
+    FIREBASE_SERVICE_ACCOUNT_JSON: Optional[str] = None  # raw service-account key JSON, for env-var-only deployments
+    FIREBASE_SERVICE_ACCOUNT_PATH: Optional[str] = None  # path to the service-account key JSON file
+
     @property
     def admin_user_ids(self) -> set:
         """Return the set of authorized admin Clerk user IDs."""

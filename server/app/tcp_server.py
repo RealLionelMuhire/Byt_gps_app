@@ -7,21 +7,34 @@ Handles binary protocol communication
 import asyncio
 import logging
 from typing import Dict, List, Optional, Set
-from datetime import datetime
+from datetime import datetime, timedelta
 import struct
 
 from app.protocol_parser import ProtocolParser
 from app.core.database import SessionLocal
 from app.models.alert_settings import AlertSettings
+from app.models.alarm_push_state import AlarmPushState
 from app.models.device import Device
 from app.models.location import Location
 from app.models.location_quality_log import LocationQualityLog
 from app.api.locations import classify_outlier, compute_quality_log_fields
 from app.services.geofencing import evaluate_geofences, GeofenceTransition
 from app.services.push_notifications import send_push_notification
+from app.services.alarm_rules import (
+    ALARM_LABELS,
+    ALARM_SETTING_FIELDS,
+    get_severity,
+    get_severity_rank,
+    is_critical,
+)
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger(__name__)
+
+# A push already sent for a given (device, alarm_type) suppresses another
+# push for the same combination within this window, unless the alarm type is
+# in CRITICAL_ALARM_TYPES (see app/services/alarm_rules.py — never deduped).
+PUSH_DEDUP_WINDOW_MINUTES = 3
 
 
 def _evaluate_incoming_point(
@@ -92,12 +105,13 @@ def _apply_geofence_transitions(
 
 async def _broadcast_geofence_transitions(
     server: 'TCPServer', device_id: int, data: Dict, transitions: List[GeofenceTransition],
+    location_id: Optional[int] = None,
 ) -> None:
     """Fire one broadcast_alarm() per detected transition — same WS + push
     pipeline as any other alarm, just with a synthesized alarm_type."""
     for t in transitions:
         alarm_data = {**data, "alarm_type": "Enter fence" if t.entered else "Exit fence"}
-        await server.broadcast_alarm(device_id, alarm_data)
+        await server.broadcast_alarm(device_id, alarm_data, location_id=location_id)
 
 
 class GPSTrackerConnection:
@@ -338,7 +352,7 @@ class GPSTrackerConnection:
                     # structurally impossible regardless of what trip
                     # auto-start does in the future.
                     await self.server.broadcast_location_update(device.id, data)
-                    await _broadcast_geofence_transitions(self.server, device.id, data, geofence_transitions)
+                    await _broadcast_geofence_transitions(self.server, device.id, data, geofence_transitions, location_id=location.id)
 
                     # Auto-start a trip the first time this device reports a
                     # gps_valid fix at/above the owner's "moving" speed
@@ -475,8 +489,8 @@ class GPSTrackerConnection:
                     db.commit()
 
                     # Broadcast alarm to WebSocket clients
-                    await self.server.broadcast_alarm(device.id, data)
-                    await _broadcast_geofence_transitions(self.server, device.id, data, geofence_transitions)
+                    await self.server.broadcast_alarm(device.id, data, location_id=location.id)
+                    await _broadcast_geofence_transitions(self.server, device.id, data, geofence_transitions, location_id=location.id)
             
             finally:
                 db.close()
@@ -638,8 +652,14 @@ class TCPServer:
         }
         await self.ws_manager.broadcast(device_id, payload)
 
-    async def broadcast_alarm(self, device_id: int, data: Dict):
-        """Broadcast alarm event to all WebSocket subscribers of this device."""
+    async def broadcast_alarm(self, device_id: int, data: Dict, location_id: Optional[int] = None):
+        """Broadcast alarm event to all WebSocket subscribers of this device.
+
+        `location_id`, when known, lets _send_push_notification stamp the
+        Location row's digested_at once this alarm has been "accounted for"
+        (sent immediately, muted, or left for the periodic digest job) — see
+        that method's docstring.
+        """
         if self.ws_manager is None:
             return
 
@@ -655,7 +675,7 @@ class TCPServer:
         await self.ws_manager.broadcast(device_id, payload)
 
         # Also send a push notification to the device owner (works when app is backgrounded)
-        await self._send_push_notification(device_id, data)
+        await self._send_push_notification(device_id, data, location_id=location_id)
     
     async def send_command_to_device(self, imei: str, command: str, timeout: float = 10.0) -> Dict:
         """Send an ASCII command to a connected device and return the response."""
@@ -664,7 +684,7 @@ class TCPServer:
             return {"success": False, "error": "Device not connected"}
         return await connection.send_command(command, timeout=timeout)
 
-    async def _send_push_notification(self, device_id: int, data: Dict) -> None:
+    async def _send_push_notification(self, device_id: int, data: Dict, location_id: Optional[int] = None) -> None:
         """
         Send an Expo push notification to the owner of a device when an alarm fires.
         Looks up the owner's expo_push_token from the DB and posts to the Expo Push API
@@ -678,44 +698,24 @@ class TCPServer:
         filtering applies to the push path only \u2014 the WS broadcast in
         broadcast_alarm() already happened before this method is called and
         is unaffected.
+
+        Three disciplines on top of that original filter (see
+        app/services/alarm_rules.py):
+          - CRITICAL_ALARM_TYPES (currently just "sos") bypass the master
+            switch, per-type mute, min_push_severity, AND deduplication below
+            \u2014 deliberate: a user must never be able to accidentally mute a
+            safety-critical alert, and a repeated SOS press must never be
+            treated as a suppressible "duplicate".
+          - Deduplication: a push already sent for this (device, alarm_type)
+            within PUSH_DEDUP_WINDOW_MINUTES is skipped.
+          - Digest hand-off: when `location_id` is given and this alarm is
+            suppressed purely by the min_push_severity threshold (not by an
+            explicit mute or dedup), the Location row's digested_at is left
+            NULL so scripts/cron_alarm_digest.py can fold it into a periodic
+            summary later. Every other outcome (sent, critical bypass,
+            explicit mute, deduped) stamps digested_at immediately so the
+            digest job never double-notifies or resurrects a muted alert.
         """
-        ALARM_LABELS: Dict[str, tuple] = {
-            "sos":          ("\U0001f198 SOS Alert",         "Emergency SOS triggered"),
-            "vibration":    ("\U0001f4f3 Vibration Detected", "Unusual movement detected on your vehicle"),
-            "low_battery":  ("\U0001faab Low Battery",        "GPS tracker battery is running low"),
-            "acc":          ("\U0001f511 Ignition Change",    "Vehicle ignition changed state"),
-            "overspeed":    ("\u26a1 Overspeed Alert",        "Vehicle exceeded the speed limit"),
-            "displacement": ("\U0001f4cd Displacement Alert", "Vehicle moved outside the allowed radius"),
-            "enter fence":  ("\U0001f6a7 Geofence Entered",   "Vehicle entered a geofence zone"),
-            "exit fence":   ("\U0001f6a7 Geofence Exited",    "Vehicle exited a geofence zone"),
-        }
-
-        # Fixed severity per alarm type \u2014 not stored anywhere, just used to
-        # compare against AlertSettings.min_push_severity. Unknown alarm
-        # types (not in this dict) default to "medium" so a new alarm type
-        # isn't silently swallowed by a "high"-only filter nor always able
-        # to bypass a "medium" filter.
-        ALARM_SEVERITY: Dict[str, str] = {
-            "sos": "high",
-            "overspeed": "high",
-            "displacement": "high",
-            "acc": "medium",
-            "vibration": "low",
-            "low_battery": "low",
-            "enter fence": "medium",
-            "exit fence": "medium",
-        }
-        _SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2}
-
-        ALARM_SETTING_FIELDS = {
-            "sos": "sos_push_enabled",
-            "vibration": "vibration_push_enabled",
-            "low_battery": "low_battery_push_enabled",
-            "acc": "acc_push_enabled",
-            "overspeed": "overspeed_push_enabled",
-            "displacement": "displacement_push_enabled",
-        }
-
         db = SessionLocal()
         try:
             device = db.query(Device).filter(Device.id == device_id).first()
@@ -728,20 +728,49 @@ class TCPServer:
                 return
 
             alarm_key = str(data.get("alarm_type", "")).lower()
+            location = db.query(Location).filter(Location.id == location_id).first() if location_id else None
+            critical = is_critical(alarm_key)
 
-            alert_settings = db.query(AlertSettings).filter(AlertSettings.device_id == device_id).first()
-            if alert_settings is not None:
-                if not alert_settings.push_notifications_enabled:
-                    return
+            # None -> send. "below_threshold" -> suppressed, eligible for digest.
+            # Anything else -> suppressed, already accounted for (no digest).
+            skip_reason: Optional[str] = None
 
-                setting_field = ALARM_SETTING_FIELDS.get(alarm_key)
-                if setting_field is not None and not getattr(alert_settings, setting_field):
-                    return
+            if not critical:
+                alert_settings = db.query(AlertSettings).filter(AlertSettings.device_id == device_id).first()
+                if alert_settings is not None:
+                    if not alert_settings.push_notifications_enabled:
+                        skip_reason = "muted"
+                    else:
+                        setting_field = ALARM_SETTING_FIELDS.get(alarm_key)
+                        if setting_field is not None and not getattr(alert_settings, setting_field):
+                            skip_reason = "muted"
+                        else:
+                            severity = get_severity(alarm_key)
+                            min_rank = get_severity_rank(alert_settings.min_push_severity)
+                            if get_severity_rank(severity) < min_rank:
+                                skip_reason = "below_threshold"
 
-                severity = ALARM_SEVERITY.get(alarm_key, "medium")
-                min_rank = _SEVERITY_RANK.get(alert_settings.min_push_severity, 0)
-                if _SEVERITY_RANK[severity] < min_rank:
-                    return
+                if skip_reason is None:
+                    push_state = db.query(AlarmPushState).filter(
+                        AlarmPushState.device_id == device_id,
+                        AlarmPushState.alarm_type == alarm_key,
+                    ).first()
+                    if (
+                        push_state is not None
+                        and push_state.last_push_at is not None
+                        and push_state.last_alarm_state != "resolved"
+                        and datetime.utcnow() - push_state.last_push_at < timedelta(minutes=PUSH_DEDUP_WINDOW_MINUTES)
+                    ):
+                        skip_reason = "deduped"
+
+            if skip_reason == "below_threshold":
+                return
+
+            if skip_reason is not None:
+                if location is not None and location.digested_at is None:
+                    location.digested_at = datetime.utcnow()
+                    db.commit()
+                return
 
             title, body_text = ALARM_LABELS.get(
                 alarm_key,
@@ -756,6 +785,19 @@ class TCPServer:
                 data={"type": "alarm", "device_id": device_id, "alarm_type": alarm_key},
                 channel_id="gps-alarms",
             )
+
+            push_state = db.query(AlarmPushState).filter(
+                AlarmPushState.device_id == device_id,
+                AlarmPushState.alarm_type == alarm_key,
+            ).first()
+            if push_state is None:
+                push_state = AlarmPushState(device_id=device_id, alarm_type=alarm_key)
+                db.add(push_state)
+            push_state.last_push_at = datetime.utcnow()
+            push_state.last_alarm_state = "fired"
+            if location is not None and location.digested_at is None:
+                location.digested_at = datetime.utcnow()
+            db.commit()
 
         except Exception as exc:
             logger.error("Failed to send push notification for device %d: %s", device_id, exc)

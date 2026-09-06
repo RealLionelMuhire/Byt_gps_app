@@ -29,7 +29,11 @@ class User(Base):
     onboarding_step = Column(Integer, default=0, nullable=False)
     onboarding_complete = Column(Boolean, default=False, nullable=False)
     expo_push_token = Column(String(255), nullable=True)
-    
+    # FCM registration token — see app/services/push_notifications.py. Both this
+    # and expo_push_token can coexist during the Expo->FCM client migration;
+    # send_push_notification() prefers fcm_token, falling back to expo_push_token.
+    fcm_token = Column(String(255), nullable=True)
+
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     

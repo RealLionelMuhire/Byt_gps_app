@@ -572,7 +572,7 @@ async def update_user_role(
 # ── Push notification token ────────────────────────────────────────────────
 
 class PushTokenRequest(BaseModel):
-    """Request body for saving an Expo push token."""
+    """Request body for saving a push token (Expo or FCM — see update_push_token)."""
     token: str
 
 
@@ -583,7 +583,14 @@ async def update_push_token(
     db: Session = Depends(get_db),
 ):
     """
-    Store (or update) the Expo push token for the authenticated user.
+    Store (or update) the push token for the authenticated user. Accepts
+    either an Expo push token or an FCM registration token through the same
+    field — Expo tokens are always shaped "ExponentPushToken[...]", so that
+    prefix is what tells them apart; anything else is treated as an FCM
+    token. This lets the mobile client migrate from Expo to FCM without any
+    backend contract change: it just starts sending a different kind of
+    token string to this same endpoint. See app/services/push_notifications.py
+    for how the two are used at send time (FCM preferred, Expo fallback).
 
     Called by the mobile app once on login so the backend can send push
     notifications when a GPS alarm fires on one of their devices.
@@ -592,7 +599,10 @@ async def update_push_token(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    user.expo_push_token = body.token
+    if body.token.startswith("ExponentPushToken["):
+        user.expo_push_token = body.token
+    else:
+        user.fcm_token = body.token
     user.updated_at = datetime.utcnow()
     db.commit()
 

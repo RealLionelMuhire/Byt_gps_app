@@ -653,6 +653,7 @@ class LocationResponse(BaseModel):
     is_outlier: bool
     is_alarm: bool
     alarm_type: Optional[str]
+    acknowledged_at: Optional[datetime]
     timestamp: datetime
     received_at: datetime
     
@@ -1176,6 +1177,39 @@ async def get_device_alarms(
     alarms = query.order_by(Location.timestamp.desc()).limit(limit).all()
 
     return alarms
+
+
+@router.post("/{location_id}/acknowledge", response_model=LocationResponse)
+async def acknowledge_alarm(
+    location_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """
+    Mark an alarm event as seen/handled — the app calls this when the user
+    opens the alert history list or taps an explicit "acknowledge" action on
+    a critical alert. Idempotent: acknowledging an already-acknowledged alarm
+    just returns it unchanged.
+
+    Feeds scripts/cron_alarm_escalation.py — an unacknowledged CRITICAL alarm
+    (see app/services/alarm_rules.CRITICAL_ALARM_TYPES) gets exactly one
+    resend if it's still unacknowledged past ESCALATION_WINDOW_MINUTES; this
+    endpoint is what stops that resend from firing.
+    """
+    location = db.query(Location).filter(Location.id == location_id).first()
+    if not location:
+        raise HTTPException(status_code=404, detail="Alarm not found")
+    if not location.is_alarm:
+        raise HTTPException(status_code=400, detail="Location is not an alarm event")
+
+    verify_device_access(location.device_id, user, db)
+
+    if location.acknowledged_at is None:
+        location.acknowledged_at = datetime.utcnow()
+        db.commit()
+        db.refresh(location)
+
+    return location
 
 
 class RecentAlarmResponse(BaseModel):

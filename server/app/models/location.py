@@ -32,7 +32,18 @@ class Location(Base):
     # Alarm info
     is_alarm = Column(Boolean, default=False)
     alarm_type = Column(String(50), nullable=True)
-    
+
+    # Alarm notification-delivery discipline (see app/services/alarm_rules.py
+    # and TCPServer._send_push_notification in app/tcp_server.py):
+    # - acknowledged_at: set when the user views/acknowledges this alarm in the app.
+    # - escalated_at: set once the one-time unacknowledged-critical-alarm resend has fired.
+    # - digested_at: set once this alarm has been "accounted for" via push (sent
+    #   immediately, explicitly muted, or folded into a digest) — NULL means it's
+    #   still awaiting the periodic low/medium digest job.
+    acknowledged_at = Column(DateTime, nullable=True)
+    escalated_at = Column(DateTime, nullable=True)
+    digested_at = Column(DateTime, nullable=True)
+
     # Timestamps
     timestamp = Column(DateTime, nullable=False, index=True)  # GPS tracker time
     received_at = Column(DateTime, default=datetime.utcnow)  # Server receive time

@@ -28,6 +28,10 @@ wheels/
 .env.local
 .env.*.local
 
+# Firebase service-account keys (Admin SDK credentials) — never commit these
+*firebase-adminsdk*.json
+firebase-service-account*.json
+
 # IDEs
 .vscode/
 .idea/
