@@ -62,7 +62,7 @@ def init_db():
         conn.commit()
 
     # Import all models here
-    from app.models import device, location, user, geofence, trip, trip_settings
+    from app.models import device, location, user, geofence, geofence_device_state, trip, trip_settings
 
     # Create tables
     Base.metadata.create_all(bind=engine)

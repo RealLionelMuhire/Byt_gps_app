@@ -6,7 +6,7 @@ Handles binary protocol communication
 
 import asyncio
 import logging
-from typing import Dict, Optional, Set
+from typing import Dict, List, Optional, Set
 from datetime import datetime
 import struct
 
@@ -17,6 +17,7 @@ from app.models.device import Device
 from app.models.location import Location
 from app.models.location_quality_log import LocationQualityLog
 from app.api.locations import classify_outlier, compute_quality_log_fields
+from app.services.geofencing import evaluate_geofences, GeofenceTransition
 from app.services.push_notifications import send_push_notification
 from sqlalchemy.orm import Session
 
@@ -62,6 +63,41 @@ def _evaluate_incoming_point(
 
     quality_fields = compute_quality_log_fields(prev1, lon, lat, course, satellites, ts)
     return {"is_outlier": new_is_outlier, "quality_fields": quality_fields}
+
+
+def _apply_geofence_transitions(
+    db: Session, device: Device, location: Location, lon: float, lat: float,
+) -> List[GeofenceTransition]:
+    """
+    Evaluate the just-ingested point against the device owner's geofences
+    (see app/services/geofencing.py) and, if any enter/exit transitions
+    fired, reflect the first one on `location` — unless it already carries
+    a hardware-reported alarm_type (handle_alarm's case), which takes
+    priority since it's a real device alarm, not a synthesized one.
+
+    Must be called after `location` has been added to `db` and before
+    `db.commit()` — GeofenceDeviceState rows are staged on the same
+    session so they commit atomically with the Location row. Returns the
+    full transition list; the caller broadcasts each one after commit.
+    """
+    if not device.user_id:
+        return []
+
+    transitions = evaluate_geofences(db, device.id, device.user_id, lon, lat)
+    if transitions and not location.is_alarm:
+        location.is_alarm = True
+        location.alarm_type = "Enter fence" if transitions[0].entered else "Exit fence"
+    return transitions
+
+
+async def _broadcast_geofence_transitions(
+    server: 'TCPServer', device_id: int, data: Dict, transitions: List[GeofenceTransition],
+) -> None:
+    """Fire one broadcast_alarm() per detected transition — same WS + push
+    pipeline as any other alarm, just with a synthesized alarm_type."""
+    for t in transitions:
+        alarm_data = {**data, "alarm_type": "Enter fence" if t.entered else "Exit fence"}
+        await server.broadcast_alarm(device_id, alarm_data)
 
 
 class GPSTrackerConnection:
@@ -280,7 +316,11 @@ class GPSTrackerConnection:
                     device.last_longitude = data['longitude']
                     device.last_update = datetime.utcnow()
                     device.status = 'online'
-                    
+
+                    geofence_transitions = _apply_geofence_transitions(
+                        db, device, location, data['longitude'], data['latitude']
+                    )
+
                     db.commit()
 
                     # Broadcast to WebSocket clients — deliberately runs
@@ -298,6 +338,7 @@ class GPSTrackerConnection:
                     # structurally impossible regardless of what trip
                     # auto-start does in the future.
                     await self.server.broadcast_location_update(device.id, data)
+                    await _broadcast_geofence_transitions(self.server, device.id, data, geofence_transitions)
 
                     # Auto-start a trip the first time this device reports a
                     # gps_valid fix at/above the owner's "moving" speed
@@ -422,11 +463,20 @@ class GPSTrackerConnection:
                     device.last_latitude = data['latitude']
                     device.last_longitude = data['longitude']
                     device.last_update = datetime.utcnow()
-                    
+
+                    # location.is_alarm is already True with the hardware's
+                    # own alarm_type above, so this can only add *additional*
+                    # geofence transitions to broadcast — it never overwrites
+                    # a real device alarm on the stored row.
+                    geofence_transitions = _apply_geofence_transitions(
+                        db, device, location, data['longitude'], data['latitude']
+                    )
+
                     db.commit()
-                    
+
                     # Broadcast alarm to WebSocket clients
                     await self.server.broadcast_alarm(device.id, data)
+                    await _broadcast_geofence_transitions(self.server, device.id, data, geofence_transitions)
             
             finally:
                 db.close()
@@ -636,6 +686,8 @@ class TCPServer:
             "acc":          ("\U0001f511 Ignition Change",    "Vehicle ignition changed state"),
             "overspeed":    ("\u26a1 Overspeed Alert",        "Vehicle exceeded the speed limit"),
             "displacement": ("\U0001f4cd Displacement Alert", "Vehicle moved outside the allowed radius"),
+            "enter fence":  ("\U0001f6a7 Geofence Entered",   "Vehicle entered a geofence zone"),
+            "exit fence":   ("\U0001f6a7 Geofence Exited",    "Vehicle exited a geofence zone"),
         }
 
         # Fixed severity per alarm type \u2014 not stored anywhere, just used to
@@ -650,6 +702,8 @@ class TCPServer:
             "acc": "medium",
             "vibration": "low",
             "low_battery": "low",
+            "enter fence": "medium",
+            "exit fence": "medium",
         }
         _SEVERITY_RANK = {"low": 0, "medium": 1, "high": 2}
 

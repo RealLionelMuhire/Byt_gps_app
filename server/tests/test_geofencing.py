@@ -1,0 +1,181 @@
+"""
+Unit tests for app/services/geofencing.py — server-side enter/exit
+transition detection, replacing reliance on the device's own (unconfigurable)
+GT06 fence alarm bytes.
+
+Uses the `db_session` fixture from conftest.py (isolated in-memory SQLite)
+directly, without going through the TCP server or HTTP API, to exercise
+evaluate_geofences() against a realistic ping sequence for one device.
+"""
+
+from datetime import datetime, timedelta
+
+from app.models.user import User, Role
+from app.models.device import Device
+from app.models.geofence import Geofence
+from app.models.geofence_device_state import GeofenceDeviceState
+from app.services.geofencing import evaluate_geofences
+
+
+def make_user(db, clerk_id="clerk_geofence_owner"):
+    user = User(
+        clerk_user_id=clerk_id,
+        email=f"{clerk_id}@example.com",
+        first_name="Test",
+        last_name="User",
+        role=Role.USER,
+        onboarding_step=0,
+        onboarding_complete=False,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def make_device(db, owner: User, imei="123456789012345"):
+    # -1.9, 30.05 is the Kigali coordinate already used as this device's
+    # last-known location by the fixtures in test_vehicles_api.py.
+    device = Device(
+        imei=imei,
+        name="Device 1",
+        lifecycle="sold",
+        user_id=owner.id,
+        status="online",
+        last_latitude=-1.9,
+        last_longitude=30.05,
+        last_update=datetime.utcnow(),
+    )
+    db.add(device)
+    db.commit()
+    db.refresh(device)
+    return device
+
+
+def make_geofence(db, owner: User, **overrides):
+    defaults = dict(
+        user_id=owner.id,
+        name="Home",
+        center_latitude=-1.9,
+        center_longitude=30.05,
+        radius_meters=200,
+        is_active=True,
+        alert_on_enter=True,
+        alert_on_exit=True,
+    )
+    defaults.update(overrides)
+    geofence = Geofence(**defaults)
+    db.add(geofence)
+    db.commit()
+    db.refresh(geofence)
+    return geofence
+
+
+# Well outside the 200m radius geofence centered on (-1.9, 30.05).
+OUTSIDE = (30.10, -1.95)
+# Exactly the geofence center — well inside.
+INSIDE = (30.05, -1.9)
+# ~40m from center (well inside a 200m radius).
+INSIDE_NEARBY = (30.0505, -1.9003)
+
+
+def test_first_observation_seeds_state_without_firing(db_session):
+    """A device already inside a brand-new geofence the first time it's
+    evaluated must not fire a spurious 'Enter fence' — only real
+    transitions after the baseline should alarm."""
+    owner = make_user(db_session)
+    device = make_device(db_session, owner)
+    geofence = make_geofence(db_session, owner)
+
+    transitions = evaluate_geofences(db_session, device.id, owner.id, *INSIDE)
+    db_session.commit()
+
+    assert transitions == []
+    state = db_session.query(GeofenceDeviceState).filter_by(
+        device_id=device.id, geofence_id=geofence.id
+    ).first()
+    assert state is not None
+    assert state.is_inside is True
+
+
+def test_enter_and_exit_fire_once_per_transition_not_per_ping(db_session):
+    """The core requirement: repeated pings while inside (or outside) must
+    not re-fire the alarm — only the boundary crossings themselves."""
+    owner = make_user(db_session)
+    device = make_device(db_session, owner)
+    make_geofence(db_session, owner)
+
+    def ping(lon, lat):
+        transitions = evaluate_geofences(db_session, device.id, owner.id, lon, lat)
+        db_session.commit()
+        return transitions
+
+    # 1: baseline (outside) — no event.
+    assert ping(*OUTSIDE) == []
+    # 2: still outside — no event.
+    assert ping(*OUTSIDE) == []
+    # 3: crosses into the zone — exactly one "enter" event.
+    t = ping(*INSIDE)
+    assert len(t) == 1
+    assert t[0].entered is True
+    # 4, 5: still inside (different points within the radius) — no re-fire.
+    assert ping(*INSIDE) == []
+    assert ping(*INSIDE_NEARBY) == []
+    # 6: crosses back out — exactly one "exit" event.
+    t = ping(*OUTSIDE)
+    assert len(t) == 1
+    assert t[0].entered is False
+    # 7: still outside — no event.
+    assert ping(*OUTSIDE) == []
+
+
+def test_inactive_geofence_never_fires(db_session):
+    owner = make_user(db_session)
+    device = make_device(db_session, owner)
+    make_geofence(db_session, owner, is_active=False)
+
+    assert evaluate_geofences(db_session, device.id, owner.id, *OUTSIDE) == []
+    db_session.commit()
+    assert evaluate_geofences(db_session, device.id, owner.id, *INSIDE) == []
+
+
+def test_alert_on_enter_false_suppresses_enter_but_state_still_tracks(db_session):
+    owner = make_user(db_session)
+    device = make_device(db_session, owner)
+    make_geofence(db_session, owner, alert_on_enter=False, alert_on_exit=True)
+
+    def ping(lon, lat):
+        transitions = evaluate_geofences(db_session, device.id, owner.id, lon, lat)
+        db_session.commit()
+        return transitions
+
+    assert ping(*OUTSIDE) == []          # baseline
+    assert ping(*INSIDE) == []           # enter suppressed by alert_on_enter=False
+    t = ping(*OUTSIDE)                   # exit still fires — state wasn't left stale
+    assert len(t) == 1
+    assert t[0].entered is False
+
+
+def test_only_owner_geofences_are_evaluated(db_session):
+    owner = make_user(db_session, clerk_id="clerk_owner")
+    other = make_user(db_session, clerk_id="clerk_other")
+    device = make_device(db_session, owner, imei="111111111111111")
+    make_geofence(db_session, other)  # belongs to a different user
+
+    transitions = evaluate_geofences(db_session, device.id, owner.id, *INSIDE)
+    assert transitions == []
+
+
+def test_circle_fields_missing_is_ignored(db_session):
+    """A geofence with no circle fields set (e.g. a future polygon-only
+    row) must not blow up evaluation — it's just skipped in v1."""
+    owner = make_user(db_session)
+    device = make_device(db_session, owner)
+    geofence = Geofence(
+        user_id=owner.id, name="Polygon placeholder",
+        center_latitude=None, center_longitude=None, radius_meters=None,
+    )
+    db_session.add(geofence)
+    db_session.commit()
+
+    assert evaluate_geofences(db_session, device.id, owner.id, *INSIDE) == []

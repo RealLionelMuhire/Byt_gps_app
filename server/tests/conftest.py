@@ -9,14 +9,19 @@ clerk_user_id. `get_db`/`require_auth` are overridden; everything else
 
 Two columns (locations.geom, geofences.geom) use geoalchemy2's Geometry
 type, which compiles to PostGIS/SpatiaLite-only DDL and SQL functions
-(RecoverGeometryColumn, AsEWKB, ...) that plain SQLite doesn't have. Rather
-than hand-picking which tables to create — Device has backref
-relationships from nearly every other table (trips, alert_settings,
-command_settings, ...), and SQLAlchemy's flush needs all of them to exist
-to compute delete/cascade history — every table is created, with those
-few SpatiaLite function names stubbed out as harmless no-ops on the test
-connection. No test in this suite reads/writes geometry data, so the
-stubs are never exercised for real.
+(RecoverGeometryColumn, AsEWKB, GeomFromEWKT, ...) that plain SQLite
+doesn't have — GeomFromEWKT in particular is emitted by geoalchemy2 to
+wrap *every* insert/update bind for a Geometry column, even when the
+Python value is None, so any ORM insert into a geometry-bearing table
+needs it stubbed. Rather than hand-picking which tables to create — Device
+has backref relationships from nearly every other table (trips,
+alert_settings, command_settings, ...), and SQLAlchemy's flush needs all
+of them to exist to compute delete/cascade history — every table is
+created, with those SpatiaLite function names stubbed out as harmless
+no-ops (returning a dummy value) on the test connection. No test in this
+suite reads/writes real geometry data — geofences.geom in particular
+stays NULL, since v1 geofences are circle-only — so the dummy return
+value is never exercised for real.
 """
 
 import importlib
@@ -36,7 +41,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.core.database import Base, get_db
 from app.core.auth import require_auth
-from app.api import devices, onboarding
+from app.api import devices, onboarding, geofences
 
 # Import every model module so all Base.metadata tables are registered —
 # relied on below by Base.metadata.create_all() with no `tables=` filter.
@@ -51,9 +56,18 @@ for _, _modname, _ in pkgutil.iter_modules(_models_pkg.__path__):
 # SpatiaLite functions geoalchemy2 emits DDL/SQL for on a "sqlite" dialect;
 # stubbed as no-ops purely so CREATE TABLE / cascade queries succeed.
 _SPATIALITE_STUBS = [
-    ("AsEWKB", 1), ("RecoverGeometryColumn", 5), ("DiscardGeometryColumn", 2),
+    ("RecoverGeometryColumn", 5), ("DiscardGeometryColumn", 2),
     ("AddGeometryColumn", -1), ("CreateSpatialIndex", 2), ("DisableSpatialIndex", 2),
 ]
+
+# AsEWKB/GeomFromEWKT wrap *every* Geometry-column read/bind respectively
+# (geoalchemy2's column_expression/bind_expression), including a Python
+# None — so unlike the stubs above, these must pass a NULL argument
+# through as NULL rather than a dummy value, or a row with geom=None comes
+# back non-NULL and geoalchemy2's result processor
+# (geoalchemy2/types/__init__.py) then tries to parse the dummy value as
+# real WKB and blows up.
+_SPATIALITE_PASSTHROUGH_STUBS = ["AsEWKB", "GeomFromEWKT", "AsEWKT"]
 
 
 @pytest.fixture()
@@ -68,6 +82,8 @@ def db_session():
     def _register_spatialite_stubs(dbapi_conn, conn_record):
         for name, argc in _SPATIALITE_STUBS:
             dbapi_conn.create_function(name, argc, lambda *a: 1)
+        for name in _SPATIALITE_PASSTHROUGH_STUBS:
+            dbapi_conn.create_function(name, 1, lambda v: None if v is None else 1)
 
     Base.metadata.create_all(bind=engine)
 
@@ -93,6 +109,7 @@ def client(db_session, current_clerk_id):
     app = FastAPI()
     app.include_router(devices.router, prefix="/api/devices")
     app.include_router(onboarding.router, prefix="/api")
+    app.include_router(geofences.router, prefix="/api/geofences")
 
     def _override_get_db():
         yield db_session
