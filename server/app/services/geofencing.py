@@ -13,6 +13,12 @@ Two shapes, both feeding the same transition-detection/dedup logic below:
   - polygon: PostGIS ST_Contains(geom, point) — note this excludes the
     boundary itself (a point exactly on the polygon's edge is "outside"),
     matching PostGIS's containment semantics.
+
+Both shapes are additionally scoped to specific devices via GeofenceDevice
+(migration 026): a geofence with no GeofenceDevice row for a given device
+never evaluates for it, regardless of shape or is_active. That join lives
+in the initial fetch below, shared by both branches, so device scoping
+can't drift out of sync between them.
 """
 
 from typing import List, NamedTuple
@@ -21,6 +27,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.models.geofence import Geofence
+from app.models.geofence_device import GeofenceDevice
 from app.models.geofence_device_state import GeofenceDeviceState
 from app.api.locations import haversine_km
 
@@ -35,10 +42,12 @@ def evaluate_geofences(
 ) -> List[GeofenceTransition]:
     """
     Compare (lat, lon) against every active geofence owned by user_id
-    (circle or polygon), using each geofence's *persisted* inside/outside
-    state for
-    this device (geofence_device_state) to fire only on transitions —
-    not on every ping while the device stays inside or outside a zone.
+    (circle or polygon) that device_id is actually linked to (see
+    GeofenceDevice — a geofence with no link for this device is skipped
+    entirely, regardless of shape or is_active), using each geofence's
+    *persisted* inside/outside state for this device (geofence_device_state)
+    to fire only on transitions — not on every ping while the device stays
+    inside or outside a zone.
 
     The first observation of a given (device, geofence) pair seeds the
     state without firing an event: otherwise a device already inside a
@@ -54,6 +63,7 @@ def evaluate_geofences(
 
     circle_geofences = (
         db.query(Geofence)
+        .join(GeofenceDevice, GeofenceDevice.geofence_id == Geofence.id)
         .filter(
             Geofence.user_id == user_id,
             Geofence.is_active == True,  # noqa: E712
@@ -61,16 +71,19 @@ def evaluate_geofences(
             Geofence.center_latitude.isnot(None),
             Geofence.center_longitude.isnot(None),
             Geofence.radius_meters.isnot(None),
+            GeofenceDevice.device_id == device_id,
         )
         .all()
     )
     polygon_geofences = (
         db.query(Geofence)
+        .join(GeofenceDevice, GeofenceDevice.geofence_id == Geofence.id)
         .filter(
             Geofence.user_id == user_id,
             Geofence.is_active == True,  # noqa: E712
             Geofence.shape_type == "polygon",
             Geofence.geom.isnot(None),
+            GeofenceDevice.device_id == device_id,
         )
         .all()
     )

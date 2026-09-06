@@ -23,6 +23,13 @@ class Geofence(Base):
       - "polygon": `geom`, evaluated via PostGIS ST_Contains.
     Exactly one shape's fields are populated per row (enforced by the
     geofences_shape_matches_type CHECK constraint added in migration 025).
+
+    Device scoping: a geofence applies only to devices linked via
+    `device_links` (GeofenceDevice, migration 026) — NOT implicitly to
+    every device the owner has. Zero links means the zone fires for no
+    device until explicitly assigned (see app/api/geofences.py's
+    device_ids); evaluate_geofences enforces this the same way for both
+    shapes, via a join, so neither branch needs its own device check.
     """
     __tablename__ = "geofences"
 
@@ -36,7 +43,7 @@ class Geofence(Base):
     # Geometry (polygon) — populated only when shape_type == "polygon".
     geom = Column(Geometry('POLYGON', srid=4326), nullable=True)
 
-    # Circle center + radius — the only zone type evaluated in v1.
+    # Circle center + radius — populated only when shape_type == "circle".
     center_latitude = Column(Float, nullable=True)
     center_longitude = Column(Float, nullable=True)
     radius_meters = Column(Float, nullable=True)
@@ -52,6 +59,10 @@ class Geofence(Base):
     user = relationship("User", backref="geofences")
     device_states = relationship(
         "GeofenceDeviceState", back_populates="geofence",
+        cascade="all, delete-orphan", passive_deletes=True,
+    )
+    device_links = relationship(
+        "GeofenceDevice", back_populates="geofence",
         cascade="all, delete-orphan", passive_deletes=True,
     )
 

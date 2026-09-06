@@ -8,7 +8,9 @@ clerk_user_id.
 """
 
 from app.models.user import User, Role
+from app.models.device import Device
 from app.models.geofence import Geofence
+from app.models.geofence_device import GeofenceDevice
 
 
 def make_user(db, clerk_id, role=Role.USER):
@@ -25,6 +27,14 @@ def make_user(db, clerk_id, role=Role.USER):
     db.commit()
     db.refresh(user)
     return user
+
+
+def make_device(db, owner: User, imei):
+    device = Device(imei=imei, name="Device", lifecycle="sold", user_id=owner.id, status="online")
+    db.add(device)
+    db.commit()
+    db.refresh(device)
+    return device
 
 
 VALID_BODY = {
@@ -274,3 +284,103 @@ def test_update_polygon_points_without_shape_type_is_rejected(client, db_session
     resp = client.put(f"/api/geofences/{created['id']}", json={"points": POLYGON_BODY["points"]})
 
     assert resp.status_code == 400
+
+
+# --- Device scoping (device_ids) ---
+
+
+def test_create_geofence_with_no_device_ids_is_unscoped(client, db_session, current_clerk_id):
+    """Omitting device_ids entirely must not implicitly apply to the
+    owner's whole fleet — it defaults to an empty (unscoped) list."""
+    owner = make_user(db_session, "clerk_owner")
+    current_clerk_id["value"] = owner.clerk_user_id
+
+    resp = client.post("/api/geofences", json=VALID_BODY)
+
+    assert resp.status_code == 201
+    assert resp.json()["device_ids"] == []
+
+
+def test_create_geofence_with_device_ids(client, db_session, current_clerk_id):
+    owner = make_user(db_session, "clerk_owner")
+    d1 = make_device(db_session, owner, imei="600000000000001")
+    d2 = make_device(db_session, owner, imei="600000000000002")
+    current_clerk_id["value"] = owner.clerk_user_id
+
+    resp = client.post("/api/geofences", json={**VALID_BODY, "device_ids": [d1.id, d2.id]})
+
+    assert resp.status_code == 201
+    body = resp.json()
+    assert sorted(body["device_ids"]) == sorted([d1.id, d2.id])
+
+    links = db_session.query(GeofenceDevice).filter_by(geofence_id=body["id"]).all()
+    assert {l.device_id for l in links} == {d1.id, d2.id}
+
+
+def test_create_geofence_rejects_device_ids_not_owned_by_caller(client, db_session, current_clerk_id):
+    owner = make_user(db_session, "clerk_owner")
+    other = make_user(db_session, "clerk_other")
+    other_device = make_device(db_session, other, imei="600000000000003")
+    current_clerk_id["value"] = owner.clerk_user_id
+
+    resp = client.post("/api/geofences", json={**VALID_BODY, "device_ids": [other_device.id]})
+
+    assert resp.status_code == 400
+    assert db_session.query(Geofence).count() == 0  # nothing partially created
+
+
+def test_create_geofence_rejects_nonexistent_device_ids(client, db_session, current_clerk_id):
+    owner = make_user(db_session, "clerk_owner")
+    current_clerk_id["value"] = owner.clerk_user_id
+
+    resp = client.post("/api/geofences", json={**VALID_BODY, "device_ids": [999999]})
+
+    assert resp.status_code == 400
+
+
+def test_update_device_ids_replaces_the_assigned_set(client, db_session, current_clerk_id):
+    owner = make_user(db_session, "clerk_owner")
+    d1 = make_device(db_session, owner, imei="600000000000004")
+    d2 = make_device(db_session, owner, imei="600000000000005")
+    current_clerk_id["value"] = owner.clerk_user_id
+    created = client.post("/api/geofences", json={**VALID_BODY, "device_ids": [d1.id]}).json()
+
+    resp = client.put(f"/api/geofences/{created['id']}", json={"device_ids": [d2.id]})
+
+    assert resp.status_code == 200
+    assert resp.json()["device_ids"] == [d2.id]
+
+
+def test_update_without_device_ids_leaves_assignment_untouched(client, db_session, current_clerk_id):
+    """device_ids omitted from the PUT body (vs. sent as []) must not
+    clear existing assignments — matches this endpoint's existing
+    partial-update semantics for every other field."""
+    owner = make_user(db_session, "clerk_owner")
+    d1 = make_device(db_session, owner, imei="600000000000006")
+    current_clerk_id["value"] = owner.clerk_user_id
+    created = client.post("/api/geofences", json={**VALID_BODY, "device_ids": [d1.id]}).json()
+
+    resp = client.put(f"/api/geofences/{created['id']}", json={"name": "Renamed"})
+
+    assert resp.status_code == 200
+    assert resp.json()["device_ids"] == [d1.id]
+
+
+def test_update_device_ids_empty_list_clears_assignment(client, db_session, current_clerk_id):
+    owner = make_user(db_session, "clerk_owner")
+    d1 = make_device(db_session, owner, imei="600000000000007")
+    current_clerk_id["value"] = owner.clerk_user_id
+    created = client.post("/api/geofences", json={**VALID_BODY, "device_ids": [d1.id]}).json()
+
+    resp = client.put(f"/api/geofences/{created['id']}", json={"device_ids": []})
+
+    assert resp.status_code == 200
+    assert resp.json()["device_ids"] == []
+
+
+## Cascade delete of geofence_devices rows (ON DELETE CASCADE, migration
+## 026) isn't exercised here: this suite's SQLite fixture never enables
+## `PRAGMA foreign_keys=ON`, and the ORM relationship uses
+## passive_deletes=True (trusts the DB to cascade) like the pre-existing
+## geofence_device_state relationship — neither is cascade-tested in this
+## harness. The DDL itself mirrors that already-trusted pattern.

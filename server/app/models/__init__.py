@@ -6,6 +6,7 @@ from app.models.location_quality_log import LocationQualityLog
 from app.models.user import User
 from app.models.geofence import Geofence
 from app.models.geofence_device_state import GeofenceDeviceState
+from app.models.geofence_device import GeofenceDevice
 from app.models.trip import Trip
 from app.models.trip_settings import TripSettings
 from app.models.vehicle import Vehicle
@@ -14,4 +15,4 @@ from app.models.geocode_cache import GeocodeCache
 from app.models.command_settings import CommandSettings
 from app.models.alert_settings import AlertSettings
 
-__all__ = ['Device', 'Location', 'LocationQualityLog', 'User', 'Geofence', 'GeofenceDeviceState', 'Trip', 'TripSettings', 'Vehicle', 'Subscription', 'Payment', 'GeocodeCache', 'CommandSettings', 'AlertSettings']
+__all__ = ['Device', 'Location', 'LocationQualityLog', 'User', 'Geofence', 'GeofenceDeviceState', 'GeofenceDevice', 'Trip', 'TripSettings', 'Vehicle', 'Subscription', 'Payment', 'GeocodeCache', 'CommandSettings', 'AlertSettings']

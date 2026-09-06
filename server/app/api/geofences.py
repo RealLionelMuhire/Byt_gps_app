@@ -16,7 +16,9 @@ from sqlalchemy.orm import Session
 
 from app.core.database import get_db
 from app.core.auth import get_current_user
+from app.models.device import Device
 from app.models.geofence import Geofence
+from app.models.geofence_device import GeofenceDevice
 from app.models.user import User
 
 logger = logging.getLogger(__name__)
@@ -103,6 +105,10 @@ class GeofenceCreate(BaseModel):
     center_longitude: Optional[float] = None
     radius_meters: Optional[float] = None
     points: Optional[List[PointIn]] = None
+    # No devices linked by default — a geofence applies to none until
+    # explicitly assigned (see GeofenceDevice), not implicitly to the
+    # owner's whole fleet.
+    device_ids: List[int] = []
     is_active: bool = True
     alert_on_enter: bool = True
     alert_on_exit: bool = True
@@ -136,6 +142,10 @@ class GeofenceUpdate(BaseModel):
     center_longitude: Optional[float] = None
     radius_meters: Optional[float] = None
     points: Optional[List[PointIn]] = None
+    # None = leave device assignments untouched (partial-update default).
+    # [] explicitly clears all assignments. A non-empty list replaces the
+    # full assigned set.
+    device_ids: Optional[List[int]] = None
     is_active: Optional[bool] = None
     alert_on_enter: Optional[bool] = None
     alert_on_exit: Optional[bool] = None
@@ -167,6 +177,7 @@ class GeofenceResponse(BaseModel):
     center_longitude: Optional[float] = None
     radius_meters: Optional[float] = None
     points: Optional[List[PointOut]] = None
+    device_ids: List[int] = []
     is_active: bool
     alert_on_enter: bool
     alert_on_exit: bool
@@ -212,6 +223,32 @@ def _parse_polygon_wkt(wkt: str) -> List[PointOut]:
     return [PointOut(lng=lng, lat=lat) for lng, lat in coords]
 
 
+def _validate_device_ids(device_ids: List[int], user: User, db: Session) -> None:
+    """Raise 400 unless every id in device_ids is a device owned by `user`.
+
+    400 (not 404) since this is a validation failure on the request body,
+    not a lookup of one resource — matching this file's use of 400 for
+    other cross-field shape mismatches above.
+    """
+    unique_ids = set(device_ids)
+    if not unique_ids:
+        return
+    owned_count = (
+        db.query(Device.id)
+        .filter(Device.id.in_(unique_ids), Device.user_id == user.id)
+        .count()
+    )
+    if owned_count != len(unique_ids):
+        raise HTTPException(status_code=400, detail="one or more device_ids are invalid or not owned by you")
+
+
+def _set_device_links(geofence: Geofence, device_ids: List[int], db: Session) -> None:
+    """Replace the full set of devices this geofence is scoped to."""
+    db.query(GeofenceDevice).filter(GeofenceDevice.geofence_id == geofence.id).delete()
+    for device_id in set(device_ids):
+        db.add(GeofenceDevice(geofence_id=geofence.id, device_id=device_id))
+
+
 def _serialize(geofence: Geofence, db: Session) -> GeofenceResponse:
     """Build the response, returning only the fields relevant to this row's
     shape_type rather than both shapes' fields populated meaninglessly."""
@@ -233,6 +270,9 @@ def _serialize(geofence: Geofence, db: Session) -> GeofenceResponse:
     else:
         wkt = db.query(func.ST_AsText(Geofence.geom)).filter(Geofence.id == geofence.id).scalar()
         data["points"] = _parse_polygon_wkt(wkt)
+    data["device_ids"] = [
+        d for (d,) in db.query(GeofenceDevice.device_id).filter(GeofenceDevice.geofence_id == geofence.id).all()
+    ]
     return GeofenceResponse(**data)
 
 
@@ -245,6 +285,8 @@ async def create_geofence(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
+    _validate_device_ids(body.device_ids, user, db)
+
     geofence = Geofence(
         user_id=user.id,
         name=body.name,
@@ -261,6 +303,8 @@ async def create_geofence(
     else:
         geofence.geom = WKTElement(_build_polygon_wkt(body.points), srid=4326)
     db.add(geofence)
+    db.flush()  # assigns geofence.id, needed by the device links below, before the single commit
+    _set_device_links(geofence, body.device_ids, db)
     db.commit()
     db.refresh(geofence)
     return _serialize(geofence, db)
@@ -297,8 +341,12 @@ async def update_geofence(
     user: User = Depends(get_current_user),
 ):
     geofence = _get_owned_geofence(geofence_id, user, db)
+    if body.device_ids is not None:
+        _validate_device_ids(body.device_ids, user, db)
+
     data = body.model_dump(exclude_unset=True)
     data.pop("points", None)
+    data.pop("device_ids", None)
     points = body.points
     new_shape = data.pop("shape_type", None)
     effective_shape = new_shape or geofence.shape_type
@@ -341,6 +389,8 @@ async def update_geofence(
 
     for field, value in data.items():
         setattr(geofence, field, value)
+    if body.device_ids is not None:
+        _set_device_links(geofence, body.device_ids, db)
     db.commit()
     db.refresh(geofence)
     return _serialize(geofence, db)
