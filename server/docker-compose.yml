@@ -20,6 +20,7 @@ services:
       - ./app:/app/app
       - ./migrations:/app/migrations   # Keep migrations + migrate in sync with the repo (no image rebuild needed)
       - ./migrate:/app/migrate
+      - ./scripts:/app/scripts         # cron_expiry.py / cron_alarm_*.py — run via `docker compose exec gps_server python scripts/<name>.py`
       - ./logs:/app/logs
     restart: unless-stopped
 
