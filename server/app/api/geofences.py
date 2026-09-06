@@ -1,4 +1,4 @@
-"""Geofence CRUD API — user-owned circle zones evaluated server-side.
+"""Geofence CRUD API — user-owned circle or polygon zones evaluated server-side.
 
 See app/services/geofencing.py for why zones are evaluated here instead of
 on the device: neither supported hardware model (TK903ELE, G900LS J16-4G)
@@ -6,10 +6,12 @@ exposes a command to push a zone definition to it.
 """
 
 import logging
-from typing import List, Optional
+from typing import List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel, field_validator
+from geoalchemy2.elements import WKTElement
+from pydantic import BaseModel, field_validator, model_validator
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
@@ -22,6 +24,7 @@ router = APIRouter()
 
 MIN_RADIUS_METERS = 10
 MAX_RADIUS_METERS = 50_000  # 50km — a generous ceiling for a single circle zone
+MIN_POLYGON_POINTS = 3
 
 
 # --- Field-level validation, shared between create (required fields) and
@@ -64,15 +67,42 @@ def _validate_radius(v: Optional[float]) -> Optional[float]:
     return v
 
 
+def _validate_point_lat(v: float) -> float:
+    if v < -90 or v > 90:
+        raise ValueError("lat must be between -90 and 90")
+    return v
+
+
+def _validate_point_lng(v: float) -> float:
+    if v < -180 or v > 180:
+        raise ValueError("lng must be between -180 and 180")
+    return v
+
+
 # --- Schemas ---
+
+
+class PointIn(BaseModel):
+    lat: float
+    lng: float
+
+    _check_lat = field_validator("lat")(_validate_point_lat)
+    _check_lng = field_validator("lng")(_validate_point_lng)
+
+
+class PointOut(BaseModel):
+    lat: float
+    lng: float
 
 
 class GeofenceCreate(BaseModel):
     name: str
     description: Optional[str] = None
-    center_latitude: float
-    center_longitude: float
-    radius_meters: float
+    shape_type: Literal["circle", "polygon"] = "circle"
+    center_latitude: Optional[float] = None
+    center_longitude: Optional[float] = None
+    radius_meters: Optional[float] = None
+    points: Optional[List[PointIn]] = None
     is_active: bool = True
     alert_on_enter: bool = True
     alert_on_exit: bool = True
@@ -83,13 +113,29 @@ class GeofenceCreate(BaseModel):
     _check_longitude = field_validator("center_longitude")(_validate_longitude)
     _check_radius = field_validator("radius_meters")(_validate_radius)
 
+    @model_validator(mode="after")
+    def _check_shape(self):
+        if self.shape_type == "circle":
+            if self.center_latitude is None or self.center_longitude is None or self.radius_meters is None:
+                raise ValueError("circle geofences require center_latitude, center_longitude, and radius_meters")
+            if self.points is not None:
+                raise ValueError("circle geofences must not include points")
+        else:
+            if self.points is None or len(self.points) < MIN_POLYGON_POINTS:
+                raise ValueError(f"polygon geofences require at least {MIN_POLYGON_POINTS} points")
+            if self.center_latitude is not None or self.center_longitude is not None or self.radius_meters is not None:
+                raise ValueError("polygon geofences must not include circle fields")
+        return self
+
 
 class GeofenceUpdate(BaseModel):
     name: Optional[str] = None
     description: Optional[str] = None
+    shape_type: Optional[Literal["circle", "polygon"]] = None
     center_latitude: Optional[float] = None
     center_longitude: Optional[float] = None
     radius_meters: Optional[float] = None
+    points: Optional[List[PointIn]] = None
     is_active: Optional[bool] = None
     alert_on_enter: Optional[bool] = None
     alert_on_exit: Optional[bool] = None
@@ -100,14 +146,27 @@ class GeofenceUpdate(BaseModel):
     _check_longitude = field_validator("center_longitude")(_validate_longitude)
     _check_radius = field_validator("radius_meters")(_validate_radius)
 
+    @model_validator(mode="after")
+    def _check_shape(self):
+        if self.shape_type == "circle" and self.points is not None:
+            raise ValueError("circle geofences must not include points")
+        if self.shape_type == "polygon":
+            if self.points is not None and len(self.points) < MIN_POLYGON_POINTS:
+                raise ValueError(f"polygon geofences require at least {MIN_POLYGON_POINTS} points")
+            if self.center_latitude is not None or self.center_longitude is not None or self.radius_meters is not None:
+                raise ValueError("polygon geofences must not include circle fields")
+        return self
+
 
 class GeofenceResponse(BaseModel):
     id: int
     name: str
     description: Optional[str] = None
+    shape_type: str
     center_latitude: Optional[float] = None
     center_longitude: Optional[float] = None
     radius_meters: Optional[float] = None
+    points: Optional[List[PointOut]] = None
     is_active: bool
     alert_on_enter: bool
     alert_on_exit: bool
@@ -132,6 +191,51 @@ def _get_owned_geofence(geofence_id: int, user: User, db: Session) -> Geofence:
     return geofence
 
 
+def _build_polygon_wkt(points: List[PointIn]) -> str:
+    """Build a closed PostGIS POLYGON WKT ring from input points, auto-closing
+    it (repeating the first point as the last) if the caller didn't already."""
+    coords = [(p.lng, p.lat) for p in points]
+    if coords[0] != coords[-1]:
+        coords.append(coords[0])
+    ring = ",".join(f"{lng} {lat}" for lng, lat in coords)
+    return f"POLYGON(({ring}))"
+
+
+def _parse_polygon_wkt(wkt: str) -> List[PointOut]:
+    """Parse a PostGIS WKT "POLYGON((lng lat,lng lat,...))" string (as
+    returned by ST_AsText) back into an open ring of {lat, lng} points,
+    dropping the redundant closing point that duplicates the first."""
+    ring_text = wkt[wkt.index("((") + 2 : wkt.rindex("))")]
+    coords = [tuple(map(float, pair.strip().split())) for pair in ring_text.split(",")]
+    if len(coords) > 1 and coords[0] == coords[-1]:
+        coords = coords[:-1]
+    return [PointOut(lng=lng, lat=lat) for lng, lat in coords]
+
+
+def _serialize(geofence: Geofence, db: Session) -> GeofenceResponse:
+    """Build the response, returning only the fields relevant to this row's
+    shape_type rather than both shapes' fields populated meaninglessly."""
+    data = dict(
+        id=geofence.id,
+        name=geofence.name,
+        description=geofence.description,
+        shape_type=geofence.shape_type,
+        is_active=geofence.is_active,
+        alert_on_enter=geofence.alert_on_enter,
+        alert_on_exit=geofence.alert_on_exit,
+    )
+    if geofence.shape_type == "circle":
+        data.update(
+            center_latitude=geofence.center_latitude,
+            center_longitude=geofence.center_longitude,
+            radius_meters=geofence.radius_meters,
+        )
+    else:
+        wkt = db.query(func.ST_AsText(Geofence.geom)).filter(Geofence.id == geofence.id).scalar()
+        data["points"] = _parse_polygon_wkt(wkt)
+    return GeofenceResponse(**data)
+
+
 # --- Routes ---
 
 
@@ -145,17 +249,21 @@ async def create_geofence(
         user_id=user.id,
         name=body.name,
         description=body.description,
-        center_latitude=body.center_latitude,
-        center_longitude=body.center_longitude,
-        radius_meters=body.radius_meters,
+        shape_type=body.shape_type,
         is_active=body.is_active,
         alert_on_enter=body.alert_on_enter,
         alert_on_exit=body.alert_on_exit,
     )
+    if body.shape_type == "circle":
+        geofence.center_latitude = body.center_latitude
+        geofence.center_longitude = body.center_longitude
+        geofence.radius_meters = body.radius_meters
+    else:
+        geofence.geom = WKTElement(_build_polygon_wkt(body.points), srid=4326)
     db.add(geofence)
     db.commit()
     db.refresh(geofence)
-    return geofence
+    return _serialize(geofence, db)
 
 
 @router.get("", response_model=List[GeofenceResponse])
@@ -167,7 +275,8 @@ async def list_geofences(
     query = db.query(Geofence).filter(Geofence.user_id == user.id)
     if is_active is not None:
         query = query.filter(Geofence.is_active == is_active)
-    return query.order_by(Geofence.created_at.desc()).all()
+    geofences = query.order_by(Geofence.created_at.desc()).all()
+    return [_serialize(g, db) for g in geofences]
 
 
 @router.get("/{geofence_id}", response_model=GeofenceResponse)
@@ -176,7 +285,8 @@ async def get_geofence(
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
-    return _get_owned_geofence(geofence_id, user, db)
+    geofence = _get_owned_geofence(geofence_id, user, db)
+    return _serialize(geofence, db)
 
 
 @router.put("/{geofence_id}", response_model=GeofenceResponse)
@@ -187,11 +297,53 @@ async def update_geofence(
     user: User = Depends(get_current_user),
 ):
     geofence = _get_owned_geofence(geofence_id, user, db)
-    for field, value in body.model_dump(exclude_unset=True).items():
+    data = body.model_dump(exclude_unset=True)
+    data.pop("points", None)
+    points = body.points
+    new_shape = data.pop("shape_type", None)
+    effective_shape = new_shape or geofence.shape_type
+
+    circle_fields_sent = any(f in data for f in ("center_latitude", "center_longitude", "radius_meters"))
+    if circle_fields_sent and effective_shape != "circle":
+        raise HTTPException(status_code=400, detail="circle fields require shape_type='circle'")
+    if points is not None and effective_shape != "polygon":
+        raise HTTPException(status_code=400, detail="points require shape_type='polygon'")
+
+    if new_shape == "circle":
+        merged = {
+            f: data.get(f, getattr(geofence, f) if geofence.shape_type == "circle" else None)
+            for f in ("center_latitude", "center_longitude", "radius_meters")
+        }
+        if any(v is None for v in merged.values()):
+            raise HTTPException(
+                status_code=422,
+                detail="switching to a circle geofence requires center_latitude, center_longitude, and radius_meters",
+            )
+        geofence.shape_type = "circle"
+        geofence.geom = None
+        geofence.center_latitude = merged["center_latitude"]
+        geofence.center_longitude = merged["center_longitude"]
+        geofence.radius_meters = merged["radius_meters"]
+        data.pop("center_latitude", None)
+        data.pop("center_longitude", None)
+        data.pop("radius_meters", None)
+    elif new_shape == "polygon" or points is not None:
+        if not points or len(points) < MIN_POLYGON_POINTS:
+            raise HTTPException(
+                status_code=422,
+                detail=f"polygon geofences require at least {MIN_POLYGON_POINTS} points",
+            )
+        geofence.shape_type = "polygon"
+        geofence.geom = WKTElement(_build_polygon_wkt(points), srid=4326)
+        geofence.center_latitude = None
+        geofence.center_longitude = None
+        geofence.radius_meters = None
+
+    for field, value in data.items():
         setattr(geofence, field, value)
     db.commit()
     db.refresh(geofence)
-    return geofence
+    return _serialize(geofence, db)
 
 
 @router.delete("/{geofence_id}", status_code=204)

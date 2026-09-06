@@ -151,3 +151,126 @@ def test_invalid_latitude_is_rejected(client, db_session, current_clerk_id):
     resp = client.post("/api/geofences", json={**VALID_BODY, "center_latitude": 200})
 
     assert resp.status_code == 422
+
+
+# --- Polygon geofences ---
+
+POLYGON_BODY = {
+    "name": "Warehouse yard",
+    "shape_type": "polygon",
+    "points": [
+        {"lat": -1.91, "lng": 30.04},
+        {"lat": -1.91, "lng": 30.06},
+        {"lat": -1.89, "lng": 30.06},
+        {"lat": -1.89, "lng": 30.04},
+    ],
+}
+
+
+def test_create_polygon_geofence(client, db_session, current_clerk_id):
+    owner = make_user(db_session, "clerk_owner")
+    current_clerk_id["value"] = owner.clerk_user_id
+
+    resp = client.post("/api/geofences", json=POLYGON_BODY)
+
+    assert resp.status_code == 201
+    body = resp.json()
+    assert body["shape_type"] == "polygon"
+    assert body["center_latitude"] is None
+    assert body["radius_meters"] is None
+    assert len(body["points"]) == 4
+    assert {"lat": -1.91, "lng": 30.04} in body["points"]
+
+    geofence = db_session.query(Geofence).filter_by(id=body["id"]).first()
+    assert geofence.shape_type == "polygon"
+    assert geofence.geom is not None
+    assert geofence.center_latitude is None
+
+
+def test_create_polygon_requires_at_least_3_points(client, db_session, current_clerk_id):
+    owner = make_user(db_session, "clerk_owner")
+    current_clerk_id["value"] = owner.clerk_user_id
+
+    resp = client.post("/api/geofences", json={**POLYGON_BODY, "points": POLYGON_BODY["points"][:2]})
+
+    assert resp.status_code == 422
+
+
+def test_create_polygon_rejects_circle_fields(client, db_session, current_clerk_id):
+    owner = make_user(db_session, "clerk_owner")
+    current_clerk_id["value"] = owner.clerk_user_id
+
+    resp = client.post("/api/geofences", json={**POLYGON_BODY, "radius_meters": 200})
+
+    assert resp.status_code == 422
+
+
+def test_create_circle_rejects_points(client, db_session, current_clerk_id):
+    owner = make_user(db_session, "clerk_owner")
+    current_clerk_id["value"] = owner.clerk_user_id
+
+    resp = client.post("/api/geofences", json={**VALID_BODY, "points": POLYGON_BODY["points"]})
+
+    assert resp.status_code == 422
+
+
+def test_get_polygon_geofence_returns_points_not_circle_fields(client, db_session, current_clerk_id):
+    owner = make_user(db_session, "clerk_owner")
+    current_clerk_id["value"] = owner.clerk_user_id
+    created = client.post("/api/geofences", json=POLYGON_BODY).json()
+
+    resp = client.get(f"/api/geofences/{created['id']}")
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["shape_type"] == "polygon"
+    assert body["center_latitude"] is None
+    assert body["center_longitude"] is None
+    assert body["radius_meters"] is None
+    assert len(body["points"]) == 4
+
+
+def test_update_polygon_points_replaces_ring(client, db_session, current_clerk_id):
+    owner = make_user(db_session, "clerk_owner")
+    current_clerk_id["value"] = owner.clerk_user_id
+    created = client.post("/api/geofences", json=POLYGON_BODY).json()
+
+    new_points = [
+        {"lat": 0.0, "lng": 0.0}, {"lat": 0.0, "lng": 1.0}, {"lat": 1.0, "lng": 1.0},
+    ]
+    resp = client.put(f"/api/geofences/{created['id']}", json={"points": new_points, "shape_type": "polygon"})
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body["points"]) == 3
+    assert {"lat": 0.0, "lng": 0.0} in body["points"]
+
+
+def test_update_circle_to_polygon_switches_shape(client, db_session, current_clerk_id):
+    owner = make_user(db_session, "clerk_owner")
+    current_clerk_id["value"] = owner.clerk_user_id
+    created = client.post("/api/geofences", json=VALID_BODY).json()
+
+    resp = client.put(
+        f"/api/geofences/{created['id']}",
+        json={"shape_type": "polygon", "points": POLYGON_BODY["points"]},
+    )
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["shape_type"] == "polygon"
+    assert body["center_latitude"] is None
+    assert body["radius_meters"] is None
+    assert len(body["points"]) == 4
+
+
+def test_update_polygon_points_without_shape_type_is_rejected(client, db_session, current_clerk_id):
+    """Sending circle fields (or points) without declaring shape_type on a
+    row of the other shape is rejected rather than silently ignored."""
+    owner = make_user(db_session, "clerk_owner")
+    current_clerk_id["value"] = owner.clerk_user_id
+    created = client.post("/api/geofences", json=VALID_BODY).json()
+
+    resp = client.put(f"/api/geofences/{created['id']}", json={"points": POLYGON_BODY["points"]})
+
+    assert resp.status_code == 400

@@ -17,9 +17,12 @@ class Geofence(Base):
     enter/exit alarm bytes (0x04/0x05) can never be configured from this
     backend and aren't relied on — the server computes breaches itself.
 
-    v1 supports circle zones only (center_latitude/longitude/radius_meters).
-    `geom` is reserved for a future polygon geofence type; evaluate_geofences
-    ignores rows where the circle fields are NULL.
+    Two shapes, selected by `shape_type`:
+      - "circle": center_latitude/center_longitude/radius_meters (haversine
+        check against radius — see evaluate_geofences).
+      - "polygon": `geom`, evaluated via PostGIS ST_Contains.
+    Exactly one shape's fields are populated per row (enforced by the
+    geofences_shape_matches_type CHECK constraint added in migration 025).
     """
     __tablename__ = "geofences"
 
@@ -28,7 +31,9 @@ class Geofence(Base):
     name = Column(String(100), nullable=False)
     description = Column(String(500), nullable=True)
 
-    # Geometry (polygon) — not yet evaluated; reserved for a future polygon geofence type.
+    shape_type = Column(String(10), nullable=False, default="circle", server_default="circle")
+
+    # Geometry (polygon) — populated only when shape_type == "polygon".
     geom = Column(Geometry('POLYGON', srid=4326), nullable=True)
 
     # Circle center + radius — the only zone type evaluated in v1.

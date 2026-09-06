@@ -7,13 +7,17 @@ hardware model (TK903ELE, G900LS J16-4G) exposes a command to push a zone
 definition to the device, so those bytes can never be configured from this
 backend (see docs/usage/CONFIGURATION_GUIDE.md's Alarms sections).
 
-Circle-only for v1: distance-based (haversine) check against
-Geofence.center_latitude/longitude/radius_meters. Polygon geofences
-(Geofence.geom) are not evaluated yet.
+Two shapes, both feeding the same transition-detection/dedup logic below:
+  - circle: distance-based (haversine) check against
+    Geofence.center_latitude/longitude/radius_meters.
+  - polygon: PostGIS ST_Contains(geom, point) — note this excludes the
+    boundary itself (a point exactly on the polygon's edge is "outside"),
+    matching PostGIS's containment semantics.
 """
 
 from typing import List, NamedTuple
 
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.models.geofence import Geofence
@@ -30,8 +34,9 @@ def evaluate_geofences(
     db: Session, device_id: int, user_id: int, lon: float, lat: float,
 ) -> List[GeofenceTransition]:
     """
-    Compare (lat, lon) against every active circle geofence owned by
-    user_id, using each geofence's *persisted* inside/outside state for
+    Compare (lat, lon) against every active geofence owned by user_id
+    (circle or polygon), using each geofence's *persisted* inside/outside
+    state for
     this device (geofence_device_state) to fire only on transitions —
     not on every ping while the device stays inside or outside a zone.
 
@@ -47,19 +52,46 @@ def evaluate_geofences(
     if user_id is None:
         return []
 
-    geofences = (
+    circle_geofences = (
         db.query(Geofence)
         .filter(
             Geofence.user_id == user_id,
             Geofence.is_active == True,  # noqa: E712
+            Geofence.shape_type == "circle",
             Geofence.center_latitude.isnot(None),
             Geofence.center_longitude.isnot(None),
             Geofence.radius_meters.isnot(None),
         )
         .all()
     )
+    polygon_geofences = (
+        db.query(Geofence)
+        .filter(
+            Geofence.user_id == user_id,
+            Geofence.is_active == True,  # noqa: E712
+            Geofence.shape_type == "polygon",
+            Geofence.geom.isnot(None),
+        )
+        .all()
+    )
+    geofences = circle_geofences + polygon_geofences
     if not geofences:
         return []
+
+    # Batched, like the circle fetch above: one query covers every polygon
+    # zone for this user rather than one ST_Contains round-trip per zone.
+    inside_polygon_ids = set()
+    if polygon_geofences:
+        point = func.ST_SetSRID(func.ST_MakePoint(lon, lat), 4326)
+        inside_polygon_ids = {
+            gid
+            for (gid,) in db.query(Geofence.id)
+            .filter(
+                Geofence.id.in_([g.id for g in polygon_geofences]),
+                func.ST_Contains(Geofence.geom, point),
+            )
+            .all()
+        }
 
     states = {
         s.geofence_id: s
@@ -73,8 +105,11 @@ def evaluate_geofences(
 
     transitions: List[GeofenceTransition] = []
     for gf in geofences:
-        distance_m = haversine_km(gf.center_longitude, gf.center_latitude, lon, lat) * 1000
-        is_inside = distance_m <= gf.radius_meters
+        if gf.shape_type == "circle":
+            distance_m = haversine_km(gf.center_longitude, gf.center_latitude, lon, lat) * 1000
+            is_inside = distance_m <= gf.radius_meters
+        else:
+            is_inside = gf.id in inside_polygon_ids
 
         state = states.get(gf.id)
         if state is None:

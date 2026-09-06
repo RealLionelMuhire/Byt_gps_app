@@ -10,6 +10,8 @@ evaluate_geofences() against a realistic ping sequence for one device.
 
 from datetime import datetime, timedelta
 
+from geoalchemy2.elements import WKTElement
+
 from app.models.user import User, Role
 from app.models.device import Device
 from app.models.geofence import Geofence
@@ -167,15 +169,140 @@ def test_only_owner_geofences_are_evaluated(db_session):
 
 
 def test_circle_fields_missing_is_ignored(db_session):
-    """A geofence with no circle fields set (e.g. a future polygon-only
-    row) must not blow up evaluation — it's just skipped in v1."""
+    """A geofence with no circle fields set (e.g. a polygon row) must not
+    blow up circle evaluation — it's just skipped by the circle branch."""
     owner = make_user(db_session)
     device = make_device(db_session, owner)
     geofence = Geofence(
-        user_id=owner.id, name="Polygon placeholder",
+        user_id=owner.id, name="Polygon placeholder", shape_type="polygon",
         center_latitude=None, center_longitude=None, radius_meters=None,
+        geom=WKTElement(SQUARE_WKT, srid=4326),
     )
     db_session.add(geofence)
     db_session.commit()
 
-    assert evaluate_geofences(db_session, device.id, owner.id, *INSIDE) == []
+    # POLY_OUTSIDE, not INSIDE: this geofence is the polygon below, not a
+    # circle — INSIDE (the circle fixtures' center) is outside the square.
+    assert evaluate_geofences(db_session, device.id, owner.id, *POLY_OUTSIDE) == []
+
+
+# --- Polygon geofences ---
+#
+# Square ring covering lng [30.04, 30.06] x lat [-1.91, -1.89] — chosen to
+# sit next to (not overlap) the circle fixtures above (centered on
+# 30.05, -1.9 with a 200m radius, i.e. roughly within +-0.002 degrees of
+# that point), so circle and polygon fixtures in the same test file can't
+# accidentally overlap and mask a bug in either.
+SQUARE_WKT = "POLYGON((30.04 -1.91,30.06 -1.91,30.06 -1.89,30.04 -1.89,30.04 -1.91))"
+
+POLY_INSIDE = (30.05, -1.90)     # square's center — well inside.
+POLY_OUTSIDE = (30.20, -1.90)    # well outside.
+POLY_BOUNDARY = (30.04, -1.90)   # exactly on the square's left edge.
+
+
+def make_polygon_geofence(db, owner: User, wkt=SQUARE_WKT, **overrides):
+    defaults = dict(
+        user_id=owner.id,
+        name="Polygon zone",
+        shape_type="polygon",
+        geom=WKTElement(wkt, srid=4326),
+        is_active=True,
+        alert_on_enter=True,
+        alert_on_exit=True,
+    )
+    defaults.update(overrides)
+    geofence = Geofence(**defaults)
+    db.add(geofence)
+    db.commit()
+    db.refresh(geofence)
+    return geofence
+
+
+def test_polygon_inside_point_is_detected_as_inside(db_session):
+    owner = make_user(db_session)
+    device = make_device(db_session, owner)
+    geofence = make_polygon_geofence(db_session, owner)
+
+    transitions = evaluate_geofences(db_session, device.id, owner.id, *POLY_INSIDE)
+    db_session.commit()
+
+    assert transitions == []  # first observation seeds state without firing
+    state = db_session.query(GeofenceDeviceState).filter_by(
+        device_id=device.id, geofence_id=geofence.id
+    ).first()
+    assert state.is_inside is True
+
+
+def test_polygon_outside_point_is_detected_as_outside(db_session):
+    owner = make_user(db_session)
+    device = make_device(db_session, owner)
+    geofence = make_polygon_geofence(db_session, owner)
+
+    transitions = evaluate_geofences(db_session, device.id, owner.id, *POLY_OUTSIDE)
+    db_session.commit()
+
+    assert transitions == []
+    state = db_session.query(GeofenceDeviceState).filter_by(
+        device_id=device.id, geofence_id=geofence.id
+    ).first()
+    assert state.is_inside is False
+
+
+def test_polygon_boundary_point_is_treated_as_outside(db_session):
+    """PostGIS ST_Contains excludes the boundary itself: a point exactly on
+    a polygon's edge is in neither the interior nor the exterior, so
+    containment is false. A device riding the fence line is "outside"."""
+    owner = make_user(db_session)
+    device = make_device(db_session, owner)
+    geofence = make_polygon_geofence(db_session, owner)
+
+    transitions = evaluate_geofences(db_session, device.id, owner.id, *POLY_BOUNDARY)
+    db_session.commit()
+
+    assert transitions == []
+    state = db_session.query(GeofenceDeviceState).filter_by(
+        device_id=device.id, geofence_id=geofence.id
+    ).first()
+    assert state.is_inside is False
+
+
+def test_polygon_enter_and_exit_fire_once_per_transition_not_per_ping(db_session):
+    """Same requirement as the circle version above, adapted to a polygon
+    zone: repeated pings while inside (or outside) must not re-fire — only
+    the boundary crossings themselves, exactly once each."""
+    owner = make_user(db_session)
+    device = make_device(db_session, owner)
+    make_polygon_geofence(db_session, owner)
+
+    def ping(lon, lat):
+        transitions = evaluate_geofences(db_session, device.id, owner.id, lon, lat)
+        db_session.commit()
+        return transitions
+
+    # 1: baseline (outside) — no event.
+    assert ping(*POLY_OUTSIDE) == []
+    # 2: still outside — no event.
+    assert ping(*POLY_OUTSIDE) == []
+    # 3: crosses into the zone — exactly one "enter" event.
+    t = ping(*POLY_INSIDE)
+    assert len(t) == 1
+    assert t[0].entered is True
+    # 4: still inside — no re-fire.
+    assert ping(*POLY_INSIDE) == []
+    # 5: sitting on the boundary counts as outside (ST_Contains excludes
+    # it), so this does NOT re-fire "enter" — it's already "outside" from
+    # step 3's perspective... except step 3 made it inside, so touching the
+    # boundary now is itself an exit.
+    t = ping(*POLY_BOUNDARY)
+    assert len(t) == 1
+    assert t[0].entered is False
+    # 6: crosses back in.
+    t = ping(*POLY_INSIDE)
+    assert len(t) == 1
+    assert t[0].entered is True
+    # 7: crosses back out — exactly one "exit" event.
+    t = ping(*POLY_OUTSIDE)
+    assert len(t) == 1
+    assert t[0].entered is False
+    # 8: still outside — no event.
+    assert ping(*POLY_OUTSIDE) == []
