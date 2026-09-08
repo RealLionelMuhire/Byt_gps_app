@@ -32,6 +32,12 @@ class Location(Base):
     # Alarm info
     is_alarm = Column(Boolean, default=False)
     alarm_type = Column(String(50), nullable=True)
+    # Snapshot of Geofence.name at the moment an "Enter fence"/"Exit fence"
+    # alarm_type fired (see _apply_geofence_transitions in tcp_server.py).
+    # NULL for every other alarm_type. Deliberately not a geofence_id FK —
+    # a historical alarm should keep reporting the zone name as it was
+    # then, even if the geofence is later renamed or deleted.
+    geofence_name = Column(String(100), nullable=True)
 
     # Alarm notification-delivery discipline (see app/services/alarm_rules.py
     # and TCPServer._send_push_notification in app/tcp_server.py):

@@ -101,6 +101,7 @@ def _apply_geofence_transitions(
     if transitions and not location.is_alarm:
         location.is_alarm = True
         location.alarm_type = "Enter fence" if transitions[0].entered else "Exit fence"
+        location.geofence_name = transitions[0].geofence.name
     return transitions
 
 

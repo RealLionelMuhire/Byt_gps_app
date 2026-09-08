@@ -653,6 +653,7 @@ class LocationResponse(BaseModel):
     is_outlier: bool
     is_alarm: bool
     alarm_type: Optional[str]
+    geofence_name: Optional[str]
     acknowledged_at: Optional[datetime]
     timestamp: datetime
     received_at: datetime

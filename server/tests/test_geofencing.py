@@ -17,7 +17,9 @@ from app.models.device import Device
 from app.models.geofence import Geofence
 from app.models.geofence_device import GeofenceDevice
 from app.models.geofence_device_state import GeofenceDeviceState
+from app.models.location import Location
 from app.services.geofencing import evaluate_geofences
+from app.tcp_server import _apply_geofence_transitions
 
 
 def make_user(db, clerk_id="clerk_geofence_owner"):
@@ -376,3 +378,84 @@ def test_polygon_enter_and_exit_fire_once_per_transition_not_per_ping(db_session
     assert t[0].entered is False
     # 8: still outside — no event.
     assert ping(*POLY_OUTSIDE) == []
+
+
+# ---------------------------------------------------------------------------
+# _apply_geofence_transitions — the tcp_server.py wiring: claims the
+# Location row's alarm_type slot and snapshots the fence's name onto it
+# (migration 030). Same "device already committed" precondition
+# evaluate_geofences itself has, since this calls straight through to it.
+# ---------------------------------------------------------------------------
+
+def _location(device, is_alarm=False, alarm_type=None):
+    return Location(
+        device_id=device.id, latitude=-1.9, longitude=30.05,
+        is_alarm=is_alarm, alarm_type=alarm_type, timestamp=datetime.utcnow(),
+    )
+
+
+def test_apply_geofence_transitions_snapshots_the_fence_name_on_enter(db_session):
+    owner = make_user(db_session)
+    device = make_device(db_session, owner)
+    geofence = make_geofence(db_session, owner, device=device, name="Warehouse")
+
+    # Baseline observation (outside) — seeds state, no alarm yet.
+    baseline = _location(device)
+    db_session.add(baseline)
+    _apply_geofence_transitions(db_session, device, baseline, *OUTSIDE)
+    db_session.commit()
+
+    location = _location(device)
+    db_session.add(location)
+    transitions = _apply_geofence_transitions(db_session, device, location, *INSIDE)
+    db_session.commit()
+
+    assert len(transitions) == 1
+    assert location.is_alarm is True
+    assert location.alarm_type == "Enter fence"
+    assert location.geofence_name == "Warehouse"
+
+
+def test_apply_geofence_transitions_snapshots_the_fence_name_on_exit(db_session):
+    owner = make_user(db_session)
+    device = make_device(db_session, owner)
+    make_geofence(db_session, owner, device=device, name="Depot")
+
+    baseline = _location(device)
+    db_session.add(baseline)
+    _apply_geofence_transitions(db_session, device, baseline, *INSIDE)
+    db_session.commit()
+
+    location = _location(device)
+    db_session.add(location)
+    _apply_geofence_transitions(db_session, device, location, *OUTSIDE)
+    db_session.commit()
+
+    assert location.alarm_type == "Exit fence"
+    assert location.geofence_name == "Depot"
+
+
+def test_apply_geofence_transitions_does_not_override_an_existing_alarm(db_session):
+    """A hardware alarm already claimed this fix's one alarm_type slot —
+    the geofence crossing must not clobber it, and geofence_name must stay
+    unset since the persisted alarm isn't actually a fence event."""
+    owner = make_user(db_session)
+    device = make_device(db_session, owner)
+    make_geofence(db_session, owner, device=device, name="Warehouse")
+
+    baseline = _location(device)
+    db_session.add(baseline)
+    _apply_geofence_transitions(db_session, device, baseline, *OUTSIDE)
+    db_session.commit()
+
+    location = _location(device, is_alarm=True, alarm_type="Shock")
+    db_session.add(location)
+    transitions = _apply_geofence_transitions(db_session, device, location, *INSIDE)
+    db_session.commit()
+
+    # The transition is still reported (state tracking must not be
+    # suppressed just because another alarm won the slot this time), but
+    # the Location row itself keeps the hardware alarm's identity.
+    assert len(transitions) == 1
+    assert location.alarm_type == "Shock"
+    assert location.geofence_name is None
