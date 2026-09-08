@@ -19,6 +19,7 @@ from app.models.location import Location
 from app.models.location_quality_log import LocationQualityLog
 from app.api.locations import classify_outlier, compute_quality_log_fields
 from app.services.geofencing import evaluate_geofences, GeofenceTransition
+from app.services.speed_limit import evaluate_speed_limit
 from app.services.push_notifications import send_push_notification
 from app.services.alarm_rules import (
     ALARM_LABELS,
@@ -112,6 +113,39 @@ async def _broadcast_geofence_transitions(
     for t in transitions:
         alarm_data = {**data, "alarm_type": "Enter fence" if t.entered else "Exit fence"}
         await server.broadcast_alarm(device_id, alarm_data, location_id=location_id)
+
+
+def _apply_speed_limit_check(device: Device, location: Location, speed_kmh: float, gps_valid: bool) -> bool:
+    """
+    Evaluate device.speed_limit_kmh against this fix (see
+    app/services/speed_limit.py) and, if it just crossed into overspeed,
+    reflect it on `location` — unless `location` already carries a
+    hardware-reported or geofence-synthesized alarm_type, which takes
+    priority (same one-Location-row-one-alarm_type-slot precedence
+    _apply_geofence_transitions gives a hardware alarm; checked after
+    geofence transitions here, so on the rare fix that would trigger both,
+    a geofence crossing wins the slot and speed_limit's own state still
+    updates correctly for the *next* fix regardless).
+
+    Must be called after `location` has been added to `db` and before
+    `db.commit()` — evaluate_speed_limit mutates `device.is_overspeeding`
+    on the same session. Returns whether to broadcast a new "Over speed"
+    alarm for this fix.
+
+    Deliberately only wired into handle_location, not handle_alarm — a
+    hardware-alarm packet's own speed field could in principle also cross
+    the threshold, but those packets are comparatively rare bursts, and
+    the state it would update self-corrects on the very next regular
+    location ping (normally seconds later), so the added complexity of
+    threading this through handle_alarm too isn't worth it for that
+    narrow a gap.
+    """
+    crossed = evaluate_speed_limit(device, speed_kmh, gps_valid)
+    if crossed and not location.is_alarm:
+        location.is_alarm = True
+        location.alarm_type = "Over speed"
+        return True
+    return False
 
 
 class GPSTrackerConnection:
@@ -334,6 +368,9 @@ class GPSTrackerConnection:
                     geofence_transitions = _apply_geofence_transitions(
                         db, device, location, data['longitude'], data['latitude']
                     )
+                    speed_limit_fired = _apply_speed_limit_check(
+                        device, location, data['speed'], data['gps_valid']
+                    )
 
                     db.commit()
 
@@ -353,6 +390,9 @@ class GPSTrackerConnection:
                     # auto-start does in the future.
                     await self.server.broadcast_location_update(device.id, data)
                     await _broadcast_geofence_transitions(self.server, device.id, data, geofence_transitions, location_id=location.id)
+                    if speed_limit_fired:
+                        speed_alarm_data = {**data, "alarm_type": "Over speed"}
+                        await self.server.broadcast_alarm(device.id, speed_alarm_data, location_id=location.id)
 
                     # Auto-start a trip the first time this device reports a
                     # gps_valid fix at/above the owner's "moving" speed

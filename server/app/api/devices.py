@@ -1222,3 +1222,70 @@ async def update_alert_settings(
     db.commit()
     db.refresh(settings_row)
     return _alert_settings_response(device_id, settings_row)
+
+
+class SpeedLimitResponse(BaseModel):
+    device_id: int
+    speed_limit_kmh: Optional[float] = None
+
+
+class SpeedLimitUpdate(BaseModel):
+    """Body for `PUT /{device_id}/speed_limit`. `speed_limit_kmh: null`
+    clears the custom threshold entirely — the device reverts to relying
+    solely on its own fixed-firmware overspeed alarm (if any), same as a
+    device that's never had a limit set. See app/services/speed_limit.py
+    for how this is evaluated against every incoming location fix."""
+
+    speed_limit_kmh: Optional[float] = None
+
+    @field_validator("speed_limit_kmh")
+    @classmethod
+    def speed_limit_valid(cls, v: Optional[float]) -> Optional[float]:
+        if v is not None and v <= 0:
+            raise ValueError("speed_limit_kmh must be a positive number")
+        return v
+
+
+@router.get("/{device_id}/speed_limit", response_model=SpeedLimitResponse)
+async def get_speed_limit(
+    device_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Read this device's owner-configured speed threshold. Unlike
+    alert_settings, this is a plain column on Device itself (always
+    exists), not a separate row-or-defaults table — a device with no
+    custom threshold just reads back speed_limit_kmh: null."""
+    device = db.query(Device).filter(Device.id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    require_device_access(device, user)
+
+    return SpeedLimitResponse(device_id=device_id, speed_limit_kmh=device.speed_limit_kmh)
+
+
+@router.put("/{device_id}/speed_limit", response_model=SpeedLimitResponse)
+async def update_speed_limit(
+    device_id: int,
+    body: SpeedLimitUpdate,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Set (or clear, with a null body) this device's owner-configured
+    speed threshold. Takes effect on the next incoming location fix —
+    there's no need to reset any in-progress overspeed state here:
+    Device.is_overspeeding is just edge-detection bookkeeping for
+    app/services/speed_limit.py, and naturally resolves itself against
+    whatever the new threshold is on that next fix."""
+    device = db.query(Device).filter(Device.id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    require_device_access(device, user)
+
+    device.speed_limit_kmh = body.speed_limit_kmh
+    device.updated_at = datetime.utcnow()
+
+    db.commit()
+    db.refresh(device)
+
+    return SpeedLimitResponse(device_id=device_id, speed_limit_kmh=device.speed_limit_kmh)

@@ -72,6 +72,18 @@ class Device(Base):
     battery_level = Column(Integer, nullable=True)  # 0-100
     gsm_signal = Column(Integer, nullable=True)     # 0-31
 
+    # Owner-configured speed threshold (km/h) — see
+    # app/services/speed_limit.py, which evaluates this on every incoming
+    # location fix (migration 029). NULL = no custom limit; the device's
+    # own fixed-firmware "Over speed" alarm (if any) is unaffected either
+    # way, since neither supported hardware model exposes a way to read or
+    # set that value from this backend.
+    speed_limit_kmh = Column(Float, nullable=True)
+    # Edge-detection state for speed_limit_kmh — True while the most recent
+    # fix was over the limit. Purely internal bookkeeping for
+    # app/services/speed_limit.py; never exposed via the API.
+    is_overspeeding = Column(Boolean, nullable=False, default=False)
+
     # Metadata
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

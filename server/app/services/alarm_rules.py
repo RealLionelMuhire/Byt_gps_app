@@ -5,6 +5,22 @@ Extracted from what used to be locals inside TCPServer._send_push_notification
 (app/tcp_server.py) so the escalation/digest cron scripts can share the exact
 same severity/label/critical rules instead of redefining them and risking
 drift.
+
+Keys here must match what TCPServer._send_push_notification actually looks
+them up with: `str(data["alarm_type"]).lower()`. Every real alarm_type this
+backend ever produces for overspeed is the two-word "Over speed" (the GT06
+hardware alarm-byte label in app/protocol_parser.py, and
+app/services/speed_limit.py's synthesized alarms both use it) — so the key
+below is "over speed" (with the space), not "overspeed". It was originally
+"overspeed" (matching the AlertSettings.overspeed_push_enabled *column*
+name, not the actual runtime string), which meant every real overspeed
+alarm silently missed all three dicts below: it fell back to the generic
+"🚨 Device Alarm" label instead of the one meant for it, defaulted to
+"medium" severity instead of "high", and — since a missing
+ALARM_SETTING_FIELDS entry skips the per-type-mute check entirely in
+_send_push_notification — the overspeed_push_enabled toggle had no effect
+on it at all. Fixed alongside adding speed_limit.py, whose alarms would
+otherwise have inherited the exact same bug.
 """
 
 from typing import Dict, Set, Tuple
@@ -14,7 +30,7 @@ ALARM_LABELS: Dict[str, Tuple[str, str]] = {
     "vibration":    ("📳 Vibration Detected", "Unusual movement detected on your vehicle"),
     "low_battery":  ("🪫 Low Battery",        "GPS tracker battery is running low"),
     "acc":          ("🔑 Ignition Change",    "Vehicle ignition changed state"),
-    "overspeed":    ("⚡ Overspeed Alert",     "Vehicle exceeded the speed limit"),
+    "over speed":   ("⚡ Overspeed Alert",     "Vehicle exceeded the speed limit"),
     "displacement": ("📍 Displacement Alert", "Vehicle moved outside the allowed radius"),
     "enter fence":  ("🚧 Geofence Entered",   "Vehicle entered a geofence zone"),
     "exit fence":   ("🚧 Geofence Exited",    "Vehicle exited a geofence zone"),
@@ -26,7 +42,7 @@ ALARM_LABELS: Dict[str, Tuple[str, str]] = {
 # a "high"-only filter nor always able to bypass a "medium" filter.
 ALARM_SEVERITY: Dict[str, str] = {
     "sos": "critical",
-    "overspeed": "high",
+    "over speed": "high",
     "displacement": "high",
     "acc": "medium",
     "vibration": "low",
@@ -41,7 +57,7 @@ ALARM_SETTING_FIELDS: Dict[str, str] = {
     "vibration": "vibration_push_enabled",
     "low_battery": "low_battery_push_enabled",
     "acc": "acc_push_enabled",
-    "overspeed": "overspeed_push_enabled",
+    "over speed": "overspeed_push_enabled",
     "displacement": "displacement_push_enabled",
 }
 
