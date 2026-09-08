@@ -191,22 +191,39 @@ class ConnectionManager:
 manager = ConnectionManager()
 
 
-def _resolve_fleet_device_ids(db: Session, user: User) -> Set[int]:
+def _resolve_fleet_device_ids(db: Session, user: User, company_id: Optional[int] = None) -> Set[int]:
     """
     device_ids a /ws/fleet connection for `user` should receive.
 
     Mirrors the exact ownership rule GET /api/devices/ already applies:
     SUPER_ADMIN/ADMIN see every device, everyone else sees only devices
     belonging to their companies.
+
+    When [company_id] is provided, the fleet is scoped to that single company
+    — the caller must be a member of it (or hold an admin role). When null,
+    all companies the user belongs to are included.
     """
     from app.models.company import Membership
     query = db.query(Device.id)
     if user.role not in (Role.SUPER_ADMIN, Role.ADMIN):
-        member_company_ids = [
-            m.company_id for m in
-            db.query(Membership.company_id).filter(Membership.user_id == user.id).all()
-        ]
-        query = query.filter(Device.company_id.in_(member_company_ids))
+        if company_id is not None:
+            # Verify the user is a member of the requested company
+            membership = (
+                db.query(Membership)
+                .filter(Membership.user_id == user.id, Membership.company_id == company_id)
+                .first()
+            )
+            if not membership:
+                return set()
+            query = query.filter(Device.company_id == company_id)
+        else:
+            member_company_ids = [
+                m.company_id for m in
+                db.query(Membership.company_id).filter(Membership.user_id == user.id).all()
+            ]
+            query = query.filter(Device.company_id.in_(member_company_ids))
+    elif company_id is not None:
+        query = query.filter(Device.company_id == company_id)
     return {row[0] for row in query.all()}
 
 
@@ -260,7 +277,11 @@ async def location_stream(
 
 
 @router.websocket("/ws/fleet")
-async def fleet_stream(websocket: WebSocket, token: Optional[str] = Query(None)):
+async def fleet_stream(
+    websocket: WebSocket,
+    token: Optional[str] = Query(None),
+    company_id: Optional[int] = Query(None),
+):
     """
     Stream real-time GPS location + alarm updates for every device in the
     caller's fleet over a single connection.
@@ -277,6 +298,11 @@ async def fleet_stream(websocket: WebSocket, token: Optional[str] = Query(None))
     Devices paired/unpaired after connecting aren't picked up until the
     client reconnects — deliberately simple for now; a live-refresh path can
     be added later if that turns out to matter in practice.
+
+    When `company_id` is provided as a query parameter, the fleet is scoped
+    to devices belonging to that single company only. The caller must be a
+    member of the company (or hold an admin role). Without `company_id`,
+    every device across all the caller's companies is included.
 
     Auth and idle-timeout behavior match /ws/locations/{device_id}:
     ?token=<clerk-jwt> query param, and the socket closes if the client
@@ -303,7 +329,12 @@ async def fleet_stream(websocket: WebSocket, token: Optional[str] = Query(None))
                 "WS fleet: no User row for clerk_user_id %s", clerk_user_id
             )
             return
-        device_ids = _resolve_fleet_device_ids(db, user)
+        device_ids = _resolve_fleet_device_ids(db, user, company_id)
+        if company_id is not None and not device_ids:
+            logger.info(
+                "WS fleet: no accessible devices for company %d — closing",
+                company_id,
+            )
     finally:
         db.close()
 

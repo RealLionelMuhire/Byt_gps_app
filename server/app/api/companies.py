@@ -28,6 +28,7 @@ from sqlalchemy import or_, func
 from app.core.database import get_db
 from app.core.auth import require_auth, get_current_user, require_admin
 from app.models.user import User
+from app.models.device import Device
 from app.models.company import Company, Membership, CompanyRole, InviteCode
 
 logger = logging.getLogger(__name__)
@@ -57,6 +58,173 @@ class CompanyResponse(BaseModel):
         from_attributes = True
 
 
+# ── Schemas: GET /api/companies ───────────────────────────────────────────────
+
+class CompanyListItem(BaseModel):
+    """One company the authenticated user belongs to."""
+    companyId: int
+    name: str
+    isCompany: bool
+    membershipId: int
+    companyRole: str
+    deviceCount: int = 0
+    memberCount: int = 0
+    createdAt: str
+
+    class Config:
+        from_attributes = True
+
+
+# ── Endpoint: GET /api/companies ──────────────────────────────────────────────
+
+@router.get("/companies", response_model=List[CompanyListItem])
+async def list_my_companies(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    List every company the authenticated user is a member of.
+
+    Returns company metadata plus device_count and member_count so the
+    client can display a useful summary without extra round-trips.
+    """
+    memberships = (
+        db.query(Membership)
+        .filter(Membership.user_id == user.id)
+        .order_by(Membership.created_at.asc())
+        .all()
+    )
+    if not memberships:
+        return []
+
+    company_ids = [m.company_id for m in memberships]
+    companies = {c.id: c for c in db.query(Company).filter(Company.id.in_(company_ids)).all()}
+
+    # Batch-load device counts per company
+    device_counts = dict(
+        db.query(Device.company_id, func.count(Device.id))
+        .filter(Device.company_id.in_(company_ids))
+        .group_by(Device.company_id)
+        .all()
+    )
+
+    # Batch-load member counts per company
+    member_counts = dict(
+        db.query(Membership.company_id, func.count(Membership.id))
+        .filter(Membership.company_id.in_(company_ids))
+        .group_by(Membership.company_id)
+        .all()
+    )
+
+    result = []
+    for m in memberships:
+        company = companies.get(m.company_id)
+        if company is None:
+            continue
+        result.append(CompanyListItem(
+            companyId=company.id,
+            name=company.name,
+            isCompany=company.is_company,
+            membershipId=m.id,
+            companyRole=m.company_role.value,
+            deviceCount=device_counts.get(company.id, 0),
+            memberCount=member_counts.get(company.id, 0),
+            createdAt=company.created_at.isoformat(),
+        ))
+    return result
+
+
+# ── Schemas: GET /api/companies/{company_id}/devices ─────────────────────────
+
+class CompanyDeviceResponse(BaseModel):
+    """One device belonging to a company, with last-known GPS fix."""
+    id: int
+    imei: str
+    name: str
+    status: str
+    lastUpdate: Optional[datetime] = None
+    lastLatitude: Optional[float] = None
+    lastLongitude: Optional[float] = None
+    batteryLevel: Optional[int] = None
+    gsmSignal: Optional[int] = None
+    markerIcon: str = "arrow"
+    nickname: Optional[str] = None
+    plate: Optional[str] = None
+    make: Optional[str] = None
+    model: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+# ── Endpoint: GET /api/companies/{company_id}/devices ─────────────────────────
+
+@router.get("/companies/{company_id}/devices", response_model=List[CompanyDeviceResponse])
+async def list_company_devices(
+    company_id: int,
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    """
+    List all GPS devices belonging to a specific company.
+
+    The caller must be a member of the company, or hold an admin role.
+    Returns device status + last-known GPS fix so the client can
+    immediately render the fleet without a second round-trip.
+    """
+    # Membership check
+    membership = (
+        db.query(Membership)
+        .filter(Membership.user_id == user.id, Membership.company_id == company_id)
+        .first()
+    )
+    if not membership and user.role not in ("SUPER_ADMIN", "ADMIN"):
+        raise HTTPException(status_code=404, detail="Company not found or you are not a member.")
+
+    from app.models.vehicle import Vehicle
+
+    devices = (
+        db.query(Device)
+        .filter(Device.company_id == company_id)
+        .order_by(Device.id.asc())
+        .all()
+    )
+
+    # Batch-load vehicle info (nickname/plate/make/model)
+    vehicle_map: dict = {}
+    if devices:
+        device_ids = [d.id for d in devices]
+        vehicles = (
+            db.query(Vehicle)
+            .filter(Vehicle.device_id.in_(device_ids))
+            .order_by(Vehicle.created_at.desc())
+            .all()
+        )
+        for v in vehicles:
+            vehicle_map.setdefault(v.device_id, v)
+
+    result = []
+    for device in devices:
+        v = vehicle_map.get(device.id)
+        result.append(CompanyDeviceResponse(
+            id=device.id,
+            imei=device.imei,
+            name=device.name,
+            status=device.status,
+            lastUpdate=device.last_update,
+            lastLatitude=device.last_latitude,
+            lastLongitude=device.last_longitude,
+            batteryLevel=device.battery_level,
+            gsmSignal=device.gsm_signal,
+            markerIcon=device.marker_icon,
+            nickname=v.nickname if v else None,
+            plate=v.plate if v else None,
+            make=v.make if v else None,
+            model=v.model if v else None,
+        ))
+    return result
+
+
 # ── Endpoint: POST /api/companies (Step 5) ────────────────────────────────────
 
 @router.post("/companies", response_model=CompanyResponse, status_code=201)
@@ -71,23 +239,46 @@ async def create_company(
     This is onboarding step 5 — called after user profile creation (step 4)
     and before device pairing (step 6).
 
-    - One company per user for now (idempotent: returns existing if already created).
-    - Bumps user.onboarding_step to 5 on success.
+    - If `name` is provided → is_company=True, company name = provided name.
+    - If `name` is omitted  → is_company=False, company name = ".FirstName LastName".
+    - Since /api/auth/sync already auto-creates a personal workspace on
+      sign-up, a first call here is usually an *upgrade*: if the user already
+      belongs to a company and a `name` is provided, the existing personal
+      workspace is renamed and flagged `is_company=True` (rather than being
+      left as-is or duplicated).
+    - The user's onboarding_step is bumped to 5 on success.
     """
     user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found. Complete profile step first.")
 
-    # Idempotent: if user already has a company + membership, return it
+    # The user may already have a company auto-created by /api/auth/sync
+    # (usually a personal/solo workspace). If they now provide a company
+    # name, upgrade that existing company to a real one (is_company=True)
+    # rather than returning it unchanged or creating a duplicate.
     existing_membership = (
         db.query(Membership)
         .filter(Membership.user_id == user.id)
         .order_by(Membership.created_at.asc())
         .first()
     )
+    provided_name = (body.name or "").strip()
     if existing_membership:
         company = db.query(Company).filter(Company.id == existing_membership.company_id).first()
-        logger.info("Company already exists for user %s — returning existing (id=%d)", clerk_user_id, company.id)
+        if provided_name and (not company.is_company or company.name != provided_name):
+            company.name = provided_name
+            company.is_company = True
+            company.updated_at = datetime.utcnow()
+            user.onboarding_step = 5
+            user.updated_at = datetime.utcnow()
+            db.commit()
+            db.refresh(company)
+            logger.info(
+                "Upgraded company id=%d to is_company=True name='%s' for user %s",
+                company.id, company.name, clerk_user_id,
+            )
+        else:
+            logger.info("Company already exists for user %s — returning existing (id=%d)", clerk_user_id, company.id)
         return CompanyResponse(
             companyId=company.id,
             name=company.name,
@@ -97,7 +288,6 @@ async def create_company(
         )
 
     # Determine company name and is_company flag
-    provided_name = (body.name or "").strip()
     if provided_name:
         company_name = provided_name
         is_company = True

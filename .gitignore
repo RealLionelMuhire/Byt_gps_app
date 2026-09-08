@@ -69,3 +69,6 @@ server/__pycache__/
 # Utility scripts
 check_users.py
 make_admin.py
+
+# ShipStudio metadata
+.shipstudio/

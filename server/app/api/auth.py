@@ -15,7 +15,7 @@ from app.core.database import get_db
 from app.core.config import settings
 from app.core.auth import require_auth, require_admin
 from app.models.user import User, Role
-from app.models.company import Membership, Company
+from app.models.company import Membership, Company, CompanyRole
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -23,17 +23,26 @@ router = APIRouter()
 
 # Pydantic schemas
 class UserSyncRequest(BaseModel):
-    """Request body for user sync. clerk_user_id comes from JWT, not body."""
+    """Request body for user sync. clerk_user_id comes from JWT, not body.
+
+    `company_name` is optional and only honoured on a *new* user's first
+    sync (or when the user has no company yet). If provided, the auto-created
+    workspace is flagged `is_company=True` with that name; if omitted, a
+    personal (solo) workspace is created with `is_company=False` and a name
+    derived from the user's own name.
+    """
     email: EmailStr
     first_name: Optional[str] = None
     last_name: Optional[str] = None
     name: Optional[str] = None  # Alternative: full name (split into first/last)
+    company_name: Optional[str] = None  # Optional company name at sign-up
 
     class Config:
         json_schema_extra = {
             "example": {
                 "email": "user@example.com",
-                "name": "John Doe"
+                "name": "John Doe",
+                "company_name": "Acme Fleet"
             }
         }
 
@@ -116,6 +125,78 @@ def _build_user_response(user: User, db: Session) -> UserResponse:
     )
 
 
+def _ensure_user_company(
+    db: Session,
+    user: User,
+    company_name: Optional[str] = None,
+) -> None:
+    """Create the user's workspace (a `Company` + `OWNER` membership) if they
+    don't already belong to one — onboarding step 5.
+
+    Called automatically on user sync so every registered user is guaranteed
+    a company, meaning device pairing (`POST /api/devices/pair`) and the
+    fleet views (which scope devices by company membership) always have
+    something to work with.
+
+    - If the user already has a membership, nothing changes (idempotent).
+    - Otherwise a company is created:
+        * `company_name` provided → `is_company=True` with that name.
+        * `company_name` omitted → personal (solo) workspace,
+          `is_company=False`, name derived from the user's own name.
+    The user's `onboarding_step` is bumped to at least 5.
+    """
+    existing = (
+        db.query(Membership)
+        .filter(Membership.user_id == user.id)
+        .order_by(Membership.created_at.asc())
+        .first()
+    )
+    if existing:
+        return
+
+    provided_name = (company_name or "").strip()
+    if provided_name:
+        company_name_value = provided_name
+        is_company = True
+    else:
+        first = (user.first_name or "").strip()
+        last = (user.last_name or "").strip()
+        company_name_value = f"{first} {last}".strip() or user.email
+        is_company = False
+
+    try:
+        company = Company(
+            name=company_name_value,
+            is_company=is_company,
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow(),
+        )
+        db.add(company)
+        db.flush()  # get company.id
+
+        membership = Membership(
+            user_id=user.id,
+            company_id=company.id,
+            company_role=CompanyRole.OWNER,
+            created_at=datetime.utcnow(),
+        )
+        db.add(membership)
+
+        if user.onboarding_step is None or user.onboarding_step < 5:
+            user.onboarding_step = 5
+        user.updated_at = datetime.utcnow()
+
+        db.commit()
+        db.refresh(company)
+        logger.info(
+            "Auto-created company id=%d name='%s' is_company=%s for user %s (membership_id=%d)",
+            company.id, company.name, company.is_company, user.clerk_user_id, membership.id,
+        )
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error("DB error auto-creating company for user %s: %s", user.clerk_user_id, exc)
+
+
 @router.post("/sync", response_model=UserResponse, status_code=200)
 async def sync_user(
     user_data: UserSyncRequest,
@@ -131,8 +212,12 @@ async def sync_user(
     - **clerk_user_id**: Unique identifier from Clerk authentication (required)
     - **email**: User's email address (required)
     - **name**: User's full name (optional)
+    - **company_name**: Optional company name. On a brand-new user this
+      auto-creates their workspace (onboarding step 5): if provided the
+      workspace is flagged `is_company=True`, otherwise a personal (solo)
+      workspace (`is_company=False`) is created from the user's own name.
     
-    Returns the created or updated user record with timestamps.
+    Returns the created or updated user record with timestamps and companies.
     """
     try:
         # Validate required fields
@@ -201,11 +286,20 @@ async def sync_user(
         if user.is_admin and not user.onboarding_complete:
             user.onboarding_complete = True
             user.onboarding_step = 9
-        
+
         # Commit changes
         db.commit()
         db.refresh(user)
-        
+
+        # Auto-create the user's workspace (onboarding step 5) if they don't
+        # have one yet — covers a brand-new sign-up and any legacy user who
+        # never went through company creation. See _ensure_user_company.
+        _ensure_user_company(
+            db,
+            user=user,
+            company_name=user_data.company_name,
+        )
+
         logger.info(f"User synced successfully: {user.clerk_user_id} (ID: {user.id})")
         return _build_user_response(user, db)
         
