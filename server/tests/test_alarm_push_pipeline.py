@@ -90,8 +90,8 @@ async def test_severity_below_threshold_is_suppressed_and_left_for_digest(alarm_
     db_session.add(AlertSettings(device_id=device.id, min_push_severity="high"))
     db_session.commit()
 
-    location = _make_location(db_session, device, "vibration")
-    await server._send_push_notification(device.id, {"alarm_type": "vibration"}, location_id=location.id)
+    location = _make_location(db_session, device, "shock")
+    await server._send_push_notification(device.id, {"alarm_type": "shock"}, location_id=location.id)
 
     assert sent == []
     db_session.refresh(location)
@@ -107,8 +107,8 @@ async def test_explicit_per_type_mute_is_never_digested(alarm_env, device_and_us
     db_session.add(AlertSettings(device_id=device.id, vibration_push_enabled=False))
     db_session.commit()
 
-    location = _make_location(db_session, device, "vibration")
-    await server._send_push_notification(device.id, {"alarm_type": "vibration"}, location_id=location.id)
+    location = _make_location(db_session, device, "shock")
+    await server._send_push_notification(device.id, {"alarm_type": "shock"}, location_id=location.id)
 
     assert sent == []
     db_session.refresh(location)
@@ -122,8 +122,8 @@ async def test_severity_at_or_above_threshold_still_sends(alarm_env, device_and_
     server, sent = alarm_env
     device, user = device_and_user
 
-    location = _make_location(db_session, device, "acc")
-    await server._send_push_notification(device.id, {"alarm_type": "acc"}, location_id=location.id)
+    location = _make_location(db_session, device, "ignition on")
+    await server._send_push_notification(device.id, {"alarm_type": "ignition on"}, location_id=location.id)
 
     assert len(sent) == 1
     db_session.refresh(location)
@@ -152,12 +152,12 @@ async def test_repeat_alarm_within_dedup_window_is_suppressed(alarm_env, device_
     server, sent = alarm_env
     device, user = device_and_user
 
-    loc1 = _make_location(db_session, device, "vibration")
-    await server._send_push_notification(device.id, {"alarm_type": "vibration"}, location_id=loc1.id)
+    loc1 = _make_location(db_session, device, "shock")
+    await server._send_push_notification(device.id, {"alarm_type": "shock"}, location_id=loc1.id)
     assert len(sent) == 1
 
-    loc2 = _make_location(db_session, device, "vibration")
-    await server._send_push_notification(device.id, {"alarm_type": "vibration"}, location_id=loc2.id)
+    loc2 = _make_location(db_session, device, "shock")
+    await server._send_push_notification(device.id, {"alarm_type": "shock"}, location_id=loc2.id)
 
     # Second push suppressed as a duplicate within the window ...
     assert len(sent) == 1
@@ -171,15 +171,15 @@ async def test_alarm_sends_again_once_dedup_window_has_passed(alarm_env, device_
     device, user = device_and_user
 
     stale_state = AlarmPushState(
-        device_id=device.id, alarm_type="vibration",
+        device_id=device.id, alarm_type="shock",
         last_push_at=datetime.utcnow() - timedelta(minutes=tcp_server_module.PUSH_DEDUP_WINDOW_MINUTES + 1),
         last_alarm_state="fired",
     )
     db_session.add(stale_state)
     db_session.commit()
 
-    location = _make_location(db_session, device, "vibration")
-    await server._send_push_notification(device.id, {"alarm_type": "vibration"}, location_id=location.id)
+    location = _make_location(db_session, device, "shock")
+    await server._send_push_notification(device.id, {"alarm_type": "shock"}, location_id=location.id)
 
     assert len(sent) == 1
 
@@ -218,10 +218,10 @@ async def test_broadcast_alarm_still_fires_ws_broadcast_unconditionally_alongsid
 
     server.ws_manager = FakeWsManager()
 
-    location = _make_location(db_session, device, "vibration")
-    await server.broadcast_alarm(device.id, {"alarm_type": "vibration", "timestamp": location.timestamp}, location_id=location.id)
+    location = _make_location(db_session, device, "shock")
+    await server.broadcast_alarm(device.id, {"alarm_type": "shock", "timestamp": location.timestamp}, location_id=location.id)
 
     # WS broadcast fires regardless of the per-type mute that suppressed the push.
     assert len(broadcasts) == 1
-    assert broadcasts[0][1]["alarm_type"] == "vibration"
+    assert broadcasts[0][1]["alarm_type"] == "shock"
     assert sent == []
