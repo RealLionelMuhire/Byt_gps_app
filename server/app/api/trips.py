@@ -423,7 +423,10 @@ async def end_trip_manually(
         raise HTTPException(status_code=404, detail="Trip not found")
     if trip.end_time is not None:
         return trip  # Already ended
-    end_active_trips_for_device(device_id, db)
+    # discard_if_short=False: this is a deliberate user action, not noise —
+    # the minimum-duration backstop only applies to automatic close paths
+    # (stale checker, disconnect). See end_active_trips_for_device.
+    end_active_trips_for_device(device_id, db, discard_if_short=False)
     db.refresh(trip)
     return trip
 

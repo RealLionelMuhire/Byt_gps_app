@@ -17,9 +17,11 @@ from app.models.alarm_push_state import AlarmPushState
 from app.models.device import Device
 from app.models.location import Location
 from app.models.location_quality_log import LocationQualityLog
-from app.api.locations import classify_outlier, compute_quality_log_fields
+from app.api.locations import classify_outlier, compute_quality_log_fields, location_quality_filters
 from app.services.geofencing import evaluate_geofences, GeofenceTransition
 from app.services.speed_limit import evaluate_speed_limit
+from app.services.live_position import resolve_live_position
+from app.services.trip_settings_service import DEFAULT_STOP_SPEED_KMH, get_or_create_trip_settings
 from app.services.push_notifications import send_push_notification
 from app.services.alarm_rules import (
     ALARM_LABELS,
@@ -360,9 +362,23 @@ class GPSTrackerConnection:
                         **evaluation["quality_fields"],
                     ))
 
-                    # Update device's last known location
-                    device.last_latitude = data['latitude']
-                    device.last_longitude = data['longitude']
+                    # Update device's CONFIRMED live position — gated behind
+                    # the same gps_valid/is_outlier check every historical
+                    # query already applies (location_quality_filters), plus
+                    # a corroboration hold for the case that check can't
+                    # catch: a slow, "plausible" jump while the device
+                    # reports itself stopped (GPS reacquisition after a
+                    # reconnect). See app/services/live_position.py.
+                    if data['gps_valid'] and not is_outlier:
+                        if device.user_id:
+                            trip_settings = get_or_create_trip_settings(device.user_id, db)
+                            stop_speed_threshold_kmh = trip_settings.stop_speed_threshold_kmh
+                        else:
+                            stop_speed_threshold_kmh = DEFAULT_STOP_SPEED_KMH
+                        resolve_live_position(
+                            device, data['latitude'], data['longitude'], data['speed'],
+                            stop_speed_threshold_kmh, datetime.utcnow(),
+                        )
                     device.last_update = datetime.utcnow()
                     device.status = 'online'
 
@@ -389,21 +405,39 @@ class GPSTrackerConnection:
                     # in its own try/except below, makes that class of bug
                     # structurally impossible regardless of what trip
                     # auto-start does in the future.
-                    await self.server.broadcast_location_update(device.id, data)
+                    # Broadcast the CONFIRMED position (device.last_latitude/
+                    # longitude), not the raw ping — otherwise a held
+                    # candidate (see resolve_live_position above) would still
+                    # reach live clients even though it wasn't trusted enough
+                    # to update the device row. Other fields (speed, course,
+                    # timestamp) are still the raw values; only lat/lon is
+                    # gated. Skipped entirely if there's no confirmed
+                    # position yet at all (e.g. device's very first ping was
+                    # itself invalid).
+                    if device.last_latitude is not None and device.last_longitude is not None:
+                        live_data = {**data, 'latitude': device.last_latitude, 'longitude': device.last_longitude}
+                        await self.server.broadcast_location_update(device.id, live_data)
                     await _broadcast_geofence_transitions(self.server, device.id, data, geofence_transitions, location_id=location.id)
                     if speed_limit_fired:
                         speed_alarm_data = {**data, "alarm_type": "Over speed"}
                         await self.server.broadcast_alarm(device.id, speed_alarm_data, location_id=location.id)
 
-                    # Auto-start a trip the first time this device reports a
-                    # gps_valid fix at/above the owner's "moving" speed
-                    # threshold while it has no active trip. Mirrors the
-                    # auto-*end* logic in trip_service.py/main.py's stale
-                    # checker, which only ever closes a trip, never opens
-                    # one — without this, no Trip row is ever created unless
-                    # something calls POST /api/trips/start explicitly.
+                    # Auto-start a trip once this device shows SUSTAINED
+                    # movement — the immediately preceding quality-filtered
+                    # point must also be at/above the owner's "moving" speed
+                    # threshold, not just this one point. A single ping
+                    # above threshold used to be enough, which meant any
+                    # noisy/glitched fix (e.g. a reconnect GPS-reacquisition
+                    # transient — see app/services/live_position.py, added
+                    # for the sibling bug on the live-map side of this same
+                    # failure mode) opened a real trip on its own. Mirrors
+                    # the auto-*end* logic in trip_service.py/main.py's
+                    # stale checker, which only ever closes a trip, never
+                    # opens one — without this, no Trip row is ever created
+                    # unless something calls POST /api/trips/start
+                    # explicitly.
                     try:
-                        if device.user_id and data['gps_valid']:
+                        if device.user_id and data['gps_valid'] and not is_outlier:
                             from app.models.trip import Trip
                             from app.api.trips import get_or_create_trip_settings
 
@@ -415,20 +449,36 @@ class GPSTrackerConnection:
                                     .first()
                                 )
                                 if not has_active_trip:
-                                    new_trip = Trip(
-                                        device_id=device.id,
-                                        user_id=device.user_id,
-                                        name=f"Trip {data['timestamp']:%Y-%m-%d %H:%M}",
-                                        start_time=data['timestamp'],
-                                        end_time=None,
-                                        total_distance_km=0.0,
+                                    prev_point = (
+                                        db.query(Location)
+                                        .filter(*location_quality_filters(device.id))
+                                        .filter(Location.id != location.id)
+                                        .order_by(Location.timestamp.desc())
+                                        .first()
                                     )
-                                    db.add(new_trip)
-                                    db.commit()
-                                    logger.info(
-                                        "Auto-started trip for device %s at %s",
-                                        self.device_imei, data['timestamp'],
+                                    sustained = (
+                                        prev_point is not None
+                                        and prev_point.speed is not None
+                                        and prev_point.speed >= trip_settings.stop_speed_threshold_kmh
+                                        and data['timestamp'] > prev_point.timestamp
+                                        and (data['timestamp'] - prev_point.timestamp)
+                                            <= timedelta(minutes=trip_settings.stop_splits_trip_after_minutes)
                                     )
+                                    if sustained:
+                                        new_trip = Trip(
+                                            device_id=device.id,
+                                            user_id=device.user_id,
+                                            name=f"Trip {prev_point.timestamp:%Y-%m-%d %H:%M}",
+                                            start_time=prev_point.timestamp,
+                                            end_time=None,
+                                            total_distance_km=0.0,
+                                        )
+                                        db.add(new_trip)
+                                        db.commit()
+                                        logger.info(
+                                            "Auto-started trip for device %s at %s",
+                                            self.device_imei, prev_point.timestamp,
+                                        )
                     except Exception as e:
                         logger.error(
                             "Trip auto-start failed for device %s: %s",
@@ -515,8 +565,17 @@ class GPSTrackerConnection:
                         **evaluation["quality_fields"],
                     ))
 
-                    device.last_latitude = data['latitude']
-                    device.last_longitude = data['longitude']
+                    # Same gps_valid/is_outlier gate as handle_location, but
+                    # never held for corroboration — an alarm's reported
+                    # position must never be silently delayed. Clears any
+                    # pending candidate either way so a stale hold can't
+                    # later confirm against an unrelated point.
+                    if data['gps_valid'] and not is_outlier:
+                        device.last_latitude = data['latitude']
+                        device.last_longitude = data['longitude']
+                    device.pending_latitude = None
+                    device.pending_longitude = None
+                    device.pending_since = None
                     device.last_update = datetime.utcnow()
 
                     # location.is_alarm is already True with the hardware's

@@ -64,9 +64,19 @@ class Device(Base):
     last_connect = Column(DateTime, nullable=True)    # Last TCP handshake received
     last_update = Column(DateTime, nullable=True)     # Last location/heartbeat received
 
-    # Last known location
+    # Last known location — the CONFIRMED live position (see
+    # app/services/live_position.py). Never written from a raw ping
+    # directly; only resolve_live_position() updates these.
     last_latitude = Column(Float, nullable=True)
     last_longitude = Column(Float, nullable=True)
+
+    # Unconfirmed live-position candidate awaiting a corroborating next
+    # point, staged when a ping jumps away from last_latitude/longitude
+    # while the device reports itself as stopped (see migration 031 and
+    # app/services/live_position.py). NULL when nothing is being held.
+    pending_latitude = Column(Float, nullable=True)
+    pending_longitude = Column(Float, nullable=True)
+    pending_since = Column(DateTime, nullable=True)
 
     # Device telemetry
     battery_level = Column(Integer, nullable=True)  # 0-100
