@@ -15,5 +15,6 @@ from app.models.geocode_cache import GeocodeCache
 from app.models.command_settings import CommandSettings
 from app.models.alert_settings import AlertSettings
 from app.models.alarm_push_state import AlarmPushState
+from app.models.contact_request import ContactRequest
 
-__all__ = ['Device', 'Location', 'LocationQualityLog', 'User', 'Geofence', 'GeofenceDeviceState', 'GeofenceDevice', 'Trip', 'TripSettings', 'Vehicle', 'Subscription', 'Payment', 'GeocodeCache', 'CommandSettings', 'AlertSettings', 'AlarmPushState']
+__all__ = ['Device', 'Location', 'LocationQualityLog', 'User', 'Geofence', 'GeofenceDeviceState', 'GeofenceDevice', 'Trip', 'TripSettings', 'Vehicle', 'Subscription', 'Payment', 'GeocodeCache', 'CommandSettings', 'AlertSettings', 'AlarmPushState', 'ContactRequest']

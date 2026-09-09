@@ -28,6 +28,7 @@ class User(Base):
     role = Column(SAEnum(Role, name="user_role", create_type=False), default=Role.USER, nullable=False)
     onboarding_step = Column(Integer, default=0, nullable=False)
     onboarding_complete = Column(Boolean, default=False, nullable=False)
+    phone_number = Column(String(32), nullable=True)
     expo_push_token = Column(String(255), nullable=True)
     # FCM registration token — see app/services/push_notifications.py. Both this
     # and expo_push_token can coexist during the Expo->FCM client migration;

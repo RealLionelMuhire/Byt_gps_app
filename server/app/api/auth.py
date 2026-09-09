@@ -28,6 +28,7 @@ class UserSyncRequest(BaseModel):
     first_name: Optional[str] = None
     last_name: Optional[str] = None
     name: Optional[str] = None  # Alternative: full name (split into first/last)
+    phone_number: Optional[str] = None
 
     class Config:
         json_schema_extra = {
@@ -67,9 +68,10 @@ class UserResponse(BaseModel):
     role: str
     onboarding_step: Optional[int] = 0
     onboarding_complete: Optional[bool] = False
+    phone_number: Optional[str] = None
     created_at: datetime
     updated_at: datetime
-    
+
     class Config:
         from_attributes = True
 
@@ -134,6 +136,8 @@ async def sync_user(
                 user.first_name = resolved_first
             if resolved_last is not None:
                 user.last_name = resolved_last
+            if user_data.phone_number is not None:
+                user.phone_number = user_data.phone_number
             user.updated_at = datetime.utcnow()
         else:
             # Create new user — first user becomes SUPER_ADMIN, rest default to USER
@@ -146,6 +150,7 @@ async def sync_user(
                 email=user_data.email,
                 first_name=resolved_first or "Unknown",
                 last_name=resolved_last or "Unknown",
+                phone_number=user_data.phone_number,
                 role=initial_role,
                 # SUPER_ADMIN skips the customer onboarding flow entirely
                 onboarding_complete=is_first_user,

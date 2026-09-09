@@ -14,7 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import settings
 from app.core.database import init_db
 from app.tcp_server import TCPServer
-from app.api import devices, locations, auth, commands, trips, webhooks, geofences
+from app.api import devices, locations, auth, commands, trips, webhooks, geofences, contact_requests
 from app.api import ws as ws_module
 from app.api import onboarding
 from app.api import subscriptions
@@ -177,6 +177,7 @@ app.include_router(trips.router,      prefix="/api/trips",   tags=["trips"])
 app.include_router(geofences.router,  prefix="/api/geofences", tags=["geofences"])
 app.include_router(webhooks.router,   prefix="/api/webhooks", tags=["webhooks"])
 app.include_router(subscriptions.router, prefix="/api/subscription-plans", tags=["subscriptions"])
+app.include_router(contact_requests.router, prefix="/api/contact-requests", tags=["contact-requests"])
 app.include_router(ws_module.router,  tags=["websocket"])
 app.include_router(dashboard.router,  tags=["dashboard"])
 
