@@ -23,6 +23,7 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
+from app.core.serialization import UtcDateTime
 from app.core.auth import require_auth, require_admin
 from app.models.subscription import SubscriptionPlan
 from app.models.user import User
@@ -32,6 +33,8 @@ router = APIRouter()
 
 VALID_BILLING_TYPES = {"one_time", "recurrent"}
 VALID_DURATION_UNITS = {"day", "week", "month", "year"}
+VALID_BILLING_MODELS = {"prepaid", "postpaid"}
+VALID_CHARGE_SCOPES = {"per_device", "flat"}
 
 
 # ── Shared plan resolution (used by the onboarding/billing flow too) ──────────
@@ -39,9 +42,9 @@ VALID_DURATION_UNITS = {"day", "week", "month", "year"}
 # Legacy hardcoded pricing — used only as a fallback when a plan with the
 # given slug doesn't exist in the DB yet (e.g. before migration 014 runs).
 FALLBACK_PLANS = {
-    "trial": {"price": 0, "days": 14, "max_devices": 1, "currency": "RWF"},
-    "basic": {"price": 5000, "days": 30, "max_devices": 3, "currency": "RWF"},
-    "fleet": {"price": 15000, "days": 30, "max_devices": None, "currency": "RWF"},
+    "trial": {"price": 0, "days": 14, "max_devices": 1, "currency": "RWF", "billing_model": "prepaid", "charge_scope": "flat"},
+    "basic": {"price": 5000, "days": 30, "max_devices": 3, "currency": "RWF", "billing_model": "prepaid", "charge_scope": "flat"},
+    "fleet": {"price": 15000, "days": 30, "max_devices": None, "currency": "RWF", "billing_model": "prepaid", "charge_scope": "flat"},
 }
 
 
@@ -90,6 +93,8 @@ def plan_config(db: Session, slug: str) -> dict:
             "days": plan.duration_days,
             "max_devices": plan.max_devices,
             "currency": plan.currency,
+            "billing_model": plan.billing_model,
+            "charge_scope": plan.charge_scope,
         }
     return FALLBACK_PLANS.get(slug, FALLBACK_PLANS["trial"]).copy()
 
@@ -100,6 +105,8 @@ class SubscriptionPlanCreate(BaseModel):
     name: str
     slug: str
     billing_type: str = "recurrent"
+    billing_model: str = "prepaid"
+    charge_scope: str = "flat"
     price: float = 0.0
     currency: str = "RWF"
     duration_value: int = 1
@@ -113,6 +120,20 @@ class SubscriptionPlanCreate(BaseModel):
     def billing_type_valid(cls, v):
         if v not in VALID_BILLING_TYPES:
             raise ValueError(f"billing_type must be one of: {', '.join(sorted(VALID_BILLING_TYPES))}")
+        return v
+
+    @field_validator("billing_model")
+    @classmethod
+    def billing_model_valid(cls, v):
+        if v not in VALID_BILLING_MODELS:
+            raise ValueError(f"billing_model must be one of: {', '.join(sorted(VALID_BILLING_MODELS))}")
+        return v
+
+    @field_validator("charge_scope")
+    @classmethod
+    def charge_scope_valid(cls, v):
+        if v not in VALID_CHARGE_SCOPES:
+            raise ValueError(f"charge_scope must be one of: {', '.join(sorted(VALID_CHARGE_SCOPES))}")
         return v
 
     @field_validator("duration_unit")
@@ -141,6 +162,8 @@ class SubscriptionPlanUpdate(BaseModel):
     """Partial update — only provided fields are changed."""
     name: Optional[str] = None
     billing_type: Optional[str] = None
+    billing_model: Optional[str] = None
+    charge_scope: Optional[str] = None
     price: Optional[float] = None
     currency: Optional[str] = None
     duration_value: Optional[int] = None
@@ -154,6 +177,20 @@ class SubscriptionPlanUpdate(BaseModel):
     def billing_type_valid(cls, v):
         if v is not None and v not in VALID_BILLING_TYPES:
             raise ValueError(f"billing_type must be one of: {', '.join(sorted(VALID_BILLING_TYPES))}")
+        return v
+
+    @field_validator("billing_model")
+    @classmethod
+    def billing_model_valid(cls, v):
+        if v is not None and v not in VALID_BILLING_MODELS:
+            raise ValueError(f"billing_model must be one of: {', '.join(sorted(VALID_BILLING_MODELS))}")
+        return v
+
+    @field_validator("charge_scope")
+    @classmethod
+    def charge_scope_valid(cls, v):
+        if v is not None and v not in VALID_CHARGE_SCOPES:
+            raise ValueError(f"charge_scope must be one of: {', '.join(sorted(VALID_CHARGE_SCOPES))}")
         return v
 
     @field_validator("duration_unit")
@@ -183,6 +220,8 @@ class SubscriptionPlanResponse(BaseModel):
     name: str
     slug: str
     billing_type: str
+    billing_model: str
+    charge_scope: str
     price: float
     currency: str
     duration_value: int
@@ -191,7 +230,7 @@ class SubscriptionPlanResponse(BaseModel):
     max_devices: Optional[int]
     description: Optional[str]
     is_active: bool
-    created_at: Optional[datetime] = None
+    created_at: Optional[UtcDateTime] = None
 
     class Config:
         from_attributes = True
@@ -237,6 +276,8 @@ async def create_subscription_plan(
         name=body.name.strip(),
         slug=slug,
         billing_type=body.billing_type,
+        billing_model=body.billing_model,
+        charge_scope=body.charge_scope,
         price=body.price,
         currency=body.currency.strip().upper() or "RWF",
         duration_value=body.duration_value,
@@ -268,8 +309,8 @@ async def update_subscription_plan(
     # Columns that are NOT NULL in the DB — an explicit null for these must be
     # ignored (clearing them would violate the constraint on commit).
     non_nullable = {
-        "name", "billing_type", "price", "currency",
-        "duration_value", "duration_unit", "is_active",
+        "name", "billing_type", "billing_model", "charge_scope",
+        "price", "currency", "duration_value", "duration_unit", "is_active",
     }
     for field, value in body.model_dump(exclude_unset=True).items():
         # exclude_unset guarantees absent fields stay untouched, so an explicit

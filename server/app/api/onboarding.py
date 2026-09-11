@@ -23,12 +23,15 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.core.database import get_db
+from app.core.serialization import UtcDateTime
 from app.core.auth import (
     require_auth,
+    require_admin,
     get_current_user,
     user_can_access_device,
     require_vehicle_access,
@@ -110,7 +113,7 @@ class SubscriptionRequest(BaseModel):
 
 class SubscriptionResponse(BaseModel):
     subscriptionId: int
-    expiresAt:      datetime
+    expiresAt:      UtcDateTime
 
 
 class SubscriptionUpgradeRequest(BaseModel):
@@ -123,7 +126,7 @@ class PaymentRecord(BaseModel):
     planId: str
     amount: float
     status: str
-    createdAt: datetime
+    createdAt: UtcDateTime
 
     class Config:
         from_attributes = True
@@ -131,7 +134,7 @@ class PaymentRecord(BaseModel):
 
 class BillingResponse(BaseModel):
     currentPlan: str
-    expiresAt: Optional[datetime]
+    expiresAt: Optional[UtcDateTime]
     payments: list[PaymentRecord]
 
 
@@ -389,6 +392,38 @@ async def create_vehicle(
         raise HTTPException(status_code=500, detail="Database error")
 
 
+# ── Charging helpers (per-device plans / postpaid plans) ─────────────────────
+
+def _device_count_for_user(db: Session, clerk_user_id: str) -> int:
+    """Number of GPS devices paired to the user's account (min 1 — buying a
+    plan always covers at least one vehicle)."""
+    user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
+    if not user:
+        return 1
+    count = db.query(Device).filter(Device.user_id == user.id).count()
+    return max(1, count)
+
+
+def _effective_charge(db: Session, cfg: dict, clerk_user_id: str) -> float:
+    """Price actually charged to this user for a plan.
+
+    - per_device plans: price × the user's paired device count (capped by the
+      plan's max_devices when set — "Up to N vehicles")
+    - flat plans: price once, regardless of device count
+
+    The same formula runs at payment initiation and at subscription
+    activation, so the amount collected always matches the amount stored on
+    the Subscription row."""
+    price = float(cfg.get("price", 0.0))
+    if cfg.get("charge_scope") == "per_device":
+        devices = _device_count_for_user(db, clerk_user_id)
+        max_devices = cfg.get("max_devices")
+        if max_devices and devices > max_devices:
+            devices = max_devices
+        price = round(price * devices, 2)
+    return price
+
+
 # ── Endpoint 5: POST /api/payments/initiate  (Step 8, paid plans, IntouchPay) ──
 
 @router.post("/payments/initiate", response_model=PaymentInitiateResponse)
@@ -421,13 +456,26 @@ async def initiate_payment(
 
     cfg = plan_config(db, body.planId)
 
+    # Postpaid plans are invoiced AFTER the period — there is nothing to
+    # collect up-front, so reject the mobile-money flow rather than charging
+    # the customer the wrong amount.
+    if cfg.get("billing_model") == "postpaid":
+        raise HTTPException(
+            status_code=400,
+            detail="This plan is postpaid — you will be invoiced after the period; no upfront payment is required.",
+        )
+
+    # per_device plans are charged price × the user's device count; flat
+    # plans are charged the price once.
+    amount = _effective_charge(db, cfg, clerk_user_id)
+
     # Our own reference — IntouchPay requires this to be globally unique
     # across every request ever sent to them.
     tx_ref = f"IP{uuid.uuid4().hex}"
 
     try:
         resp = await intouch_request_payment(
-            amount=cfg["price"],
+            amount=amount,
             phone=phone,
             transaction_id=tx_ref,
         )
@@ -443,7 +491,7 @@ async def initiate_payment(
             clerk_user_id=clerk_user_id,
             tx_ref=tx_ref,
             plan_id=body.planId,
-            amount=cfg["price"],
+            amount=amount,
             currency=cfg["currency"],
             status=status,
             # Not yet "verified" — this timestamp marks when the request was
@@ -528,11 +576,19 @@ async def create_subscription(
         if ever_used:
             raise HTTPException(status_code=409, detail="Free trial already used. Please choose a paid plan.")
 
-    # For paid plans: enforce that a successful payment was made before
-    # activating the subscription. The mobile app should call
+    cfg = plan_config(db, body.planId)
+    is_postpaid = cfg.get("billing_model") == "postpaid"
+    charge = _effective_charge(db, cfg, clerk_user_id)
+
+    # For paid prepaid plans: enforce that a successful payment was made
+    # before activating the subscription. The mobile app should call
     # /api/payments/verify first, but this backend check prevents a rogue
     # or buggy client from skipping payment entirely.
-    if body.planId != "trial":
+    #
+    # Postpaid plans are the exception: they are invoiced AFTER the period,
+    # so activation is flagged here (logged, no Payment row required)
+    # instead of rejected.
+    if body.planId != "trial" and not is_postpaid:
         payment = db.query(Payment).filter(
             Payment.clerk_user_id == clerk_user_id,
             Payment.plan_id == body.planId,
@@ -544,7 +600,6 @@ async def create_subscription(
                 detail="Payment required. Complete payment verification before activating a paid plan.",
             )
 
-    cfg = plan_config(db, body.planId)
     expires_at = datetime.utcnow() + timedelta(days=cfg["days"])
 
     try:
@@ -552,7 +607,7 @@ async def create_subscription(
             clerk_user_id=clerk_user_id,
             plan_id=body.planId,
             status="active",
-            price=cfg["price"],
+            price=charge,
             started_at=datetime.utcnow(),
             expires_at=expires_at,
         )
@@ -569,8 +624,10 @@ async def create_subscription(
         db.refresh(subscription)
 
         logger.info(
-            "Subscription activated: planId=%s price=%.2f user=%s expires=%s",
-            body.planId, cfg["price"], clerk_user_id, expires_at.isoformat(),
+            "Subscription activated: planId=%s price=%.2f%s user=%s expires=%s",
+            body.planId, charge,
+            " (postpaid — to be invoiced)" if is_postpaid else "",
+            clerk_user_id, expires_at.isoformat(),
         )
         return SubscriptionResponse(subscriptionId=subscription.id, expiresAt=expires_at)
 
@@ -598,15 +655,21 @@ async def upgrade_subscription(
             detail="Invalid or unavailable planId — choose an active plan from the pricing screen.",
         )
 
-    # 1. Confirm payment record exists and is successful
-    payment = db.query(Payment).filter(
-        Payment.tx_ref == body.txRef,
-        Payment.clerk_user_id == clerk_user_id,
-        Payment.status == "successful"
-    ).first()
-    
-    if not payment:
-        raise HTTPException(status_code=402, detail="Payment not verified or not found")
+    cfg = plan_config(db, body.planId)
+    is_postpaid = cfg.get("billing_model") == "postpaid"
+
+    # 1. Confirm payment record exists and is successful — skipped for
+    #    postpaid target plans (invoiced after the period; there is no
+    #    upfront payment to verify).
+    if not is_postpaid:
+        payment = db.query(Payment).filter(
+            Payment.tx_ref == body.txRef,
+            Payment.clerk_user_id == clerk_user_id,
+            Payment.status == "successful"
+        ).first()
+
+        if not payment:
+            raise HTTPException(status_code=402, detail="Payment not verified or not found")
 
     # 2. Confirm upgrade (different plan slug — the mobile app controls
     # pricing-tier ordering, the backend just ensures they're not re-buying
@@ -627,14 +690,14 @@ async def upgrade_subscription(
             current_sub.status = "cancelled"
             current_sub.updated_at = datetime.utcnow()
 
-        cfg = plan_config(db, body.planId)
+        charge = _effective_charge(db, cfg, clerk_user_id)
         expires_at = datetime.utcnow() + timedelta(days=cfg["days"])
-        
+
         new_sub = Subscription(
             clerk_user_id=clerk_user_id,
             plan_id=body.planId,
             status="active",
-            price=cfg["price"],
+            price=charge,
             started_at=datetime.utcnow(),
             expires_at=expires_at,
         )
@@ -650,7 +713,12 @@ async def upgrade_subscription(
         db.commit()
         db.refresh(new_sub)
 
-        logger.info("Subscription upgraded: planId=%s user=%s expires=%s", body.planId, clerk_user_id, expires_at.isoformat())
+        logger.info(
+            "Subscription upgraded: planId=%s price=%.2f%s user=%s expires=%s",
+            body.planId, charge,
+            " (postpaid — to be invoiced)" if is_postpaid else "",
+            clerk_user_id, expires_at.isoformat(),
+        )
         return SubscriptionResponse(subscriptionId=new_sub.id, expiresAt=expires_at)
 
     except SQLAlchemyError as exc:
@@ -693,6 +761,46 @@ async def get_billing_history(
         expiresAt=sub.expires_at if sub else None,
         payments=payment_records
     )
+
+
+# ── Endpoint 9: GET /api/billing/admin/summary ───────────────────────────────
+
+class AdminPaymentSummary(BaseModel):
+    clerk_user_id: str
+    total_payments: int
+    total_paid_amount: float
+    currency: str
+
+
+@router.get("/billing/admin/summary", response_model=list[AdminPaymentSummary])
+async def get_admin_billing_summary(
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    """Per-client payment totals (successful payments only) for the admin
+    billing dashboard. Grouped by currency so multi-currency accounts are not
+    silently summed together."""
+    rows = (
+        db.query(
+            Payment.clerk_user_id,
+            func.count(Payment.id),
+            func.coalesce(func.sum(Payment.amount), 0.0),
+            Payment.currency,
+        )
+        .filter(Payment.status == "successful")
+        .group_by(Payment.clerk_user_id, Payment.currency)
+        .order_by(Payment.clerk_user_id.asc())
+        .all()
+    )
+    return [
+        AdminPaymentSummary(
+            clerk_user_id=r[0],
+            total_payments=r[1],
+            total_paid_amount=float(r[2]),
+            currency=r[3] or "RWF",
+        )
+        for r in rows
+    ]
 
 
 # ── Vehicle serialization (shared by list + update) ───────────────────────────

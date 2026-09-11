@@ -13,6 +13,7 @@ import time
 from collections import defaultdict
 
 from app.core.database import get_db
+from app.core.serialization import UtcDateTime
 from app.core.auth import require_auth, require_admin, get_current_user, require_device_access
 from app.models.alert_settings import AlertSettings
 from app.models.device import Device
@@ -130,8 +131,9 @@ class DeviceSubscriptionInfo(BaseModel):
     plan_slug: Optional[str] = None
     plan_name: Optional[str] = None
     billing_type: Optional[str] = None
-    started_at: Optional[datetime] = None
-    expires_at: Optional[datetime] = None
+    started_at: Optional[UtcDateTime] = None
+    expires_at: Optional[UtcDateTime] = None
+    price: Optional[float] = None  # Charge stored at purchase time (what is owed on renewal/invoice)
 
 
 class DeviceResponse(DeviceBase):
@@ -225,7 +227,7 @@ class PaymentInfo(BaseModel):
     amount: float
     currency: str
     status: str
-    verified_at: Optional[datetime]
+    verified_at: Optional[UtcDateTime]
 
 
 class DeviceBillingResponse(BaseModel):
@@ -281,7 +283,40 @@ def _build_subscription_info(
         billing_type=plan.billing_type if plan else None,
         started_at=sub.started_at,
         expires_at=sub.expires_at,
+        price=sub.price,
     )
+
+
+def _subscription_for_device(
+    db: Session,
+    owner: Optional[User],
+    device_plan: Optional[SubscriptionPlan],
+    plans_by_slug: Optional[dict] = None,
+) -> DeviceSubscriptionInfo:
+    """Resolve the subscription block for ONE device.
+
+    Prefers the owner's subscription for the device's OWN linked plan, so a
+    device linked to plan X never displays the expiry/status of a newer plan
+    the owner happened to buy afterwards. Falls back to the owner's latest
+    subscription only when the device has no linked plan at all (there is
+    nothing to match against).
+    """
+    if owner is None:
+        return DeviceSubscriptionInfo(status="none")
+    sub = None
+    if device_plan is not None:
+        sub = (
+            db.query(Subscription)
+            .filter(
+                Subscription.clerk_user_id == owner.clerk_user_id,
+                func.lower(Subscription.plan_id) == device_plan.slug.lower(),
+            )
+            .order_by(Subscription.created_at.desc())
+            .first()
+        )
+    else:
+        sub = _latest_subscription(db, owner.clerk_user_id)
+    return _build_subscription_info(sub, plans_by_slug or _plans_by_slug(db))
 
 
 # ── Vehicle-info helpers (nickname/plate/make/model, DeviceResponse) ─────────
@@ -402,6 +437,10 @@ async def list_devices(
     # 500ing the whole list; devices are the payload, subscription mode is
     # optional metadata.
     latest_sub = {}
+    # (clerk_user_id, plan_slug) -> latest subscription — so each device can
+    # show the subscription for its OWN linked plan instead of whatever the
+    # owner most recently purchased.
+    sub_by_owner_plan = {}
     plans_by_slug = {}
     clerk_by_owner = {}
     try:
@@ -421,6 +460,9 @@ async def list_devices(
         )
         for s in subs:
             latest_sub.setdefault(s.clerk_user_id, s)
+            sub_by_owner_plan.setdefault(
+                (s.clerk_user_id, (s.plan_id or "").lower()), s
+            )
         plans_by_slug = _plans_by_slug(db)
     except SQLAlchemyError as e:
         # Roll back the aborted transaction BEFORE doing anything else with
@@ -456,9 +498,17 @@ async def list_devices(
         device.trip_count = trip_count or 0
         device.last_trip_at = last_trip_at
         clerk = clerk_by_owner.get(device.user_id)
-        device.subscription = _build_subscription_info(
-            latest_sub.get(clerk) if clerk else None, plans_by_slug
-        )
+        # Prefer the subscription for the device's OWN linked plan (eager-
+        # loaded via selectinload(Device.plan)); fall back to the owner's
+        # latest only when the device has no linked plan.
+        sub = None
+        linked_plan = device.plan
+        if clerk:
+            if linked_plan is not None:
+                sub = sub_by_owner_plan.get((clerk, linked_plan.slug.lower()))
+            if sub is None and linked_plan is None:
+                sub = latest_sub.get(clerk)
+        device.subscription = _build_subscription_info(sub, plans_by_slug)
         _apply_vehicle_info(device, vehicle_by_device_id.get(device.id))
         devices.append(device)
     return devices
@@ -524,8 +574,9 @@ async def get_device_billing(
         if device.plan_id else None
     )
 
-    sub = _latest_subscription(db, owner.clerk_user_id) if owner else None
-    plans_by_slug = _plans_by_slug(db)
+    # Subscription for THIS device's own linked plan (falls back to the
+    # owner's latest only when the device has no linked plan).
+    subscription_info = _subscription_for_device(db, owner, plan)
 
     # Payments: the owner's payments, narrowed to this device's linked plan
     # slug when one is set (so the panel shows only payments for this scheme).
@@ -548,7 +599,7 @@ async def get_device_billing(
             email=owner.email,
         ) if owner else None,
         plan=plan,
-        subscription=_build_subscription_info(sub, plans_by_slug),
+        subscription=subscription_info,
         payments=[
             PaymentInfo(
                 tx_ref=p.tx_ref,
@@ -599,10 +650,7 @@ async def get_device(
         db.query(User).filter(User.id == device.user_id).first()
         if device.user_id else None
     )
-    device.subscription = _build_subscription_info(
-        _latest_subscription(db, owner.clerk_user_id) if owner else None,
-        _plans_by_slug(db),
-    )
+    device.subscription = _subscription_for_device(db, owner, device.plan)
     _apply_vehicle_info(device, _latest_vehicle_by_device_id(db, {device.id}).get(device.id))
     return device
 

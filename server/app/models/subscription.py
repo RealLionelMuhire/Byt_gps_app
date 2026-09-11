@@ -22,6 +22,8 @@ class SubscriptionPlan(Base):
     name = Column(String(100), nullable=False)
     slug = Column(String(50), unique=True, nullable=False, index=True)
     billing_type = Column(String(20), nullable=False, default="recurrent")  # one_time | recurrent
+    billing_model = Column(String(20), nullable=False, default="prepaid")   # prepaid | postpaid
+    charge_scope = Column(String(20), nullable=False, default="flat")       # per_device | flat
     price = Column(Float, nullable=False, default=0.0)
     currency = Column(String(10), nullable=False, default="RWF")
     duration_value = Column(Integer, nullable=False, default=1)
