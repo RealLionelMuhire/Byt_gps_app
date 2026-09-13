@@ -55,6 +55,10 @@ class Subscription(Base):
     price = Column(Float, nullable=False, default=0.0)  # Stored at purchase time so admin edits don't affect existing subscribers
     started_at = Column(DateTime, default=datetime.utcnow)
     expires_at = Column(DateTime, nullable=False)
+    # Set once the "expiring soon" push+email has been sent (see
+    # scripts/cron_expiry.py's notify_expiring_subscriptions) so the
+    # reminder fires exactly once per subscription, not on every cron run.
+    expiry_reminder_sent_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 

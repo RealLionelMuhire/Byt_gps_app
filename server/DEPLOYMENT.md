@@ -307,7 +307,21 @@ docker-compose -f docker-compose.monitoring.yml up -d
 0 2 * * * cd /opt/gps-tracking-server && docker-compose exec postgres pg_dump -U gps_user gps_tracking > /backups/gps_$(date +\%Y\%m\%d).sql
 ```
 
-### 4. Log Rotation
+### 4. Subscription Expiry & Reminders
+
+`scripts/cron_expiry.py` expires lapsed subscriptions, sends the
+"expiring soon" push+email reminder (`EXPIRY_WARNING_DAYS` before
+`expires_at`, sent once per subscription), and reconciles stuck-pending
+IntouchPay payments. It is not run by anything automatically — schedule it
+to run periodically (every 15 minutes is enough since every check inside it
+is idempotent):
+
+```bash
+# Add to crontab
+*/15 * * * * cd /opt/gps-tracking-server && venv/bin/python scripts/cron_expiry.py >> /var/log/gps-tracking/cron_expiry.log 2>&1
+```
+
+### 5. Log Rotation
 
 ```bash
 # Configure Docker log rotation

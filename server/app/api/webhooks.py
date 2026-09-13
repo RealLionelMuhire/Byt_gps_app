@@ -15,10 +15,11 @@ from app.core.database import get_db
 from app.models.user import User
 from app.models.device import Device
 from app.models.vehicle import Vehicle
-from app.models.subscription import Subscription, Payment
+from app.models.subscription import Subscription, Payment, SubscriptionPlan
 from app.models.trip import Trip
 from app.api.auth import claim_pending_client_user
 from app.services.intouchpay import get_transaction_status, classify_status, IntouchPayError
+from app.services.email import send_payment_receipt_email, send_payment_failed_email
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -205,6 +206,27 @@ def _intouch_ack(request_id: str) -> dict:
     return {"message": "success", "success": True, "request_id": request_id or ""}
 
 
+def _plan_display_name(db: Session, plan_id: str) -> str:
+    plan = db.query(SubscriptionPlan).filter(
+        SubscriptionPlan.slug.ilike(plan_id or "")
+    ).first()
+    return plan.name if plan else (plan_id or "").capitalize()
+
+
+async def _send_payment_result_email(db: Session, payment: Payment, *, succeeded: bool) -> None:
+    """Fire-and-forget email after a Payment's status has already been
+    committed — a slow/failing email must never affect the payment state
+    itself (same pattern as cron_expiry.py's _notify_expired_users)."""
+    user = db.query(User).filter(User.clerk_user_id == payment.clerk_user_id).first()
+    if not user:
+        return
+    if succeeded:
+        plan_name = _plan_display_name(db, payment.plan_id)
+        await send_payment_receipt_email(user, payment, plan_name)
+    else:
+        await send_payment_failed_email(user, payment)
+
+
 @router.post("/intouchpay", status_code=200)
 async def intouchpay_webhook(request: Request, db: Session = Depends(get_db)):
     """
@@ -266,6 +288,7 @@ async def intouchpay_webhook(request: Request, db: Session = Depends(get_db)):
         payment.verified_at = datetime.utcnow()
         db.commit()
         logger.info("IntouchPay payment confirmed successful: tx_ref=%s", tx_ref)
+        await _send_payment_result_email(db, payment, succeeded=True)
     elif classification == "unknown" and callback_status in ("failed", "timeout"):
         # Reconciliation could not independently confirm success (see the
         # DOC GAP note in intouchpay.py — no documented decline code), and
@@ -279,6 +302,7 @@ async def intouchpay_webhook(request: Request, db: Session = Depends(get_db)):
             "IntouchPay payment marked failed (callback=%s, unconfirmed by reconciliation): tx_ref=%s",
             callback_status, tx_ref,
         )
+        await _send_payment_result_email(db, payment, succeeded=False)
     else:
         logger.info(
             "IntouchPay payment still unresolved (classification=%s, callback=%s): tx_ref=%s — leaving pending for cron reconciliation",

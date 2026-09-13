@@ -55,6 +55,19 @@ class Settings(BaseSettings):
     INTOUCH_PARTNER_PASSWORD: Optional[str] = None
     INTOUCH_CALLBACK_URL: Optional[str] = None
 
+    # EmailJS (transactional email) — see app/services/email.py.
+    # EMAILJS_SERVICE_ID/PRIVATE_KEY/PUBLIC_KEY plus the relevant
+    # EMAILJS_TEMPLATE_ID_* must all be set for that email type to send;
+    # otherwise it's skipped (logged), never a crash — same contract as the
+    # FCM block below.
+    EMAILJS_SERVICE_ID: Optional[str] = None
+    EMAILJS_PRIVATE_KEY: Optional[str] = None   # EmailJS "Private Key" (server-side accessToken)
+    EMAILJS_PUBLIC_KEY: Optional[str] = None    # EmailJS "Public Key" (user_id)
+    EMAILJS_TEMPLATE_ID_RECEIPT: Optional[str] = None
+    EMAILJS_TEMPLATE_ID_EXPIRING: Optional[str] = None
+    EMAILJS_TEMPLATE_ID_EXPIRED: Optional[str] = None
+    EMAILJS_TEMPLATE_ID_PAYMENT_FAILED: Optional[str] = None
+
     # Firebase Cloud Messaging (push notifications) — see app/services/push_notifications.py.
     # Set exactly one of these to enable FCM sending; if neither is set, FCM sending
     # is skipped (falls back to Expo, or no-ops) rather than crashing on startup.

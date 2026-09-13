@@ -43,7 +43,7 @@ VALID_CHARGE_SCOPES = {"per_device", "flat"}
 # given slug doesn't exist in the DB yet (e.g. before migration 014 runs).
 FALLBACK_PLANS = {
     "trial": {"price": 0, "days": 14, "max_devices": 1, "currency": "RWF", "billing_model": "prepaid", "charge_scope": "flat"},
-    "basic": {"price": 5000, "days": 30, "max_devices": 3, "currency": "RWF", "billing_model": "prepaid", "charge_scope": "flat"},
+    "basic": {"price": 2450, "days": 30, "max_devices": 3, "currency": "RWF", "billing_model": "prepaid", "charge_scope": "flat"},
     "fleet": {"price": 15000, "days": 30, "max_devices": None, "currency": "RWF", "billing_model": "prepaid", "charge_scope": "flat"},
 }
 

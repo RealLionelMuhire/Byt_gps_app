@@ -12,6 +12,11 @@ from app.models.subscription import Subscription, Payment, SubscriptionPlan
 from app.models.user import User
 from app.services.intouchpay import get_transaction_status, classify_status, IntouchPayError
 from app.services.push_notifications import send_push_notification
+from app.services.email import (
+    send_subscription_expiring_email,
+    send_subscription_expired_email,
+    send_payment_failed_email,
+)
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -22,6 +27,10 @@ logger = logging.getLogger(__name__)
 # app/api/webhooks.py and app/services/intouchpay.py for why.
 PENDING_RECONCILE_AFTER_MINUTES = 15   # start checking stuck-pending rows after this long
 PENDING_HARD_FAIL_AFTER_MINUTES = 24 * 60  # give up and mark failed after this long
+
+# How many days before Subscription.expires_at the "expiring soon" push+email
+# fires (once — see Subscription.expiry_reminder_sent_at).
+EXPIRY_WARNING_DAYS = 3
 
 def _expiry_notification_copy(plan_id: str, plan_name: str) -> tuple:
     if plan_id == "trial":
@@ -57,8 +66,67 @@ async def _notify_expired_users(clerk_user_ids_and_plans: list) -> None:
                 body=body,
                 data={"type": "subscription_expired", "screen": "plan_upgrade"},
             )
+            await send_subscription_expired_email(user, plan_name)
     finally:
         db.close()
+
+
+async def _notify_expiring_subscriptions_async() -> None:
+    """Warn users EXPIRY_WARNING_DAYS before their active subscription
+    expires — push + email, sent exactly once per subscription (guarded by
+    expiry_reminder_sent_at). Unlike _notify_expired_users, this runs before
+    the DB is touched for expiry itself (the subscription is still active),
+    so the reminder flag is committed per-row as it's sent rather than in a
+    single batch — a crash partway through still leaves already-sent rows
+    correctly marked, instead of re-sending them next run."""
+    db = SessionLocal()
+    try:
+        now = datetime.utcnow()
+        window_end = now + timedelta(days=EXPIRY_WARNING_DAYS)
+        candidates = db.query(Subscription).filter(
+            Subscription.status == "active",
+            Subscription.expires_at >= now,
+            Subscription.expires_at <= window_end,
+            Subscription.expiry_reminder_sent_at.is_(None),
+        ).all()
+
+        if not candidates:
+            logger.info("No subscriptions entering the expiry-warning window.")
+            return
+
+        plans_by_slug = {p.slug.lower(): p for p in db.query(SubscriptionPlan).all()}
+        for sub in candidates:
+            user = db.query(User).filter(User.clerk_user_id == sub.clerk_user_id).first()
+            if not user:
+                continue
+            plan = plans_by_slug.get((sub.plan_id or "").lower())
+            plan_name = plan.name if plan else (sub.plan_id or "").capitalize()
+            days_left = max(0, (sub.expires_at - now).days)
+
+            await send_push_notification(
+                user,
+                title="⏳ Your plan is about to expire",
+                body=f"Your {plan_name} plan expires in {days_left} day(s). Renew to keep tracking your vehicles.",
+                data={"type": "subscription_expiring", "screen": "billing"},
+            )
+            await send_subscription_expiring_email(user, sub, plan_name, days_left)
+
+            sub.expiry_reminder_sent_at = datetime.utcnow()
+            db.commit()
+            logger.info(
+                "Sent expiring-soon reminder for user %s (plan=%s, days_left=%d)",
+                sub.clerk_user_id, sub.plan_id, days_left,
+            )
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error while notifying expiring subscriptions: {e}")
+    finally:
+        db.close()
+
+
+def notify_expiring_subscriptions():
+    """Entry point for __main__ — see _notify_expiring_subscriptions_async."""
+    asyncio.run(_notify_expiring_subscriptions_async())
 
 
 def check_expired_subscriptions():
@@ -109,6 +177,7 @@ async def _reconcile_pending_intouchpay_payments_async():
             logger.info("No stuck-pending IntouchPay payments found.")
             return
 
+        hard_failed_payments = []
         for payment in stuck:
             try:
                 status_resp = await get_transaction_status(payment.tx_ref)
@@ -129,6 +198,7 @@ async def _reconcile_pending_intouchpay_payments_async():
                 # app/services/intouchpay.py), so an "unknown" classification
                 # could just mean "ask again later", not "it failed".
                 payment.status = "failed"
+                hard_failed_payments.append(payment.clerk_user_id)
                 logger.info(f"Giving up on stuck-pending payment tx_ref={payment.tx_ref} after hard timeout -> failed")
             else:
                 logger.info(f"Payment tx_ref={payment.tx_ref} still unresolved (classification={classification}); will retry next run")
@@ -138,6 +208,28 @@ async def _reconcile_pending_intouchpay_payments_async():
     except Exception as e:
         db.rollback()
         logger.error(f"Error while reconciling pending IntouchPay payments: {e}")
+        return
+    finally:
+        db.close()
+
+    # Notify after the DB commit, same reasoning as check_expired_subscriptions.
+    if hard_failed_payments:
+        await _notify_hard_failed_payments(hard_failed_payments)
+
+
+async def _notify_hard_failed_payments(clerk_user_ids: list) -> None:
+    db = SessionLocal()
+    try:
+        for clerk_user_id in clerk_user_ids:
+            user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
+            if not user:
+                continue
+            payment = db.query(Payment).filter(
+                Payment.clerk_user_id == clerk_user_id,
+                Payment.status == "failed",
+            ).order_by(Payment.verified_at.desc()).first()
+            if payment:
+                await send_payment_failed_email(user, payment)
     finally:
         db.close()
 
@@ -156,4 +248,5 @@ def reconcile_pending_intouchpay_payments():
 
 if __name__ == "__main__":
     check_expired_subscriptions()
+    notify_expiring_subscriptions()
     reconcile_pending_intouchpay_payments()
