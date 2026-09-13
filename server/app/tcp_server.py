@@ -439,7 +439,6 @@ class GPSTrackerConnection:
                     try:
                         if device.user_id and data['gps_valid'] and not is_outlier:
                             from app.models.trip import Trip
-                            from app.api.trips import get_or_create_trip_settings
 
                             trip_settings = get_or_create_trip_settings(device.user_id, db)
                             if data['speed'] >= trip_settings.stop_speed_threshold_kmh:
