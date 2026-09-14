@@ -167,7 +167,23 @@ class GPSTrackerConnection:
         self.last_activity = datetime.utcnow()
         self._command_serial = 0xA000
         self._pending_response: asyncio.Future = None
-        
+        # Which command _pending_response is waiting on — lets
+        # handle_command_response() decide whether to parse the reply as a
+        # location fix (see parse_where_reply). Set by send_command().
+        self._pending_command: Optional[str] = None
+        # Serializes send_command() calls on this connection: GT06 command
+        # responses carry a serial number, but it's the device's own
+        # independent outgoing-packet counter (see parse_command_response),
+        # not an echo of the request's serial — there is no reliable way to
+        # match a reply to a specific in-flight request. Without this lock,
+        # two overlapping commands (e.g. a fuel cut and a location query
+        # within the same ~10s window) would silently cross-wire: the second
+        # send_command() call overwrites _pending_response before the first
+        # command's real reply arrives, so the first call times out despite
+        # succeeding, and/or the wrong reply gets attributed to the wrong
+        # caller. Serializing means a second caller just waits its turn.
+        self._command_lock = asyncio.Lock()
+
         logger.info(f"New connection from {address}")
     
     async def handle(self):
@@ -598,37 +614,83 @@ class GPSTrackerConnection:
             logger.error(f"Error handling alarm: {e}", exc_info=True)
     
     async def handle_command_response(self, data: Dict):
-        """Handle 0x15 command response from terminal"""
+        """Handle 0x15 command response from terminal.
+
+        If the in-flight command was WHERE#, try to parse the reply as a
+        location fix and feed it through handle_location() BEFORE resolving
+        the pending future — so by the time send_command()'s HTTP caller
+        gets its response, the location it describes has already been
+        committed (see parse_where_reply's caller below for why satellites/
+        gps_valid are synthesized rather than taken from the reply)."""
         content = data.get('content', '')
         logger.info(f"Command response from {self.device_imei}: {content}")
+
+        if self._pending_command == "WHERE#":
+            parsed = self.parser.parse_where_reply(content)
+            if parsed:
+                if self.authenticated and self.device_imei:
+                    await self.handle_location({
+                        'latitude': parsed['latitude'],
+                        'longitude': parsed['longitude'],
+                        'speed': parsed['speed'],
+                        'course': parsed['course'],
+                        'timestamp': parsed['timestamp'],
+                        # Not reported by WHERE# — 0 here means "not
+                        # reported by an on-demand query", distinct from a
+                        # passive 0x12 packet genuinely reporting 0
+                        # satellites (which pairs with gps_valid=False, a
+                        # real failure mode handled upstream — see
+                        # app/services/live_position.py's docstring). This
+                        # combination (satellites=0, gps_valid=True) never
+                        # occurs via the passive path, so it stays
+                        # distinguishable without a schema change.
+                        'satellites': 0,
+                        # True only because parse_where_reply matched at
+                        # all — a device reply that doesn't parse (no fix,
+                        # an error string) never reaches here, so no
+                        # Location row is written for it.
+                        'gps_valid': True,
+                    })
+                else:
+                    logger.warning(
+                        f"WHERE# reply parsed but connection not authenticated for {self.device_imei} — skipping location write"
+                    )
+
         if self._pending_response and not self._pending_response.done():
             self._pending_response.set_result(data)
-    
+
     async def send_command(self, command: str, timeout: float = 10.0) -> Dict:
-        """Send an ASCII command to the device (Protocol 0x80) and wait for the 0x15 response."""
-        self._command_serial = (self._command_serial + 1) & 0xFFFF
-        packet = self.parser.create_command_packet(command, self._command_serial)
-        if not packet:
-            return {"success": False, "error": "Failed to build command packet"}
+        """Send an ASCII command to the device (Protocol 0x80) and wait for the 0x15 response.
 
-        loop = asyncio.get_event_loop()
-        self._pending_response = loop.create_future()
+        Serialized per-connection via _command_lock — see its doc in
+        __init__ for why (GT06 command responses can't be reliably
+        correlated to a specific in-flight request)."""
+        async with self._command_lock:
+            self._command_serial = (self._command_serial + 1) & 0xFFFF
+            packet = self.parser.create_command_packet(command, self._command_serial)
+            if not packet:
+                return {"success": False, "error": "Failed to build command packet"}
 
-        await self.send_data(packet)
-        logger.info(f"Sent command to {self.device_imei}: {command}")
+            loop = asyncio.get_event_loop()
+            self._pending_response = loop.create_future()
+            self._pending_command = command
 
-        try:
-            result = await asyncio.wait_for(self._pending_response, timeout=timeout)
-            return {
-                "success": True,
-                "response": result.get('content', ''),
-                "server_flag": result.get('server_flag'),
-            }
-        except asyncio.TimeoutError:
-            logger.warning(f"Command timed out for {self.device_imei}: {command}")
-            return {"success": True, "response": None, "note": "Command sent but device did not reply within timeout. It may still take effect."}
-        finally:
-            self._pending_response = None
+            await self.send_data(packet)
+            logger.info(f"Sent command to {self.device_imei}: {command}")
+
+            try:
+                result = await asyncio.wait_for(self._pending_response, timeout=timeout)
+                return {
+                    "success": True,
+                    "response": result.get('content', ''),
+                    "server_flag": result.get('server_flag'),
+                }
+            except asyncio.TimeoutError:
+                logger.warning(f"Command timed out for {self.device_imei}: {command}")
+                return {"success": True, "response": None, "note": "Command sent but device did not reply within timeout. It may still take effect."}
+            finally:
+                self._pending_response = None
+                self._pending_command = None
     
     async def send_data(self, data: bytes):
         """Send data to GPS tracker"""

@@ -8,6 +8,7 @@ Parses binary packets from GPS trackers per the official protocol:
 - Protocol numbers: 0x01 Login, 0x12 Location, 0x13 Heartbeat (status), 0x16 Alarm, 0x80 Command response
 """
 
+import re
 import struct
 from datetime import datetime
 from typing import Optional, Dict, Any
@@ -462,4 +463,47 @@ class ProtocolParser:
 
         except Exception as e:
             logger.error(f"Error parsing command response: {e}")
+            return None
+
+    # Confirmed live against a real G900LS J16-4G (2026-09-14): a WHERE#
+    # command's 0x15 reply content looks like
+    #   "LastPosition! Lati:S1.943835,E30.094658,Course:11,Speed:0.00,DateTime:2026-09-14 14:13:27"
+    # — hemisphere-prefixed lat/lon (no separate "Lon:" label), course in
+    # degrees, speed in km/h, device-clock timestamp. No satellite count or
+    # explicit validity flag, unlike a passive 0x12 packet (see
+    # parse_location) — callers must synthesize those themselves.
+    _WHERE_REPLY_RE = re.compile(
+        r"Lati:([NS])([\d.]+),([EW])([\d.]+),Course:([\d.]+),Speed:([\d.]+),"
+        r"DateTime:(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})"
+    )
+
+    def parse_where_reply(self, content: str) -> Optional[Dict[str, Any]]:
+        """Parse a WHERE# command's reply content into a location fix, or
+        None if `content` doesn't match the expected format (a STATUS#
+        reply, an error string, or "no fix" — none of these should ever be
+        treated as a real position)."""
+        if not content:
+            return None
+        match = self._WHERE_REPLY_RE.search(content)
+        if not match:
+            return None
+
+        try:
+            lat_hemi, lat_deg, lon_hemi, lon_deg, course, speed, dt_str = match.groups()
+            latitude = float(lat_deg)
+            if lat_hemi == 'S':
+                latitude = -latitude
+            longitude = float(lon_deg)
+            if lon_hemi == 'W':
+                longitude = -longitude
+
+            return {
+                'latitude': latitude,
+                'longitude': longitude,
+                'course': int(float(course)),
+                'speed': float(speed),
+                'timestamp': datetime.strptime(dt_str, '%Y-%m-%d %H:%M:%S'),
+            }
+        except (ValueError, TypeError) as e:
+            logger.error(f"Error parsing WHERE# reply {content!r}: {e}")
             return None
