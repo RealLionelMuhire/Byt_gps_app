@@ -150,6 +150,11 @@ class DeviceResponse(DeviceBase):
     last_update: Optional[datetime]
     last_latitude: Optional[float]
     last_longitude: Optional[float]
+    # When last_latitude/last_longitude were last actually changed by a
+    # confirmed fix — distinct from last_update, which is bumped on every
+    # packet whether or not it was valid or moved the position. See
+    # app/services/live_position.py.
+    position_confirmed_at: Optional[datetime] = None
     battery_level: Optional[int]
     gsm_signal: Optional[int]
     created_at: datetime

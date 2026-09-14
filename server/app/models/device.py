@@ -69,6 +69,12 @@ class Device(Base):
     # directly; only resolve_live_position() updates these.
     last_latitude = Column(Float, nullable=True)
     last_longitude = Column(Float, nullable=True)
+    # When last_latitude/last_longitude were last actually changed by a
+    # confirmed fix (see migration 037) — distinct from last_update below,
+    # which is bumped on every packet whether or not it was valid or moved
+    # the position. Lets clients show "position confirmed 3h ago" instead
+    # of implying a live position from a recent-but-invalid ping.
+    position_confirmed_at = Column(DateTime, nullable=True)
 
     # Unconfirmed live-position candidate awaiting a corroborating next
     # point, staged when a ping jumps away from last_latitude/longitude

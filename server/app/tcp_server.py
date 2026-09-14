@@ -431,7 +431,12 @@ class GPSTrackerConnection:
                     # position yet at all (e.g. device's very first ping was
                     # itself invalid).
                     if device.last_latitude is not None and device.last_longitude is not None:
-                        live_data = {**data, 'latitude': device.last_latitude, 'longitude': device.last_longitude}
+                        live_data = {
+                            **data,
+                            'latitude': device.last_latitude,
+                            'longitude': device.last_longitude,
+                            'position_confirmed_at': device.position_confirmed_at,
+                        }
                         await self.server.broadcast_location_update(device.id, live_data)
                     await _broadcast_geofence_transitions(self.server, device.id, data, geofence_transitions, location_id=location.id)
                     if speed_limit_fired:
@@ -588,6 +593,7 @@ class GPSTrackerConnection:
                     if data['gps_valid'] and not is_outlier:
                         device.last_latitude = data['latitude']
                         device.last_longitude = data['longitude']
+                        device.position_confirmed_at = datetime.utcnow()
                     device.pending_latitude = None
                     device.pending_longitude = None
                     device.pending_since = None
@@ -801,6 +807,7 @@ class TCPServer:
             return
 
         ts = data.get("timestamp")
+        confirmed_at = data.get("position_confirmed_at")
         payload = {
             "type": "location",
             "device_id": device_id,
@@ -810,6 +817,7 @@ class TCPServer:
             "course": data.get("course"),
             "timestamp": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
             "gps_valid": data.get("gps_valid", True),
+            "position_confirmed_at": confirmed_at.isoformat() if hasattr(confirmed_at, "isoformat") else None,
         }
         await self.ws_manager.broadcast(device_id, payload)
 

@@ -77,6 +77,7 @@ def resolve_live_position(
     if device.last_latitude is None or device.last_longitude is None:
         device.last_latitude = new_lat
         device.last_longitude = new_lon
+        device.position_confirmed_at = now
         device.pending_latitude = None
         device.pending_longitude = None
         device.pending_since = None
@@ -88,6 +89,7 @@ def resolve_live_position(
     if dist_from_confirmed <= CONFIRM_RADIUS_METERS or moving_now:
         device.last_latitude = new_lat
         device.last_longitude = new_lon
+        device.position_confirmed_at = now
         device.pending_latitude = None
         device.pending_longitude = None
         device.pending_since = None
@@ -103,6 +105,7 @@ def resolve_live_position(
         if dist_to_pending <= CONFIRM_RADIUS_METERS:
             device.last_latitude = new_lat
             device.last_longitude = new_lon
+            device.position_confirmed_at = now
             device.pending_latitude = None
             device.pending_longitude = None
             device.pending_since = None
