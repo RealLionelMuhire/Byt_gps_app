@@ -450,3 +450,5 @@ Full command reference: [docs/usage/CONFIGURATION_GUIDE.md](docs/usage/CONFIGURA
 ---
 
 **Happy Tracking! 🚗📍🗺️**
+
+NB: This readme is the property owned by BYTHRON, it should be used after right provided.

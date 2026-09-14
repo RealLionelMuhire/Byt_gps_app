@@ -312,14 +312,26 @@ docker-compose -f docker-compose.monitoring.yml up -d
 `scripts/cron_expiry.py` expires lapsed subscriptions, sends the
 "expiring soon" push+email reminder (`EXPIRY_WARNING_DAYS` before
 `expires_at`, sent once per subscription), and reconciles stuck-pending
-IntouchPay payments. It is not run by anything automatically — schedule it
-to run periodically (every 15 minutes is enough since every check inside it
-is idempotent):
+IntouchPay payments. On the current production host this already runs via
+the user's own crontab (`crontab -l`), invoked through Docker Compose since
+`app/`, `migrations/`, and `scripts/` are all bind-mounted into the
+`gps_server` container (see `docker-compose.yml`) — a plain `python
+scripts/cron_expiry.py` on the host itself would fail (no local venv; the
+container is the only place dependencies are installed):
 
 ```bash
-# Add to crontab
-*/15 * * * * cd /opt/gps-tracking-server && venv/bin/python scripts/cron_expiry.py >> /var/log/gps-tracking/cron_expiry.log 2>&1
+# Already installed in this deployment's crontab — every 15 minutes
+*/15 * * * * cd ~/BYTHRON/Byt_gps_app/server && docker compose exec -T gps_server python scripts/cron_expiry.py >> ~/cron_logs/cron_expiry.log 2>&1
 ```
+
+Because those directories are bind-mounted (not baked into the image), a
+`git pull` on the host is picked up by the *next* `docker compose exec` cron
+run immediately — no rebuild or restart needed for anything in
+`scripts/`/`app/`. The one exception is the long-running `gps_server`
+process itself (`python -m app.main`, started once and keeping its modules
+and `.env` values in memory) — a code change to a module it already
+imported, or a new/changed env var, only takes effect after
+`docker compose restart gps_server`.
 
 ### 5. Log Rotation
 
