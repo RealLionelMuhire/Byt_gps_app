@@ -38,6 +38,13 @@ class Location(Base):
     # a historical alarm should keep reporting the zone name as it was
     # then, even if the geofence is later renamed or deleted.
     geofence_name = Column(String(100), nullable=True)
+    # Reverse-geocoded road name at the moment an "Over speed" alarm_type
+    # fired (see _resolve_overspeed_road_name in tcp_server.py). NULL for
+    # every other alarm_type, and also NULL when the position wasn't yet in
+    # the geocoding cache at fire time (the alarm still fired immediately
+    # with a coordinate fallback rather than waiting on it — see that
+    # function's docstring) — not a missing feature, just an unresolved one.
+    road_name = Column(String(200), nullable=True)
 
     # Alarm notification-delivery discipline (see app/services/alarm_rules.py
     # and TCPServer._send_push_notification in app/tcp_server.py):

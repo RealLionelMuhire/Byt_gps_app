@@ -6,7 +6,7 @@ Handles binary protocol communication
 
 import asyncio
 import logging
-from typing import Dict, List, Optional, Set
+from typing import Dict, List, Optional, Set, Tuple
 from datetime import datetime, timedelta
 import struct
 
@@ -21,6 +21,7 @@ from app.api.locations import classify_outlier, compute_quality_log_fields, loca
 from app.services.geofencing import evaluate_geofences, GeofenceTransition
 from app.services.speed_limit import evaluate_speed_limit
 from app.services.live_position import resolve_live_position
+from app.services.geocoding import reverse_geocode_many, reverse_geocode_many_cached_only
 from app.services.trip_settings_service import DEFAULT_STOP_SPEED_KMH, get_or_create_trip_settings
 from app.services.push_notifications import send_push_notification
 from app.services.alarm_rules import (
@@ -114,7 +115,11 @@ async def _broadcast_geofence_transitions(
     """Fire one broadcast_alarm() per detected transition — same WS + push
     pipeline as any other alarm, just with a synthesized alarm_type."""
     for t in transitions:
-        alarm_data = {**data, "alarm_type": "Enter fence" if t.entered else "Exit fence"}
+        alarm_data = {
+            **data,
+            "alarm_type": "Enter fence" if t.entered else "Exit fence",
+            "geofence_name": t.geofence.name,
+        }
         await server.broadcast_alarm(device_id, alarm_data, location_id=location_id)
 
 
@@ -149,6 +154,26 @@ def _apply_speed_limit_check(device: Device, location: Location, speed_kmh: floa
         location.alarm_type = "Over speed"
         return True
     return False
+
+
+def _resolve_overspeed_road_name(location: Location) -> Tuple[Optional[str], List[Tuple[float, float]]]:
+    """
+    Cache-only reverse-geocode lookup for a just-fired overspeed alarm's
+    position (see app/services/geocoding.py — same cache the period-route
+    endpoint reads from). Never makes a Nominatim network call and never
+    sleeps, so it adds ~no latency to this alarm's delivery: a cache hit
+    returns the road name immediately, a miss returns None immediately.
+
+    Returns (road_name_or_None, coords_to_warm) — the caller should kick
+    off a background task with `coords_to_warm` (via reverse_geocode_many)
+    to resolve and cache it for next time, without waiting on it. This
+    alarm intentionally ships with a coordinate fallback rather than being
+    delayed, or double-sent once the background lookup resolves.
+    """
+    places: Dict[Tuple[float, float], Optional[str]] = {}
+    coord = (location.latitude, location.longitude)
+    missing = reverse_geocode_many_cached_only([coord], places)
+    return places.get(coord), missing
 
 
 class GPSTrackerConnection:
@@ -440,7 +465,19 @@ class GPSTrackerConnection:
                         await self.server.broadcast_location_update(device.id, live_data)
                     await _broadcast_geofence_transitions(self.server, device.id, data, geofence_transitions, location_id=location.id)
                     if speed_limit_fired:
-                        speed_alarm_data = {**data, "alarm_type": "Over speed"}
+                        road_name, missing_coords = _resolve_overspeed_road_name(location)
+                        if missing_coords:
+                            asyncio.create_task(asyncio.to_thread(reverse_geocode_many, missing_coords))
+                        if road_name:
+                            # Persist only on a cache hit -- a miss has
+                            # nothing worth recording (see
+                            # _resolve_overspeed_road_name's docstring);
+                            # GET /{device_id}/alarms can then show this
+                            # alarm's road the same way the live push/WS
+                            # broadcast just did, not just at fire time.
+                            location.road_name = road_name
+                            db.commit()
+                        speed_alarm_data = {**data, "alarm_type": "Over speed", "road_name": road_name}
                         await self.server.broadcast_alarm(device.id, speed_alarm_data, location_id=location.id)
 
                     # Auto-start a trip once this device shows SUSTAINED
@@ -840,6 +877,8 @@ class TCPServer:
             "latitude": data.get("latitude"),
             "longitude": data.get("longitude"),
             "timestamp": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
+            "geofence_name": data.get("geofence_name"),
+            "road_name": data.get("road_name"),
         }
         await self.ws_manager.broadcast(device_id, payload)
 
@@ -945,13 +984,42 @@ class TCPServer:
                 alarm_key,
                 ("\U0001f6a8 Device Alarm", f"Alarm triggered: {alarm_key}")
             )
+            # Enrich the generic label with a concrete place/road name when
+            # one is available on this alarm's data (see
+            # _apply_geofence_transitions / _broadcast_geofence_transitions
+            # for geofence_name, and the overspeed block in handle_location
+            # for road_name). Falls back to the generic label/coordinates
+            # rather than blocking this push on it.
+            if alarm_key in ("enter fence", "exit fence") and data.get("geofence_name"):
+                verb = "Entered" if alarm_key == "enter fence" else "Exited"
+                body_text = f"{verb} geofence: {data['geofence_name']}"
+            elif alarm_key == "over speed":
+                road_name = data.get("road_name")
+                lat, lon = data.get("latitude"), data.get("longitude")
+                if road_name:
+                    body_text = f"Overspeeding on {road_name}"
+                elif lat is not None and lon is not None:
+                    body_text = f"Overspeeding near {lat:.4f}, {lon:.4f}"
             body_text = f"{device.name} \u2022 {body_text}"
+
+            # Threaded through to the mobile client's foreground handler,
+            # which reconstructs its own snackbar text from this `data`
+            # map rather than the notification block above (backgrounded/
+            # killed delivery renders `body_text` verbatim via the OS
+            # instead, so doesn't need these). Omitted when absent/None \u2014
+            # FCM stringifies every value here, and str(None) == "None"
+            # would otherwise show up as a literal word in the app.
+            push_data = {"type": "alarm", "device_id": device_id, "alarm_type": alarm_key}
+            if data.get("geofence_name"):
+                push_data["geofence_name"] = data["geofence_name"]
+            if data.get("road_name"):
+                push_data["road_name"] = data["road_name"]
 
             await send_push_notification(
                 user,
                 title=title,
                 body=body_text,
-                data={"type": "alarm", "device_id": device_id, "alarm_type": alarm_key},
+                data=push_data,
                 channel_id="gps-alarms",
             )
 

@@ -19,12 +19,14 @@ import pytest
 from sqlalchemy.orm import sessionmaker
 
 import app.tcp_server as tcp_server_module
-from app.tcp_server import TCPServer
+from app.tcp_server import TCPServer, _broadcast_geofence_transitions
 from app.models.user import User
 from app.models.device import Device
 from app.models.alert_settings import AlertSettings
 from app.models.alarm_push_state import AlarmPushState
 from app.models.location import Location
+from app.models.geofence import Geofence
+from app.services.geofencing import GeofenceTransition
 
 pytestmark = pytest.mark.anyio
 
@@ -44,7 +46,7 @@ def alarm_env(db_session, monkeypatch):
     sent = []
 
     async def fake_send_push_notification(user, title, body, data, channel_id=None):
-        sent.append({"user_id": user.id, "title": title, "alarm_type": data.get("alarm_type")})
+        sent.append({"user_id": user.id, "title": title, "body": body, "alarm_type": data.get("alarm_type")})
         return True
 
     monkeypatch.setattr(tcp_server_module, "send_push_notification", fake_send_push_notification)
@@ -225,3 +227,112 @@ async def test_broadcast_alarm_still_fires_ws_broadcast_unconditionally_alongsid
     assert len(broadcasts) == 1
     assert broadcasts[0][1]["alarm_type"] == "shock"
     assert sent == []
+
+
+async def test_geofence_push_body_includes_geofence_name(alarm_env, device_and_user, db_session):
+    """Enter/Exit fence pushes should name the actual geofence, not just
+    say "Enter fence" — see _apply_geofence_transitions /
+    _broadcast_geofence_transitions in app/tcp_server.py, which stamp
+    geofence_name onto the alarm data dict passed through to this method."""
+    server, sent = alarm_env
+    device, user = device_and_user
+
+    location = _make_location(db_session, device, "enter fence")
+    await server._send_push_notification(
+        device.id, {"alarm_type": "enter fence", "geofence_name": "Home Base"}, location_id=location.id,
+    )
+
+    assert len(sent) == 1
+    assert sent[0]["body"] == "Toyota Hilux • Entered geofence: Home Base"
+
+
+async def test_exit_fence_push_body_says_exited(alarm_env, device_and_user, db_session):
+    server, sent = alarm_env
+    device, user = device_and_user
+
+    location = _make_location(db_session, device, "exit fence")
+    await server._send_push_notification(
+        device.id, {"alarm_type": "exit fence", "geofence_name": "Home Base"}, location_id=location.id,
+    )
+
+    assert sent[0]["body"] == "Toyota Hilux • Exited geofence: Home Base"
+
+
+async def test_fence_push_falls_back_to_generic_label_when_name_missing(alarm_env, device_and_user, db_session):
+    """Defensive: every synthesized fence transition carries geofence_name,
+    but the push path must not blow up (or show "None") if it's ever absent."""
+    server, sent = alarm_env
+    device, user = device_and_user
+
+    location = _make_location(db_session, device, "enter fence")
+    await server._send_push_notification(device.id, {"alarm_type": "enter fence"}, location_id=location.id)
+
+    assert sent[0]["body"] == "Toyota Hilux • Vehicle entered a geofence zone"
+
+
+async def test_overspeed_push_body_includes_road_name(alarm_env, device_and_user, db_session):
+    """Over speed pushes should name the road when a reverse-geocoded name
+    is available on the alarm data (see the overspeed block in
+    TCPServer.handle_location, app/tcp_server.py)."""
+    server, sent = alarm_env
+    device, user = device_and_user
+
+    location = _make_location(db_session, device, "over speed")
+    await server._send_push_notification(
+        device.id,
+        {"alarm_type": "over speed", "road_name": "KN 247 Street", "latitude": -1.9, "longitude": 30.05},
+        location_id=location.id,
+    )
+
+    assert sent[0]["body"] == "Toyota Hilux • Overspeeding on KN 247 Street"
+
+
+async def test_overspeed_push_falls_back_to_coordinates_when_road_name_missing(alarm_env, device_and_user, db_session):
+    """Cache-miss case: the road name isn't resolved yet, so the push must
+    still send immediately with coordinates rather than waiting on
+    Nominatim (see the latency design note in the overspeed block)."""
+    server, sent = alarm_env
+    device, user = device_and_user
+
+    location = _make_location(db_session, device, "over speed")
+    await server._send_push_notification(
+        device.id,
+        {"alarm_type": "over speed", "road_name": None, "latitude": -1.9432, "longitude": 30.0521},
+        location_id=location.id,
+    )
+
+    assert sent[0]["body"] == "Toyota Hilux • Overspeeding near -1.9432, 30.0521"
+
+
+async def test_broadcast_geofence_transitions_end_to_end_enriches_push_body(alarm_env, device_and_user, db_session):
+    """Full-stack check: a real GeofenceTransition run through
+    _broadcast_geofence_transitions -> broadcast_alarm -> _send_push_notification
+    ends up naming the actual geofence in the push body, not just "Enter fence"."""
+    server, sent = alarm_env
+    device, user = device_and_user
+
+    class FakeWsManager:
+        async def broadcast(self, device_id, payload):
+            pass
+
+    server.ws_manager = FakeWsManager()
+
+    geofence = Geofence(
+        user_id=user.id, name="Home Base", center_latitude=-1.9, center_longitude=30.05,
+        radius_meters=200, is_active=True, alert_on_enter=True, alert_on_exit=True,
+    )
+    db_session.add(geofence)
+    db_session.commit()
+    db_session.refresh(geofence)
+
+    location = _make_location(db_session, device, "enter fence")
+    transitions = [GeofenceTransition(geofence=geofence, entered=True)]
+
+    await _broadcast_geofence_transitions(
+        server, device.id,
+        {"latitude": -1.9, "longitude": 30.05, "timestamp": location.timestamp},
+        transitions, location_id=location.id,
+    )
+
+    assert len(sent) == 1
+    assert sent[0]["body"] == "Toyota Hilux • Entered geofence: Home Base"

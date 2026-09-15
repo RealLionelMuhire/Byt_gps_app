@@ -13,12 +13,13 @@ test_geofencing.py and test_vehicles_api.py's own patterns.
 
 from datetime import datetime
 
+import app.tcp_server as tcp_server_module
 from app.models.device import Device
 from app.models.location import Location
 from app.models.user import User, Role
 from app.services.speed_limit import evaluate_speed_limit
 from app.services.alarm_rules import ALARM_LABELS, ALARM_SETTING_FIELDS, get_severity
-from app.tcp_server import _apply_speed_limit_check
+from app.tcp_server import _apply_speed_limit_check, _resolve_overspeed_road_name
 
 
 # ---------------------------------------------------------------------------
@@ -129,6 +130,66 @@ def test_apply_speed_limit_check_does_not_override_an_existing_alarm(db_session)
     assert location.alarm_type == "Shock"
     # State still updates for the next fix, regardless of who won the slot.
     assert device.is_overspeeding is True
+
+
+# ---------------------------------------------------------------------------
+# _resolve_overspeed_road_name — the cache-only geocoding lookup an
+# overspeed alarm uses to name the road in its push, without ever waiting
+# on a live Nominatim call (see the function's docstring in tcp_server.py
+# and the design note on the overspeed block in handle_location).
+# ---------------------------------------------------------------------------
+
+def test_resolve_overspeed_road_name_returns_cached_name_with_nothing_to_warm(monkeypatch):
+    device = Device(imei="1", name="Test", speed_limit_kmh=80)
+    location = _location(device)
+
+    def fake_cached_only(coords, results):
+        results[coords[0]] = "KN 247 Street"
+        return []
+
+    monkeypatch.setattr(tcp_server_module, "reverse_geocode_many_cached_only", fake_cached_only)
+
+    road_name, missing = _resolve_overspeed_road_name(location)
+
+    assert road_name == "KN 247 Street"
+    assert missing == []
+
+
+def test_location_road_name_column_round_trips(db_session):
+    """Migration 039: road_name persists on the Location row (mirroring
+    geofence_name/migration 030), so a historical "Over speed" alarm reopened
+    later in GET /{device_id}/alarms can still show the road, not just the
+    live WS/push alert at fire time."""
+    device = Device(imei="1", name="Test", speed_limit_kmh=80)
+    db_session.add(device)
+    db_session.commit()
+
+    location = _location(device, is_alarm=True, alarm_type="Over speed")
+    location.road_name = "KN 247 Street"
+    db_session.add(location)
+    db_session.commit()
+    db_session.refresh(location)
+
+    assert location.road_name == "KN 247 Street"
+
+
+def test_resolve_overspeed_road_name_returns_none_and_the_coord_to_warm_on_a_cache_miss(monkeypatch):
+    """A cache miss must resolve instantly (no network call, no sleep) and
+    hand back the coord for the caller to warm asynchronously — this is
+    what lets the overspeed alarm ship immediately with a coordinate
+    fallback instead of waiting on Nominatim."""
+    device = Device(imei="1", name="Test", speed_limit_kmh=80)
+    location = _location(device)
+
+    def fake_cached_only(coords, results):
+        return list(coords)
+
+    monkeypatch.setattr(tcp_server_module, "reverse_geocode_many_cached_only", fake_cached_only)
+
+    road_name, missing = _resolve_overspeed_road_name(location)
+
+    assert road_name is None
+    assert missing == [(location.latitude, location.longitude)]
 
 
 # ---------------------------------------------------------------------------
