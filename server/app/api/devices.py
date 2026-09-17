@@ -234,6 +234,7 @@ class DeviceOwnerInfo(BaseModel):
     user_id: int
     name: str
     email: str
+    phone_number: Optional[str] = None
 
 
 
@@ -242,6 +243,7 @@ class DeviceOwnerInfo(BaseModel):
 class PaymentInfo(BaseModel):
     """A single verified payment (IntouchPay) belonging to the device owner."""
 
+    id: int
     tx_ref: str
     # The plan's slug, not Payment.plan_id's own (integer, post-migration-042)
     # value — this field's wire contract predates the FK and every existing
@@ -584,11 +586,13 @@ async def get_device_billing(
             user_id=owner.id,
             name=f"{owner.first_name} {owner.last_name}".strip() or owner.email,
             email=owner.email,
+            phone_number=owner.phone_number,
         ) if owner else None,
         plan=plan,
         subscription=subscription_info,
         payments=[
             PaymentInfo(
+                id=p.id,
                 tx_ref=p.tx_ref,
                 # PaymentInfo.plan_id is the plan's slug (wire-format
                 # contract predates the FK — see PaymentInfo's class doc),
