@@ -11,6 +11,7 @@ from sqlalchemy.orm import joinedload
 from app.core.config import settings
 from app.core.database import SessionLocal
 from app.models.subscription import Subscription, Payment, SubscriptionPlan
+from app.models.disbursement import Disbursement
 from app.models.user import User
 from app.services.intouchpay import get_transaction_status, classify_status, IntouchPayError
 from app.services.push_notifications import send_push_notification
@@ -263,7 +264,83 @@ def reconcile_pending_intouchpay_payments():
     asyncio.run(_reconcile_pending_intouchpay_payments_async())
 
 
+async def _reconcile_pending_disbursements_async():
+    """Mirror of _reconcile_pending_intouchpay_payments_async for
+    Disbursement (B2C deposit) rows — see app/api/disbursements.py. Money
+    already left the business on these, so a stuck-pending row here matters
+    more than a stuck Payment: it's the difference between knowing a payout
+    actually landed versus not. No "hard fail" notification email exists for
+    disbursements yet (there's no recipient-facing email for this at all,
+    unlike Payment's failure email) — add one if that's ever needed; for now
+    this only updates status for admin visibility via GET /api/admin/disbursements.
+    """
+    db = SessionLocal()
+    try:
+        reconcile_cutoff = datetime.utcnow() - timedelta(minutes=PENDING_RECONCILE_AFTER_MINUTES)
+        hard_fail_cutoff = datetime.utcnow() - timedelta(minutes=PENDING_HARD_FAIL_AFTER_MINUTES)
+
+        stuck = db.query(Disbursement).filter(
+            Disbursement.status == "pending",
+            Disbursement.created_at < reconcile_cutoff,
+        ).all()
+
+        if not stuck:
+            logger.info("No stuck-pending IntouchPay disbursements found.")
+            return
+
+        for disbursement in stuck:
+            try:
+                status_resp = await get_transaction_status(
+                    disbursement.tx_ref, disbursement.provider_transaction_id
+                )
+                classification = classify_status(status_resp)
+            except IntouchPayError as exc:
+                logger.error(f"Reconciliation call failed for disbursement tx_ref={disbursement.tx_ref}: {exc}")
+                classification = "unknown"
+
+            if classification == "successful":
+                disbursement.status = "successful"
+                disbursement.verified_at = datetime.utcnow()
+                logger.info(f"Reconciled stuck-pending disbursement tx_ref={disbursement.tx_ref} -> successful")
+            elif classification == "unknown" and disbursement.created_at < hard_fail_cutoff:
+                # Same "unknown is not failure" caution as payments — but
+                # unlike a payment, a stuck disbursement staying "pending"
+                # forever after this cutoff needs a human to actually check
+                # IntouchPay/the recipient rather than silently retrying;
+                # marking it "failed" here is a bookkeeping label prompting
+                # that manual check, not a claim the funds definitely never moved.
+                disbursement.status = "failed"
+                logger.warning(
+                    f"Giving up on stuck-pending disbursement tx_ref={disbursement.tx_ref} after hard timeout "
+                    "-> failed (manual verification recommended before assuming funds never moved)"
+                )
+            else:
+                logger.info(
+                    f"Disbursement tx_ref={disbursement.tx_ref} still unresolved "
+                    f"(classification={classification}); will retry next run"
+                )
+
+        db.commit()
+        logger.info(f"Disbursement reconciliation pass complete for {len(stuck)} stuck-pending row(s).")
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error while reconciling pending IntouchPay disbursements: {e}")
+    finally:
+        db.close()
+
+
+def reconcile_pending_disbursements():
+    """Check Disbursement rows stuck in status="pending" — same rationale as
+    reconcile_pending_intouchpay_payments, for outbound B2C deposits instead
+    of inbound C2B collections."""
+    if not settings.INTOUCH_USERNAME:
+        logger.info("IntouchPay not configured (INTOUCH_USERNAME unset) — skipping disbursement reconciliation.")
+        return
+    asyncio.run(_reconcile_pending_disbursements_async())
+
+
 if __name__ == "__main__":
     check_expired_subscriptions()
     notify_expiring_subscriptions()
     reconcile_pending_intouchpay_payments()
+    reconcile_pending_disbursements()

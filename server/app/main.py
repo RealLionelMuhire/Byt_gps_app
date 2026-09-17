@@ -18,6 +18,7 @@ from app.api import devices, locations, auth, commands, trips, webhooks, geofenc
 from app.api import ws as ws_module
 from app.api import onboarding
 from app.api import subscriptions
+from app.api import disbursements
 from app import dashboard
 
 # Configure logging
@@ -177,6 +178,7 @@ app.include_router(trips.router,      prefix="/api/trips",   tags=["trips"])
 app.include_router(geofences.router,  prefix="/api/geofences", tags=["geofences"])
 app.include_router(webhooks.router,   prefix="/api/webhooks", tags=["webhooks"])
 app.include_router(subscriptions.router, prefix="/api/subscription-plans", tags=["subscriptions"])
+app.include_router(disbursements.router, prefix="/api/admin/disbursements", tags=["disbursements"])
 app.include_router(contact_requests.router, prefix="/api/contact-requests", tags=["contact-requests"])
 app.include_router(ws_module.router,  tags=["websocket"])
 app.include_router(dashboard.router,  tags=["dashboard"])

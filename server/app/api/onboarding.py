@@ -44,7 +44,11 @@ from app.models.subscription import Subscription, Payment
 from app.api.devices import _check_pair_rate_limit, _release_device_to_inventory
 from app.api.auth import claim_pending_client_user
 from app.api.subscriptions import plan_config, plan_purchasable, get_plan_by_slug
-from app.services.intouchpay import request_payment as intouch_request_payment, IntouchPayError
+from app.services.intouchpay import (
+    request_payment as intouch_request_payment,
+    get_balance as intouch_get_balance,
+    IntouchPayError,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -946,6 +950,47 @@ async def get_admin_billing_summary(
         )
         for r in rows
     ]
+
+
+# ── Endpoint 10b: GET /api/billing/admin/intouchpay-balance ───────────────────
+# Distinct from AdminPaymentSummary above: that's what clients owe/have paid
+# *us*; this is the money actually sitting in *our* IntouchPay merchant
+# wallet — the number that matters before any future disbursement feature
+# (there is none yet — see app/services/intouchpay.py's get_balance, added
+# without a matching requestdeposit/disbursement flow) is ever built.
+
+class IntouchBalanceResponse(BaseModel):
+    balance: Optional[float] = None
+    currency: Optional[str] = None
+    # Raw IntouchPay status fields, surfaced as-is rather than re-interpreted
+    # — an auth failure (e.g. responsecode 0005) comes back as an ordinary
+    # dict with no "balance" key, not a raised exception (see get_balance's
+    # docstring), so the caller needs these to tell "checked, zero" apart
+    # from "the check itself failed".
+    status: Optional[str] = None
+    responsecode: Optional[str] = None
+    message: Optional[str] = None
+
+
+@router.get("/billing/admin/intouchpay-balance", response_model=IntouchBalanceResponse)
+async def get_admin_intouchpay_balance(
+    _: User = Depends(require_admin),
+):
+    """The current IntouchPay merchant account balance — admin only."""
+    try:
+        data = await intouch_get_balance()
+    except IntouchPayError as exc:
+        logger.error("IntouchPay getbalance error: %s", exc)
+        raise HTTPException(status_code=502, detail="Could not reach IntouchPay. Retry later.")
+
+    balance = data.get("balance")
+    return IntouchBalanceResponse(
+        balance=float(balance) if balance is not None else None,
+        currency=data.get("currency"),
+        status=data.get("status"),
+        responsecode=data.get("responsecode"),
+        message=data.get("message"),
+    )
 
 
 # ── Endpoint 11: Admin per-user subscription management ──────────────────────

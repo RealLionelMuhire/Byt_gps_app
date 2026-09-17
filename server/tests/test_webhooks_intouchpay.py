@@ -15,6 +15,7 @@ from app.core.database import get_db
 from app.api import webhooks
 from app.models.user import User
 from app.models.subscription import Payment, SubscriptionPlan
+from app.models.disbursement import Disbursement
 
 
 @pytest.fixture()
@@ -113,3 +114,92 @@ def test_webhook_no_email_when_still_pending(webhook_client, emails_sent, user_a
 
     assert resp.status_code == 200
     assert emails_sent == []
+
+
+# ── disbursement (B2C deposit) callback ─────────────────────────────────────
+
+@pytest.fixture()
+def pending_disbursement(db_session):
+    disbursement = Disbursement(
+        clerk_user_id="clerk_1", phone="250781234567", tx_ref="IDdeposit123",
+        amount=1000, currency="RWF", reason="Refund", status="pending",
+        initiated_by_clerk_user_id="clerk_admin",
+    )
+    db_session.add(disbursement)
+    db_session.commit()
+    return disbursement
+
+
+def test_webhook_marks_disbursement_successful(webhook_client, pending_disbursement, db_session, monkeypatch):
+    async def fake_get_transaction_status(tx_ref, provider_tx_id=None):
+        return {"status": "successful", "responsecode": "2001"}
+
+    monkeypatch.setattr(webhooks, "get_transaction_status", fake_get_transaction_status)
+    monkeypatch.setattr(webhooks, "classify_status", lambda resp: "successful")
+
+    resp = webhook_client.post(
+        "/api/webhooks/intouchpay",
+        json={"requesttransactionid": "IDdeposit123", "status": "successful", "transactionid": "PROV-99"},
+    )
+
+    assert resp.status_code == 200
+    db_session.refresh(pending_disbursement)
+    assert pending_disbursement.status == "successful"
+    assert pending_disbursement.verified_at is not None
+
+
+def test_webhook_marks_disbursement_failed_on_confirmed_failure(webhook_client, pending_disbursement, db_session, monkeypatch):
+    async def fake_get_transaction_status(tx_ref, provider_tx_id=None):
+        return {"status": "failed"}
+
+    monkeypatch.setattr(webhooks, "get_transaction_status", fake_get_transaction_status)
+    monkeypatch.setattr(webhooks, "classify_status", lambda resp: "unknown")
+
+    resp = webhook_client.post(
+        "/api/webhooks/intouchpay", json={"requesttransactionid": "IDdeposit123", "status": "failed"},
+    )
+
+    assert resp.status_code == 200
+    db_session.refresh(pending_disbursement)
+    assert pending_disbursement.status == "failed"
+
+
+def test_webhook_leaves_disbursement_pending_when_unresolved(webhook_client, pending_disbursement, db_session, monkeypatch):
+    async def fake_get_transaction_status(tx_ref, provider_tx_id=None):
+        return {"status": "pending"}
+
+    monkeypatch.setattr(webhooks, "get_transaction_status", fake_get_transaction_status)
+    monkeypatch.setattr(webhooks, "classify_status", lambda resp: "unknown")
+
+    resp = webhook_client.post(
+        "/api/webhooks/intouchpay", json={"requesttransactionid": "IDdeposit123", "status": "pending"},
+    )
+
+    assert resp.status_code == 200
+    db_session.refresh(pending_disbursement)
+    assert pending_disbursement.status == "pending"
+
+
+def test_webhook_ignores_already_resolved_disbursement(webhook_client, pending_disbursement, db_session, monkeypatch):
+    pending_disbursement.status = "successful"
+    db_session.commit()
+
+    async def fake_get_transaction_status(tx_ref, provider_tx_id=None):
+        raise AssertionError("should not re-check an already-resolved disbursement")
+
+    monkeypatch.setattr(webhooks, "get_transaction_status", fake_get_transaction_status)
+
+    resp = webhook_client.post(
+        "/api/webhooks/intouchpay", json={"requesttransactionid": "IDdeposit123", "status": "successful"},
+    )
+
+    assert resp.status_code == 200
+
+
+def test_webhook_unknown_tx_ref_acked_without_error(webhook_client, monkeypatch):
+    resp = webhook_client.post(
+        "/api/webhooks/intouchpay", json={"requesttransactionid": "no-such-tx-ref", "status": "successful"},
+    )
+
+    assert resp.status_code == 200
+    assert resp.json()["success"] is True
