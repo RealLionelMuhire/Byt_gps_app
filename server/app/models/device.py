@@ -56,7 +56,14 @@ class Device(Base):
     # User ownership (NULL = owned by company, set = owned by customer)
     user_id = Column(Integer, ForeignKey('users.id'), nullable=True, index=True)
 
-    # Subscription scheme linked to this device (admin-configured plan)
+    # DEPRECATED — device-level plan assignment was retired (Phase 1 of the
+    # plan/subscription consolidation). A device's effective plan is always
+    # resolved from its owner's own Subscription — see
+    # app/services/plan_resolution.py — never from this column. Nothing
+    # writes to it anymore (PUT /api/devices/{id}/plan and
+    # POST /admin/devices/{imei}/plan both 410/redirect-refuse now); it's
+    # kept only so historical rows and the FK stay intact rather than force
+    # a data migration in the same pass. Do not read or write it elsewhere.
     plan_id = Column(Integer, ForeignKey('subscription_plans.id'), nullable=True, index=True)
 
     # TCP connection status (independent of lifecycle)
@@ -106,7 +113,7 @@ class Device(Base):
 
     # Relationships
     user = relationship("User", backref="devices")
-    plan = relationship("SubscriptionPlan", foreign_keys=[plan_id])
+    plan = relationship("SubscriptionPlan", foreign_keys=[plan_id])  # deprecated, see plan_id above
     locations = relationship("Location", back_populates="device", cascade="all, delete-orphan")
 
     def __repr__(self):

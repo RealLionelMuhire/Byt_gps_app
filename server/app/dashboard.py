@@ -24,7 +24,7 @@ from fastapi import APIRouter, Request, Form, UploadFile, File
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import or_
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from fastapi import Depends
 import os
 import csv
@@ -39,6 +39,7 @@ from app.models.location import Location
 from app.models.user import User, Role
 from app.models.subscription import Subscription, SubscriptionPlan, Payment
 from app.api.devices import _resolve_client_user, _apply_assignment, DeviceAssignRequest
+from app.services.plan_resolution import resolve_owner_plan
 from app.api.auth import invite_clerk_client_and_create_local
 
 router = APIRouter()
@@ -246,8 +247,6 @@ def _build_device_data(devices, db, all_plans=None):
     """
     if all_plans is None:
         all_plans = db.query(SubscriptionPlan).all()
-    plans = {p.id: p for p in all_plans}
-    plans_by_slug = {p.slug.lower(): p for p in all_plans}
 
     # Also return the plans list so the caller can reuse it for the template
     # dropdown without re-querying.
@@ -274,6 +273,7 @@ def _build_device_data(devices, db, all_plans=None):
     clerk_ids = [u.clerk_user_id for u in owners if u.clerk_user_id]
     subs = (
         db.query(Subscription)
+        .options(joinedload(Subscription.plan))
         .filter(Subscription.clerk_user_id.in_(clerk_ids))
         .order_by(Subscription.created_at.desc())
         .all()
@@ -307,11 +307,9 @@ def _build_device_data(devices, db, all_plans=None):
 
         owner = owner_by_id.get(device.user_id)
 
-        plan = plans.get(device.plan_id)
-
-        # Payment scheme / subscription mode for this device:
-        # status = active | expired | none, plus the subscription plan slug,
-        # name and expiry so the inventory shows the client's real payment state.
+        # A device's plan is always its owner's own Subscription — see
+        # app/services/plan_resolution.py. There is no more independent
+        # per-device linked plan to disagree with it.
         sub = latest_sub_by_clerk.get(owner.clerk_user_id) if owner else None
         if sub is not None and sub.status == "active" and sub.expires_at and sub.expires_at > now:
             subscription_status = "active"
@@ -319,7 +317,7 @@ def _build_device_data(devices, db, all_plans=None):
             subscription_status = "expired"
         else:
             subscription_status = "none"
-        sub_plan = plans_by_slug.get((sub.plan_id or "").lower()) if sub else None
+        plan = sub.plan if sub else None
 
         result.append({
             "id": device.id,
@@ -344,7 +342,7 @@ def _build_device_data(devices, db, all_plans=None):
             "satellites": latest_loc.satellites if latest_loc else 0,
             "owner_email": owner.email if owner else None,
             "owner_name": f"{owner.first_name} {owner.last_name}".strip() if owner else None,
-            "plan_id": device.plan_id,
+            "plan_id": plan.id if plan else None,
             "plan": {
                 "name": plan.name,
                 "slug": plan.slug,
@@ -356,7 +354,6 @@ def _build_device_data(devices, db, all_plans=None):
                 "is_active": plan.is_active,
             } if plan else None,
             "subscription_status": subscription_status,
-            "subscription_plan_name": sub_plan.name if sub_plan else None,
             "subscription_expires_at": (
                 sub.expires_at.strftime("%Y-%m-%d") if sub and sub.expires_at else None
             ),
@@ -502,7 +499,12 @@ async def admin_clients(request: Request, db: Session = Depends(get_db)):
     for dev in devices:
         by_owner[dev.user_id].append(dev)
 
-    subs = db.query(Subscription).filter(Subscription.status == "active").all()
+    subs = (
+        db.query(Subscription)
+        .options(joinedload(Subscription.plan))
+        .filter(Subscription.status == "active")
+        .all()
+    )
     sub_by_clerk = {s.clerk_user_id: s for s in subs}
 
     client_rows = []
@@ -526,7 +528,7 @@ async def admin_clients(request: Request, db: Session = Depends(get_db)):
                 }
                 for d in devs
             ],
-            "plan": sub.plan_id if sub else None,
+            "plan": sub.plan.slug if sub and sub.plan else None,
             "expires_at": sub.expires_at if sub else None,
         })
 
@@ -553,11 +555,13 @@ async def admin_device_billing(request: Request, imei: str, db: Session = Depend
     """
     Per-device payment scheme / subscription mode panel.
 
-    Shows the linked plan (one-time vs recurrent, price, currency, length),
-    the owner's subscription state (active / expired / none with expiry), and
-    the payment history that matches this device's plan. Read-only — payments
-    are created via the IntouchPay payment flow in the mobile app, so
-    the admin only views the scheme, never records payments manually.
+    Shows the owner's actual plan (one-time vs recurrent, price, currency,
+    length), subscription state (active / expired / none with expiry), and
+    matching payment history. Read-only — payments are created via the
+    IntouchPay payment flow in the mobile app, so the admin only views the
+    scheme, never records payments manually. Every device belonging to the
+    same owner shows this same, single plan — see
+    app/services/plan_resolution.py.
     """
     if not _check_admin(request, db):
         return RedirectResponse(url="/admin/login", status_code=302)
@@ -570,36 +574,22 @@ async def admin_device_billing(request: Request, imei: str, db: Session = Depend
         db.query(User).filter(User.id == device.user_id).first()
         if device.user_id else None
     )
-    plan = (
-        db.query(SubscriptionPlan).filter(SubscriptionPlan.id == device.plan_id).first()
-        if device.plan_id else None
-    )
-
-    # Latest subscription for the owner (any status) → current mode
-    sub = None
-    if owner:
-        sub = (
-            db.query(Subscription)
-            .filter(Subscription.clerk_user_id == owner.clerk_user_id)
-            .order_by(Subscription.created_at.desc())
-            .first()
-        )
-
+    resolved = resolve_owner_plan(db, owner)
+    plan = resolved.plan
+    sub = resolved.subscription
     now = datetime.utcnow()
-    if sub is not None and sub.status == "active" and sub.expires_at and sub.expires_at > now:
-        subscription_status = "active"
-    elif sub is not None:
-        subscription_status = "expired"
-    else:
-        subscription_status = "none"
 
-    # Payment history narrowed to this device's linked plan slug (all the
-    # owner's payments when no plan is linked).
+    # Payment history narrowed to the owner's current plan slug (all the
+    # owner's payments when they have no subscription at all).
     payments = []
     if owner:
-        q = db.query(Payment).filter(Payment.clerk_user_id == owner.clerk_user_id)
+        q = (
+            db.query(Payment)
+            .options(joinedload(Payment.plan))
+            .filter(Payment.clerk_user_id == owner.clerk_user_id)
+        )
         if plan:
-            q = q.filter(Payment.plan_id == plan.slug)
+            q = q.filter(Payment.plan_id == plan.id)
         payments = q.order_by(Payment.verified_at.desc()).limit(50).all()
 
     return templates.TemplateResponse("admin_device_billing.html", {
@@ -607,8 +597,8 @@ async def admin_device_billing(request: Request, imei: str, db: Session = Depend
         "device": device,
         "owner": owner,
         "plan": plan,
-        "subscription_status": subscription_status,
-        "subscription_plan_slug": sub.plan_id if sub else None,
+        "subscription_status": resolved.status,
+        "subscription_plan_slug": sub.plan.slug if sub and sub.plan else None,
         "subscription_started_at": sub.started_at if sub else None,
         "subscription_expires_at": sub.expires_at if sub else None,
         "payments": payments,
@@ -622,18 +612,29 @@ async def admin_device_billing(request: Request, imei: str, db: Session = Depend
 async def admin_plans(request: Request, db: Session = Depends(get_db)):
     """
     Subscription schemes page: create/edit/deactivate plans and see how many
-    devices are linked to each one. The mobile pricing screen and billing
-    flow read these plans (see app/api/subscriptions.py).
+    users actively subscribe to each one. The mobile pricing screen and
+    billing flow read these plans (see app/api/subscriptions.py).
     """
     if not _check_admin(request, db):
         return RedirectResponse(url="/admin/login", status_code=302)
 
     plans = db.query(SubscriptionPlan).order_by(SubscriptionPlan.price.asc()).all()
 
-    # How many devices are linked to each plan (one query, grouped in memory)
-    device_counts = defaultdict(int)
-    for dev in db.query(Device).filter(Device.plan_id.isnot(None)).all():
-        device_counts[dev.plan_id] += 1
+    # How many users currently have an active Subscription on each plan (one
+    # query, grouped in memory by plan id — Subscription.plan_id is a real FK
+    # as of migrations 041/042, so this is a direct match against
+    # SubscriptionPlan.id, no slug/case-folding needed). Device-level plan
+    # links were retired (see app/services/plan_resolution.py) — a plan's
+    # real "how many are on this" count is subscribers, not devices.
+    now = datetime.utcnow()
+    subscriber_counts = defaultdict(int)
+    active_subs = (
+        db.query(Subscription)
+        .filter(Subscription.status == "active", Subscription.expires_at > now)
+        .all()
+    )
+    for s in active_subs:
+        subscriber_counts[s.plan_id] += 1
 
     plan_rows = []
     for p in plans:
@@ -649,7 +650,7 @@ async def admin_plans(request: Request, db: Session = Depends(get_db)):
             "max_devices": p.max_devices,
             "description": p.description or "",
             "is_active": p.is_active,
-            "linked_devices": device_counts.get(p.id, 0),
+            "active_subscribers": subscriber_counts.get(p.id, 0),
         })
 
     return templates.TemplateResponse("admin_plans.html", {
@@ -657,7 +658,7 @@ async def admin_plans(request: Request, db: Session = Depends(get_db)):
         "plans": plan_rows,
         "total_plans": len(plan_rows),
         "active_plans": sum(1 for r in plan_rows if r["is_active"]),
-        "linked_devices": sum(r["linked_devices"] for r in plan_rows),
+        "active_subscribers": sum(r["active_subscribers"] for r in plan_rows),
         "error": request.query_params.get("error", ""),
         "success": request.query_params.get("success", ""),
     })
@@ -752,30 +753,21 @@ async def admin_set_device_plan(
     plan_id: str = Form(""),
     db: Session = Depends(get_db),
 ):
-    """Link (or unlink) a subscription scheme to a device from the inventory page."""
+    """
+    DEPRECATED — device-level plan assignment has been removed (Phase 1 of
+    the plan/subscription consolidation: see app/services/plan_resolution.py).
+    A device's plan is always its owner's own Subscription now; there is no
+    per-device link left to set. The route (and its form on admin_devices.html)
+    is gone — this handler only remains to redirect any stale bookmark/form
+    submission to a clear explanation instead of a bare 404.
+    """
     if not _check_admin(request, db):
         return RedirectResponse(url="/admin/login", status_code=302)
-
-    device = db.query(Device).filter(Device.imei == imei).first()
-    if not device:
-        return RedirectResponse(url="/admin/devices", status_code=302)
-
-    if plan_id.strip():
-        try:
-            pid = int(plan_id)
-        except ValueError:
-            return RedirectResponse(url="/admin/devices?error=Invalid plan", status_code=302)
-        plan = db.query(SubscriptionPlan).filter(SubscriptionPlan.id == pid).first()
-        if not plan:
-            return RedirectResponse(url="/admin/devices?error=Plan not found", status_code=302)
-        device.plan_id = pid
-    else:
-        device.plan_id = None  # unlink
-
-    device.updated_at = datetime.utcnow()
-    db.commit()
     return RedirectResponse(
-        url="/admin/devices?success=" + quote("Plan updated for device"),
+        url="/admin/devices?error=" + quote(
+            "Device-level plan assignment has been removed. Manage the "
+            "owner's subscription from the Clients page instead."
+        ),
         status_code=302,
     )
 

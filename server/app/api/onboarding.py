@@ -24,7 +24,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Request
 from pydantic import BaseModel
 from sqlalchemy import func
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.exc import SQLAlchemyError
 
 from app.core.database import get_db
@@ -43,7 +43,7 @@ from app.models.vehicle import Vehicle
 from app.models.subscription import Subscription, Payment
 from app.api.devices import _check_pair_rate_limit, _release_device_to_inventory
 from app.api.auth import claim_pending_client_user
-from app.api.subscriptions import plan_config, plan_purchasable
+from app.api.subscriptions import plan_config, plan_purchasable, get_plan_by_slug
 from app.services.intouchpay import request_payment as intouch_request_payment, IntouchPayError
 
 logger = logging.getLogger(__name__)
@@ -52,6 +52,65 @@ router = APIRouter()
 # Pricing/limits now come from the admin-configured subscription_plans table
 # (see app/api/subscriptions.py plan_config — DB plan wins, legacy values are
 # the fallback), so admin edits to a plan immediately affect billing here.
+
+
+def _get_active_subscription(db: Session, clerk_user_id: str) -> Optional[Subscription]:
+    """The subscription that is genuinely active right now: status=="active"
+    AND not yet past expires_at.
+
+    Checked inline rather than trusting the cached `status` column alone,
+    because scripts/cron_expiry.py only flips a lapsed subscription's status
+    to "expired" every 15 minutes. Without the expires_at check here, a
+    request landing in that window would see a stale "active" row and either
+    grant a vehicle slot it shouldn't, or let a renewal/upgrade silently
+    no-op against an already-lapsed subscription instead of recording the
+    new one. The cron still owns the async side (expiry-warning and
+    expired-notification emails/pushes) — this only closes the request-time
+    gap for the enforcement points that gate/short-circuit on "is there a
+    subscription actively covering this account right now."
+    """
+    return (
+        db.query(Subscription)
+        .filter(
+            Subscription.clerk_user_id == clerk_user_id,
+            Subscription.status == "active",
+            Subscription.expires_at > datetime.utcnow(),
+        )
+        .first()
+    )
+
+
+def _cancel_active_subscription(db: Session, clerk_user_id: str) -> Optional[Subscription]:
+    """Shared cancellation logic — the one code path behind both the
+    self-service (POST /api/subscriptions/cancel) and admin
+    (POST /api/admin/subscriptions/{user_id}/cancel) cancel endpoints, so
+    "what cancelling actually does" is defined in exactly one place. Mutates
+    and returns the subscription (caller commits); returns None if there is
+    nothing genuinely active to cancel.
+
+    Immediate, not "at period end": this product has no auto-renewal at all
+    (subscriptions lapse on their own at expires_at; renewing is always an
+    explicit re-purchase, see create_subscription/upgrade_subscription), so
+    "cancel to stop being charged again" doesn't apply the way it would for
+    a recurring-billing SaaS. The only two readings left are "stop access
+    now" (this) or "let access continue until expires_at but flag as
+    cancelled" (deferred) — and the deferred version isn't free: it would
+    need a distinct status enforcement still honors until expires_at (e.g.
+    "cancelling"), because right now the ONLY thing that decides plan
+    entitlement is `_get_active_subscription`'s status=="active" check —
+    flipping status to "cancelled" immediately drops the account to trial
+    limits right away regardless of intent. Implementing that properly is a
+    real product/billing decision (does a mid-period prepaid cancellation
+    imply a refund? does postpaid still get invoiced for time used?) that's
+    out of scope for this pass — flagging it rather than silently picking a
+    semantics that assumes an answer.
+    """
+    sub = _get_active_subscription(db, clerk_user_id)
+    if not sub:
+        return None
+    sub.status = "cancelled"
+    sub.updated_at = datetime.utcnow()
+    return sub
 
 
 # ── Schemas ───────────────────────────────────────────────────────────────────
@@ -119,6 +178,11 @@ class SubscriptionResponse(BaseModel):
 class SubscriptionUpgradeRequest(BaseModel):
     planId: str
     txRef: str
+
+
+class SubscriptionCancelResponse(BaseModel):
+    status: str  # always "cancelled" on success
+    expiresAt: Optional[UtcDateTime] = None
 
 
 class PaymentRecord(BaseModel):
@@ -349,13 +413,14 @@ async def create_vehicle(
     # Enforce plan limits (admin-configured via subscription_plans) —
     # always against the device owner's plan/vehicle count, not the
     # caller's, so an admin acting on a client's behalf doesn't get
-    # measured against their own (nonexistent) subscription.
-    sub = db.query(Subscription).filter(
-        Subscription.clerk_user_id == owner_clerk_id,
-        Subscription.status == "active"
-    ).first()
+    # measured against their own (nonexistent) subscription. Checked
+    # expiry-freshness inline (_get_active_subscription), not just the
+    # cached status column — see its docstring for why.
+    sub = _get_active_subscription(db, owner_clerk_id)
 
-    current_plan = sub.plan_id if sub else "trial"
+    # sub.plan_id is a real FK (migrations 041/042) — plan_config/the error
+    # message below both want the plan's slug, not its raw integer id.
+    current_plan = sub.plan.slug if sub and sub.plan else "trial"
     vehicle_limit = plan_config(db, current_plan)["max_devices"]
 
     if vehicle_limit is not None:
@@ -450,6 +515,17 @@ async def initiate_payment(
             detail="Invalid or unavailable planId — choose an active plan from the pricing screen.",
         )
 
+    # Payment.plan_id is a real FK (migrations 041/042) — a subscription_plans
+    # row must exist to write this Payment, not just a FALLBACK_PLANS entry.
+    # plan_purchasable's fallback-slug-with-no-DB-row branch is unreachable in
+    # practice once migration 041 has seeded the three legacy slugs; this is
+    # a defensive 500 (not a 400) precisely because it should never happen —
+    # a missing row here means those migrations haven't been run.
+    plan = get_plan_by_slug(db, body.planId, include_inactive=True)
+    if plan is None:
+        logger.error("No subscription_plans row for purchasable planId=%s — has migration 041 run?", body.planId)
+        raise HTTPException(status_code=500, detail="This plan isn't fully set up yet. Please try again later.")
+
     phone = body.phone.strip()
     if not phone:
         raise HTTPException(status_code=400, detail="phone is required")
@@ -490,7 +566,7 @@ async def initiate_payment(
         payment = Payment(
             clerk_user_id=clerk_user_id,
             tx_ref=tx_ref,
-            plan_id=body.planId,
+            plan_id=plan.id,
             amount=amount,
             currency=cfg["currency"],
             status=status,
@@ -543,11 +619,22 @@ async def create_subscription(
             detail="Invalid or unavailable planId — choose an active plan from the pricing screen.",
         )
 
-    # Check if an active subscription already exists
-    existing_sub = db.query(Subscription).filter(
-        Subscription.clerk_user_id == clerk_user_id,
-        Subscription.status == "active",
-    ).first()
+    # Subscription.plan_id is a real FK (migrations 041/042) — see
+    # initiate_payment's identical check/comment for why this 500 should
+    # never actually fire in practice.
+    plan = get_plan_by_slug(db, body.planId, include_inactive=True)
+    if plan is None:
+        logger.error("No subscription_plans row for purchasable planId=%s — has migration 041 run?", body.planId)
+        raise HTTPException(status_code=500, detail="This plan isn't fully set up yet. Please try again later.")
+
+    # Check if a genuinely active subscription already exists (expiry-aware,
+    # not just the cached status column — see _get_active_subscription's
+    # docstring). Without the expiry check, a customer renewing right after
+    # their subscription lapsed — but before the next cron_expiry.py tick
+    # flips status to "expired" — would hit this branch and get silently
+    # short-circuited back to their already-expired subscription instead of
+    # the new one they just paid for.
+    existing_sub = _get_active_subscription(db, clerk_user_id)
 
     if existing_sub:
         # Subscription already exists — do NOT reject.
@@ -591,7 +678,7 @@ async def create_subscription(
     if body.planId != "trial" and not is_postpaid:
         payment = db.query(Payment).filter(
             Payment.clerk_user_id == clerk_user_id,
-            Payment.plan_id == body.planId,
+            Payment.plan_id == plan.id,
             Payment.status == "successful",
         ).first()
         if not payment:
@@ -605,7 +692,7 @@ async def create_subscription(
     try:
         subscription = Subscription(
             clerk_user_id=clerk_user_id,
-            plan_id=body.planId,
+            plan_id=plan.id,
             status="active",
             price=charge,
             started_at=datetime.utcnow(),
@@ -655,6 +742,14 @@ async def upgrade_subscription(
             detail="Invalid or unavailable planId — choose an active plan from the pricing screen.",
         )
 
+    # Subscription.plan_id is a real FK (migrations 041/042) — see
+    # initiate_payment's identical check/comment for why this 500 should
+    # never actually fire in practice.
+    plan = get_plan_by_slug(db, body.planId, include_inactive=True)
+    if plan is None:
+        logger.error("No subscription_plans row for purchasable planId=%s — has migration 041 run?", body.planId)
+        raise HTTPException(status_code=500, detail="This plan isn't fully set up yet. Please try again later.")
+
     cfg = plan_config(db, body.planId)
     is_postpaid = cfg.get("billing_model") == "postpaid"
 
@@ -676,12 +771,18 @@ async def upgrade_subscription(
     # the same plan. Comparing live prices is fragile because admin edits
     # to a plan would instantly change the comparison result for existing
     # subscribers, unexpectedly blocking or allowing upgrades.)
-    current_sub = db.query(Subscription).filter(
-        Subscription.clerk_user_id == clerk_user_id,
-        Subscription.status == "active"
-    ).first()
+    #
+    # Expiry-aware (_get_active_subscription), not just the cached status
+    # column: otherwise a customer renewing the SAME plan right after it
+    # lapsed — but before cron_expiry.py's next tick — would be wrongly
+    # blocked with "Already on this plan" instead of being allowed to
+    # re-subscribe. A stale "active" row that's actually past expires_at
+    # just won't match here; it's left for the cron to flip to "expired"
+    # (harmless — nothing treats it as authoritative once its own
+    # expires_at has passed, see resolve_owner_plan/_get_active_subscription).
+    current_sub = _get_active_subscription(db, clerk_user_id)
 
-    if current_sub and current_sub.plan_id == body.planId:
+    if current_sub and current_sub.plan_id == plan.id:
         raise HTTPException(status_code=400, detail="Already on this plan. Choose a different plan to upgrade.")
 
     # 3. Cancel current, create new
@@ -695,7 +796,7 @@ async def upgrade_subscription(
 
         new_sub = Subscription(
             clerk_user_id=clerk_user_id,
-            plan_id=body.planId,
+            plan_id=plan.id,
             status="active",
             price=charge,
             started_at=datetime.utcnow(),
@@ -727,7 +828,37 @@ async def upgrade_subscription(
         raise HTTPException(status_code=500, detail="Database error")
 
 
-# ── Endpoint 8: GET /api/billing ──────────────────────────────────────────────
+# ── Endpoint 8: POST /api/subscriptions/cancel ────────────────────────────────
+
+@router.post("/subscriptions/cancel", response_model=SubscriptionCancelResponse)
+async def cancel_subscription(
+    clerk_user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    """
+    Self-service cancellation of the caller's own subscription. Immediate —
+    see _cancel_active_subscription's docstring for why "at period end" was
+    not implemented in this pass, and what would be needed to add it later.
+    404s if there is nothing genuinely active to cancel (already
+    expired/cancelled, or never subscribed).
+    """
+    sub = _cancel_active_subscription(db, clerk_user_id)
+    if not sub:
+        raise HTTPException(status_code=404, detail="No active subscription to cancel")
+
+    try:
+        db.commit()
+        db.refresh(sub)
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error("DB error cancelling subscription: %s", exc)
+        raise HTTPException(status_code=500, detail="Database error")
+
+    logger.info("Subscription %s cancelled by user %s", sub.id, clerk_user_id)
+    return SubscriptionCancelResponse(status="cancelled", expiresAt=sub.expires_at)
+
+
+# ── Endpoint 9: GET /api/billing ──────────────────────────────────────────────
 
 @router.get("/billing", response_model=BillingResponse)
 async def get_billing_history(
@@ -737,33 +868,47 @@ async def get_billing_history(
     """
     Get current active plan and payment history for the user.
     """
-    sub = db.query(Subscription).filter(
-        Subscription.clerk_user_id == clerk_user_id,
-        Subscription.status == "active"
-    ).first()
+    sub = (
+        db.query(Subscription)
+        .options(joinedload(Subscription.plan))
+        .filter(
+            Subscription.clerk_user_id == clerk_user_id,
+            Subscription.status == "active"
+        )
+        .first()
+    )
 
-    payments = db.query(Payment).filter(
-        Payment.clerk_user_id == clerk_user_id
-    ).order_by(Payment.verified_at.desc()).limit(20).all()
+    payments = (
+        db.query(Payment)
+        .options(joinedload(Payment.plan))
+        .filter(Payment.clerk_user_id == clerk_user_id)
+        .order_by(Payment.verified_at.desc())
+        .limit(20)
+        .all()
+    )
 
+    # currentPlan/planId are the plan's *slug* — the mobile app's wire
+    # contract predates Subscription.plan_id/Payment.plan_id becoming real
+    # FKs (migrations 041/042), so this always resolves through the
+    # relationship now rather than reading the (now-integer) column directly.
     payment_records = []
     for p in payments:
         payment_records.append(PaymentRecord(
             txRef=p.tx_ref,
-            planId=p.plan_id,
+            planId=p.plan.slug if p.plan else "",
             amount=p.amount,
             status=p.status,
             createdAt=p.verified_at
         ))
 
     return BillingResponse(
-        currentPlan=sub.plan_id if sub else "trial",
+        currentPlan=sub.plan.slug if sub and sub.plan else "trial",
         expiresAt=sub.expires_at if sub else None,
         payments=payment_records
     )
 
 
-# ── Endpoint 9: GET /api/billing/admin/summary ───────────────────────────────
+# ── Endpoint 10: GET /api/billing/admin/summary ──────────────────────────────
 
 class AdminPaymentSummary(BaseModel):
     clerk_user_id: str
@@ -801,6 +946,234 @@ async def get_admin_billing_summary(
         )
         for r in rows
     ]
+
+
+# ── Endpoint 11: Admin per-user subscription management ──────────────────────
+# Phase 2 of the plan/subscription consolidation (see
+# app/services/plan_resolution.py for Phase 1): lets an admin view, assign,
+# extend, or cancel a user's actual Subscription — the one row
+# create_vehicle's vehicle-limit check reads — instead of the retired
+# device-level plan link. car-management-portal's per-user subscription
+# screen calls these.
+
+class AdminSubscriptionResponse(BaseModel):
+    subscription_id: Optional[int] = None
+    user_id: int
+    clerk_user_id: str
+    plan_id: Optional[str] = None    # slug
+    plan_name: Optional[str] = None
+    status: str                       # active | expired | cancelled | none
+    price: Optional[float] = None
+    started_at: Optional[UtcDateTime] = None
+    expires_at: Optional[UtcDateTime] = None
+
+
+class AdminAssignPlanRequest(BaseModel):
+    plan_id: str                              # slug — required
+    expires_at: Optional[UtcDateTime] = None  # override the computed expiry
+    price: Optional[float] = None             # override the computed/snapshot price (e.g. 0 for a comp)
+
+
+class AdminExtendExpiryRequest(BaseModel):
+    expires_at: UtcDateTime
+
+
+def _get_user_or_404(db: Session, user_id: int) -> User:
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="User not found")
+    return user
+
+
+def _admin_subscription_response(
+    user: User, sub: Optional[Subscription], db: Session
+) -> AdminSubscriptionResponse:
+    # AdminSubscriptionResponse.plan_id is the plan's *slug* (see its field
+    # comment) — resolved via the relationship now that Subscription.plan_id
+    # itself is a real integer FK (migrations 041/042).
+    plan = sub.plan if sub else None
+
+    if sub is None:
+        status = "none"
+    elif sub.status == "cancelled":
+        status = "cancelled"
+    elif sub.status == "active" and sub.expires_at and sub.expires_at > datetime.utcnow():
+        status = "active"
+    else:
+        status = "expired"
+
+    return AdminSubscriptionResponse(
+        subscription_id=sub.id if sub else None,
+        user_id=user.id,
+        clerk_user_id=user.clerk_user_id,
+        plan_id=plan.slug if plan else None,
+        plan_name=plan.name if plan else None,
+        status=status,
+        price=sub.price if sub else None,
+        started_at=sub.started_at if sub else None,
+        expires_at=sub.expires_at if sub else None,
+    )
+
+
+@router.get("/admin/subscriptions/{user_id}", response_model=AdminSubscriptionResponse)
+async def get_admin_user_subscription(
+    user_id: int,
+    db: Session = Depends(get_db),
+    _: User = Depends(require_admin),
+):
+    """The user's actual, currently-enforced subscription (most recent row,
+    any status) — the same one create_vehicle's vehicle-limit check reads."""
+    user = _get_user_or_404(db, user_id)
+    sub = (
+        db.query(Subscription)
+        .options(joinedload(Subscription.plan))
+        .filter(Subscription.clerk_user_id == user.clerk_user_id)
+        .order_by(Subscription.created_at.desc())
+        .first()
+    )
+    return _admin_subscription_response(user, sub, db)
+
+
+@router.put("/admin/subscriptions/{user_id}", response_model=AdminSubscriptionResponse)
+async def admin_assign_subscription(
+    user_id: int,
+    body: AdminAssignPlanRequest,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """
+    Directly assign a plan to a user, bypassing payment — an admin override
+    (comp, manual correction, migrating a legacy client onto the new plan
+    model, etc.). Cancels any existing active subscription and creates a new
+    one, mirroring upgrade_subscription's cancel-then-create semantics, but
+    with no payment check and admin-controlled price/expiry. Any existing
+    plan may be targeted, active or deactivated — an admin overriding a
+    subscription is assumed to know what they're doing (e.g. grandfathering
+    someone back onto a retired scheme).
+    """
+    user = _get_user_or_404(db, user_id)
+    plan = get_plan_by_slug(db, body.plan_id, include_inactive=True)
+    if not plan:
+        raise HTTPException(status_code=404, detail="Plan not found")
+
+    cfg = plan_config(db, body.plan_id)
+    try:
+        current_sub = db.query(Subscription).filter(
+            Subscription.clerk_user_id == user.clerk_user_id,
+            Subscription.status == "active",
+        ).first()
+        if current_sub:
+            current_sub.status = "cancelled"
+            current_sub.updated_at = datetime.utcnow()
+
+        expires_at = body.expires_at or (datetime.utcnow() + timedelta(days=cfg["days"]))
+        price = body.price if body.price is not None else cfg.get("price", 0.0)
+
+        new_sub = Subscription(
+            clerk_user_id=user.clerk_user_id,
+            plan_id=plan.id,
+            status="active",
+            price=price,
+            started_at=datetime.utcnow(),
+            expires_at=expires_at,
+        )
+        db.add(new_sub)
+        db.commit()
+        db.refresh(new_sub)
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error("DB error assigning subscription: %s", exc)
+        raise HTTPException(status_code=500, detail="Database error")
+
+    logger.info(
+        "Admin %s assigned plan %s to user %s (id=%s), expires=%s, price=%.2f",
+        admin.clerk_user_id, plan.slug, user.clerk_user_id, user.id,
+        expires_at.isoformat(), price,
+    )
+    return _admin_subscription_response(user, new_sub, db)
+
+
+@router.patch("/admin/subscriptions/{user_id}/expiry", response_model=AdminSubscriptionResponse)
+async def admin_extend_subscription(
+    user_id: int,
+    body: AdminExtendExpiryRequest,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """
+    Manually adjust the expiry of a user's current subscription (extend a
+    grace period, correct a mistake) without touching its plan or price.
+    Requires an existing subscription row (any status) to adjust — use
+    PUT /admin/subscriptions/{user_id} to create one from scratch.
+
+    Pushing expires_at into the future re-activates a subscription that had
+    lapsed to "expired" (that's the point of extending it); an explicit
+    "cancelled" status is left alone — undoing a cancellation is a deliberate
+    action, not a side effect of nudging a date, so use the assign-plan
+    endpoint to actively re-subscribe a cancelled user instead.
+    """
+    user = _get_user_or_404(db, user_id)
+    sub = (
+        db.query(Subscription)
+        .filter(Subscription.clerk_user_id == user.clerk_user_id)
+        .order_by(Subscription.created_at.desc())
+        .first()
+    )
+    if not sub:
+        raise HTTPException(status_code=404, detail="User has no subscription to adjust")
+
+    sub.expires_at = body.expires_at
+    if sub.status == "expired" and body.expires_at > datetime.utcnow():
+        sub.status = "active"
+    sub.updated_at = datetime.utcnow()
+    try:
+        db.commit()
+        db.refresh(sub)
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error("DB error extending subscription expiry: %s", exc)
+        raise HTTPException(status_code=500, detail="Database error")
+
+    logger.info(
+        "Admin %s adjusted expiry for user %s (id=%s) to %s",
+        admin.clerk_user_id, user.clerk_user_id, user.id, body.expires_at.isoformat(),
+    )
+    return _admin_subscription_response(user, sub, db)
+
+
+@router.post("/admin/subscriptions/{user_id}/cancel", response_model=AdminSubscriptionResponse)
+async def admin_cancel_subscription(
+    user_id: int,
+    db: Session = Depends(get_db),
+    admin: User = Depends(require_admin),
+):
+    """
+    Cancel a user's active subscription, admin-triggered. Shares
+    _cancel_active_subscription with the self-service
+    POST /api/subscriptions/cancel endpoint — one cancellation code path,
+    two auth-gated entry points (self vs. admin-on-behalf-of-a-user) — so
+    both are immediate for the same reason (see that function's docstring:
+    this product has no auto-renewal, so "at period end" isn't a free
+    change, it needs a status enforcement still honors until expiry).
+    """
+    user = _get_user_or_404(db, user_id)
+    sub = _cancel_active_subscription(db, user.clerk_user_id)
+    if not sub:
+        raise HTTPException(status_code=404, detail="User has no active subscription to cancel")
+
+    try:
+        db.commit()
+        db.refresh(sub)
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error("DB error cancelling subscription: %s", exc)
+        raise HTTPException(status_code=500, detail="Database error")
+
+    logger.info(
+        "Admin %s cancelled subscription for user %s (id=%s)",
+        admin.clerk_user_id, user.clerk_user_id, user.id,
+    )
+    return _admin_subscription_response(user, sub, db)
 
 
 # ── Vehicle serialization (shared by list + update) ───────────────────────────

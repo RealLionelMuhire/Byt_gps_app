@@ -194,8 +194,8 @@
         <div class="stat-value">{{ active_plans }}</div>
       </div>
       <div class="stat-card linked">
-        <div class="stat-label">Devices Linked</div>
-        <div class="stat-value">{{ linked_devices }}</div>
+        <div class="stat-label">Active Subscribers</div>
+        <div class="stat-value">{{ active_subscribers }}</div>
       </div>
     </div>
 
@@ -271,7 +271,7 @@
             <th>Price</th>
             <th>Length</th>
             <th>Max Devices</th>
-            <th>Linked Devices</th>
+            <th>Active Subscribers</th>
             <th>Status</th>
             <th>Actions</th>
           </tr>
@@ -300,7 +300,7 @@
               {{ p.max_devices if p.max_devices else 'Unlimited' }}
             </td>
             <td>
-              <span class="linked-count">{{ p.linked_devices }}</span>
+              <span class="linked-count">{{ p.active_subscribers }}</span>
             </td>
             <td>
               <span class="badge {{ 'badge-active' if p.is_active else 'badge-inactive' }}">

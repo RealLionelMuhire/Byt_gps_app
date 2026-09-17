@@ -483,17 +483,8 @@
               {% else %}
                 <span class="no-owner">No plan</span>
               {% endif %}
-              <form method="POST" action="/admin/devices/{{ d.imei }}/plan"
-                    onsubmit="return confirm('Change the subscription scheme for {{ d.imei }}? This affects billing.')">
-                <select name="plan_id" onchange="this.form.submit()">
-                  <option value="">— Unlink —</option>
-                  {% for p in plans %}
-                  <option value="{{ p.id }}" {% if d.plan and d.plan.slug == p.slug %}selected{% endif %}>
-                    {{ p.name }} ({{ p.slug }} · {{ '{:,.0f}'.format(p.price) }} {{ p.currency }}/{{ p.duration_value }}{{ p.duration_unit }})
-                  </option>
-                  {% endfor %}
-                </select>
-              </form>
+              <div><small style="color:#999;">the owner's own subscription — manage it from
+                <a href="/admin/clients">Clients</a></small></div>
             </td>
             <td>
               {% if d.owner_email %}
@@ -503,11 +494,6 @@
                   <span class="sub-chip sub-expired">● Expired</span>
                 {% else %}
                   <span class="sub-chip sub-none">○ No sub</span>
-                {% endif %}
-                {% if d.subscription_plan_name %}
-                <br><small style="color:#555;">{{ d.subscription_plan_name }}
-                  {% if d.billing_type %}<span style="color:#999;">· {{ d.billing_type | replace('_', ' ') }}</span>{% endif %}
-                </small>
                 {% endif %}
                 {% if d.subscription_expires_at %}
                 <br><small style="color:#888;">until {{ d.subscription_expires_at }}</small>

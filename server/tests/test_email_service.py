@@ -142,7 +142,10 @@ async def test_send_email_returns_false_without_raising_on_network_error(monkeyp
 async def test_send_payment_receipt_email_uses_receipt_template(monkeypatch):
     posts = _install_fake_client(monkeypatch, status_code=200)
     user = _user()
-    payment = Payment(clerk_user_id="clerk_1", tx_ref="IPabc", plan_id="basic", amount=2450, currency="RWF", status="successful")
+    # plan_id is a real FK (migrations 041/042) but this Payment is never
+    # persisted/queried here — plan_name is passed explicitly below — so an
+    # arbitrary int is fine; no subscription_plans row is needed.
+    payment = Payment(clerk_user_id="clerk_1", tx_ref="IPabc", plan_id=1, amount=2450, currency="RWF", status="successful")
 
     result = await email_module.send_payment_receipt_email(user, payment, "Basic")
 
@@ -157,7 +160,10 @@ async def test_send_subscription_expiring_email_uses_expiring_template(monkeypat
 
     posts = _install_fake_client(monkeypatch, status_code=200)
     user = _user()
-    sub = Subscription(clerk_user_id="clerk_1", plan_id="basic", status="active", price=2450, expires_at=datetime.utcnow() + timedelta(days=3))
+    # plan_id is a real FK (migrations 041/042) but this Subscription is
+    # never persisted/queried here — plan_name is passed explicitly below —
+    # so an arbitrary int is fine; no subscription_plans row is needed.
+    sub = Subscription(clerk_user_id="clerk_1", plan_id=1, status="active", price=2450, expires_at=datetime.utcnow() + timedelta(days=3))
 
     result = await email_module.send_subscription_expiring_email(user, sub, "Basic", days_left=3)
 

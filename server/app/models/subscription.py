@@ -1,4 +1,5 @@
-from sqlalchemy import Column, Integer, String, DateTime, Float, Boolean
+from sqlalchemy import Column, Integer, String, DateTime, Float, Boolean, ForeignKey
+from sqlalchemy.orm import relationship
 from datetime import datetime
 from app.core.database import Base
 
@@ -50,7 +51,12 @@ class Subscription(Base):
 
     id = Column(Integer, primary_key=True, index=True)
     clerk_user_id = Column(String(255), nullable=False, index=True)
-    plan_id = Column(String(20), nullable=False)
+    # Real FK as of migrations 041/042 — was a bare slug string (see
+    # `plan_slug_legacy`, kept post-migration for audit only). Every
+    # client-facing response still serializes the plan's .slug via this
+    # relationship, never the raw id — see app/services/plan_resolution.py.
+    plan_id = Column(Integer, ForeignKey("subscription_plans.id"), nullable=False, index=True)
+    plan = relationship("SubscriptionPlan", foreign_keys=[plan_id])
     status = Column(String(20), default="active")
     price = Column(Float, nullable=False, default=0.0)  # Stored at purchase time so admin edits don't affect existing subscribers
     started_at = Column(DateTime, default=datetime.utcnow)
@@ -69,7 +75,9 @@ class Payment(Base):
     id = Column(Integer, primary_key=True, index=True)
     clerk_user_id = Column(String(255), nullable=False, index=True)
     tx_ref = Column(String(255), nullable=False, unique=True, index=True)
-    plan_id = Column(String(20), nullable=False)
+    # Real FK as of migrations 041/042 — see Subscription.plan_id's doc above.
+    plan_id = Column(Integer, ForeignKey("subscription_plans.id"), nullable=False, index=True)
+    plan = relationship("SubscriptionPlan", foreign_keys=[plan_id])
     amount = Column(Float, nullable=False)
     currency = Column(String(10), default="RWF")
     status = Column(String(20), nullable=False)

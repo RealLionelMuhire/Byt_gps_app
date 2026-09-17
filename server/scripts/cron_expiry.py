@@ -6,6 +6,8 @@ from datetime import datetime, timedelta
 # Add the server directory to sys.path so we can import app modules
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
 
+from sqlalchemy.orm import joinedload
+
 from app.core.config import settings
 from app.core.database import SessionLocal
 from app.models.subscription import Subscription, Payment, SubscriptionPlan
@@ -83,24 +85,29 @@ async def _notify_expiring_subscriptions_async() -> None:
     try:
         now = datetime.utcnow()
         window_end = now + timedelta(days=EXPIRY_WARNING_DAYS)
-        candidates = db.query(Subscription).filter(
-            Subscription.status == "active",
-            Subscription.expires_at >= now,
-            Subscription.expires_at <= window_end,
-            Subscription.expiry_reminder_sent_at.is_(None),
-        ).all()
+        candidates = (
+            db.query(Subscription)
+            .options(joinedload(Subscription.plan))
+            .filter(
+                Subscription.status == "active",
+                Subscription.expires_at >= now,
+                Subscription.expires_at <= window_end,
+                Subscription.expiry_reminder_sent_at.is_(None),
+            )
+            .all()
+        )
 
         if not candidates:
             logger.info("No subscriptions entering the expiry-warning window.")
             return
 
-        plans_by_slug = {p.slug.lower(): p for p in db.query(SubscriptionPlan).all()}
         for sub in candidates:
             user = db.query(User).filter(User.clerk_user_id == sub.clerk_user_id).first()
             if not user:
                 continue
-            plan = plans_by_slug.get((sub.plan_id or "").lower())
-            plan_name = plan.name if plan else (sub.plan_id or "").capitalize()
+            # Subscription.plan_id is a real FK (migrations 041/042) —
+            # sub.plan is the eager-loaded relationship, not a slug lookup.
+            plan_name = sub.plan.name if sub.plan else "Unknown"
             days_left = max(0, (sub.expires_at - now).days)
 
             await send_push_notification(
@@ -115,7 +122,7 @@ async def _notify_expiring_subscriptions_async() -> None:
             db.commit()
             logger.info(
                 "Sent expiring-soon reminder for user %s (plan=%s, days_left=%d)",
-                sub.clerk_user_id, sub.plan_id, days_left,
+                sub.clerk_user_id, plan_name, days_left,
             )
     except Exception as e:
         db.rollback()
@@ -133,10 +140,15 @@ def check_expired_subscriptions():
     db = SessionLocal()
     try:
         now = datetime.utcnow()
-        expired_subs = db.query(Subscription).filter(
-            Subscription.status == "active",
-            Subscription.expires_at < now
-        ).all()
+        expired_subs = (
+            db.query(Subscription)
+            .options(joinedload(Subscription.plan))
+            .filter(
+                Subscription.status == "active",
+                Subscription.expires_at < now
+            )
+            .all()
+        )
 
         if not expired_subs:
             logger.info("No expired subscriptions found.")
@@ -144,10 +156,15 @@ def check_expired_subscriptions():
 
         notify_targets = []
         for sub in expired_subs:
-            logger.info(f"Expiring subscription for user {sub.clerk_user_id} (plan {sub.plan_id})")
+            # notify_targets carries the plan *slug* (not Subscription.plan_id
+            # itself, a real integer FK as of migrations 041/042) — both
+            # _expiry_notification_copy's "trial" check and
+            # _notify_expired_users' slug lookup below expect a slug string.
+            plan_slug = sub.plan.slug if sub.plan else ""
+            logger.info(f"Expiring subscription for user {sub.clerk_user_id} (plan {plan_slug})")
             sub.status = "expired"
             sub.updated_at = datetime.utcnow()
-            notify_targets.append((sub.clerk_user_id, sub.plan_id))
+            notify_targets.append((sub.clerk_user_id, plan_slug))
 
         db.commit()
         logger.info(f"Successfully expired {len(expired_subs)} subscriptions.")

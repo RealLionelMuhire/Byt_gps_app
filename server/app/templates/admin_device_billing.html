@@ -139,7 +139,7 @@
     <div class="grid">
       <!-- Linked scheme -->
       <div class="panel">
-        <div class="panel-head">📋 Payment Scheme <span style="font-weight:400;color:#aaa;">· linked plan</span></div>
+        <div class="panel-head">📋 Payment Scheme <span style="font-weight:400;color:#aaa;">· owner's current plan</span></div>
         <div class="panel-body">
           {% if plan %}
             <div style="display:flex; align-items:center; gap:12px; flex-wrap:wrap;">
@@ -227,7 +227,7 @@
           {% for p in payments %}
           <tr>
             <td class="mono">{{ p.tx_ref }}</td>
-            <td>{{ p.plan_id }}</td>
+            <td>{{ p.plan.slug if p.plan else '—' }}</td>
             <td class="amt">{{ '{:,.0f}'.format(p.amount) }} {{ p.currency }}</td>
             <td>{% if p.status == 'successful' %}<span class="pay-ok">✓ {{ p.status }}</span>{% else %}<span class="pay-bad">{{ p.status }}</span>{% endif %}</td>
             <td>{{ p.verified_at.strftime('%Y-%m-%d %H:%M') if p.verified_at else '—' }}</td>

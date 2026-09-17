@@ -14,7 +14,7 @@ from fastapi.testclient import TestClient
 from app.core.database import get_db
 from app.api import webhooks
 from app.models.user import User
-from app.models.subscription import Payment
+from app.models.subscription import Payment, SubscriptionPlan
 
 
 @pytest.fixture()
@@ -54,7 +54,17 @@ def user_and_payment(db_session):
     db_session.add(user)
     db_session.commit()
 
-    payment = Payment(clerk_user_id="clerk_1", tx_ref="IPabc123", plan_id="basic", amount=2450, currency="RWF", status="pending")
+    # Payment.plan_id is a real FK (migrations 041/042) — needs an actual
+    # subscription_plans row, not a bare slug string.
+    plan = SubscriptionPlan(
+        name="Basic", slug="basic", billing_type="recurrent", billing_model="prepaid",
+        charge_scope="flat", price=2450, currency="RWF", duration_value=1,
+        duration_unit="month", max_devices=3, is_active=True,
+    )
+    db_session.add(plan)
+    db_session.commit()
+
+    payment = Payment(clerk_user_id="clerk_1", tx_ref="IPabc123", plan_id=plan.id, amount=2450, currency="RWF", status="pending")
     db_session.add(payment)
     db_session.commit()
     return user, payment

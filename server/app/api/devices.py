@@ -5,7 +5,7 @@ from typing import List, Optional, Dict, Any
 from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from sqlalchemy import func
 from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session, joinedload
 from datetime import datetime, timedelta
 import secrets
 import string
@@ -25,6 +25,7 @@ from app.api.trips import TripResponse
 from app.api.subscriptions import SubscriptionPlanResponse
 from app.core.config import settings
 from app.models.user import User, Role
+from app.services.plan_resolution import resolve_owner_plan
 from pydantic import BaseModel, field_validator, model_validator
 
 logger = logging.getLogger(__name__)
@@ -220,8 +221,9 @@ class DeviceDiagnosticsResponse(BaseModel):
 
 
 class DevicePlanUpdate(BaseModel):
-    """Body for `PUT /{device_id}/plan` — link a subscription scheme to a device.
-    Send `plan_id: null` to unlink the device from its plan."""
+    """Body for the now-deprecated `PUT /{device_id}/plan` (always 410 —
+    see set_device_plan). Kept only so existing callers get a typed 422
+    instead of a confusing one if they send a malformed body."""
 
     plan_id: Optional[int] = None
 
@@ -241,6 +243,9 @@ class PaymentInfo(BaseModel):
     """A single verified payment (IntouchPay) belonging to the device owner."""
 
     tx_ref: str
+    # The plan's slug, not Payment.plan_id's own (integer, post-migration-042)
+    # value — this field's wire contract predates the FK and every existing
+    # client (admin portal, Flutter) still expects a slug string here.
     plan_id: str
     amount: float
     currency: str
@@ -265,38 +270,28 @@ class DeviceBillingResponse(BaseModel):
 
 
 # ── Shared billing helpers ────────────────────────────────────────────────────
+# Plan resolution itself (owner -> their actual Subscription/plan) lives in
+# app/services/plan_resolution.py, shared with the legacy admin dashboard
+# (app/dashboard.py) so both surfaces can never disagree about what plan a
+# device's owner is really on. These wrappers just adapt that shared result
+# into this router's DeviceSubscriptionInfo response shape.
 
-def _plans_by_slug(db: Session) -> dict:
-    """slug (lowercased) -> SubscriptionPlan — for resolving a subscription's
-    plan_id slug to a name/billing_type without N+1 lookups."""
-    return {p.slug.lower(): p for p in db.query(SubscriptionPlan).all()}
-
-
-def _latest_subscription(db: Session, clerk_user_id: str) -> Optional[Subscription]:
-    """Most recently created subscription for a user (any status) — used to
-    derive the current subscription mode for their devices."""
-    if not clerk_user_id:
-        return None
-    return (
-        db.query(Subscription)
-        .filter(Subscription.clerk_user_id == clerk_user_id)
-        .order_by(Subscription.created_at.desc())
-        .first()
-    )
-
-
-def _build_subscription_info(
-    sub: Optional[Subscription], plans_by_slug: dict
-) -> DeviceSubscriptionInfo:
-    """Derive a DeviceSubscriptionInfo from a Subscription row."""
+def _subscription_info_from_sub(sub: Optional[Subscription]) -> DeviceSubscriptionInfo:
+    """Build a DeviceSubscriptionInfo from an already-loaded Subscription row
+    — `sub.plan` is a plain relationship traversal (Subscription.plan_id is a
+    real FK as of migrations 041/042), eager-loaded by the caller
+    (list_devices' batch query, or resolve_owner_plan's joinedload) to avoid
+    an N+1 query per device. [plan_slug] is always the plan's *current*
+    slug via this relationship, never the raw (now-integer) plan_id column —
+    that's what every client (Flutter, the admin portal) expects here."""
     if sub is None:
         return DeviceSubscriptionInfo(status="none")
-    plan = plans_by_slug.get((sub.plan_id or "").lower())
+    plan = sub.plan
     now = datetime.utcnow()
     active = sub.status == "active" and sub.expires_at and sub.expires_at > now
     return DeviceSubscriptionInfo(
         status="active" if active else "expired",
-        plan_slug=sub.plan_id,
+        plan_slug=plan.slug if plan else None,
         plan_name=plan.name if plan else None,
         billing_type=plan.billing_type if plan else None,
         started_at=sub.started_at,
@@ -305,36 +300,13 @@ def _build_subscription_info(
     )
 
 
-def _subscription_for_device(
-    db: Session,
-    owner: Optional[User],
-    device_plan: Optional[SubscriptionPlan],
-    plans_by_slug: Optional[dict] = None,
-) -> DeviceSubscriptionInfo:
-    """Resolve the subscription block for ONE device.
-
-    Prefers the owner's subscription for the device's OWN linked plan, so a
-    device linked to plan X never displays the expiry/status of a newer plan
-    the owner happened to buy afterwards. Falls back to the owner's latest
-    subscription only when the device has no linked plan at all (there is
-    nothing to match against).
-    """
-    if owner is None:
-        return DeviceSubscriptionInfo(status="none")
-    sub = None
-    if device_plan is not None:
-        sub = (
-            db.query(Subscription)
-            .filter(
-                Subscription.clerk_user_id == owner.clerk_user_id,
-                func.lower(Subscription.plan_id) == device_plan.slug.lower(),
-            )
-            .order_by(Subscription.created_at.desc())
-            .first()
-        )
-    else:
-        sub = _latest_subscription(db, owner.clerk_user_id)
-    return _build_subscription_info(sub, plans_by_slug or _plans_by_slug(db))
+def _subscription_for_device(db: Session, owner: Optional[User]) -> DeviceSubscriptionInfo:
+    """Resolve the DeviceSubscriptionInfo block for a device from its owner's
+    actual Subscription — the same one enforcement reads in create_vehicle.
+    Single-owner path (get_device/get_device_billing); resolve_owner_plan
+    eager-loads the plan relationship itself, so there's no batch to pass in."""
+    resolved = resolve_owner_plan(db, owner)
+    return _subscription_info_from_sub(resolved.subscription)
 
 
 # ── Vehicle-info helpers (nickname/plate/make/model, DeviceResponse) ─────────
@@ -342,13 +314,13 @@ def _subscription_for_device(
 # flow, POST /api/vehicles — see app/api/onboarding.py) linked by
 # `Vehicle.device_id -> Device.id`. Nothing enforces at most one Vehicle per
 # device (no unique constraint on vehicles.device_id), so "latest wins" —
-# same resolution `_latest_subscription`/`latest_sub.setdefault` already use
+# same resolution `resolve_owner_plan`/`latest_sub.setdefault` already use
 # for the analogous one-user-many-subscriptions case above.
 
 def _latest_vehicle_by_device_id(db: Session, device_ids) -> dict:
     """device_id -> most-recently-created Vehicle, batched for a whole page
-    of devices in one query — the list_devices equivalent of
-    `_latest_subscription`, sized to avoid an N+1 per row."""
+    of devices in one query — the list_devices equivalent of resolving each
+    owner's Subscription, sized to avoid an N+1 per row."""
     if not device_ids:
         return {}
     vehicles = (
@@ -418,9 +390,6 @@ async def list_devices(
     )
 
     query = db.query(Device, trip_count_subq, last_trip_at_subq)
-    # Eager-load the linked plan so DeviceResponse.plan doesn't trigger an
-    # N+1 lazy-load per device row.
-    query = query.options(selectinload(Device.plan))
 
     # If not admin/super_admin, only show devices assigned to this user
     is_admin = user.role in (Role.SUPER_ADMIN, Role.ADMIN)
@@ -445,7 +414,10 @@ async def list_devices(
     )
 
     # Batch-load the subscription mode for every device's owner so the
-    # response's `subscription` block doesn't N+1 per row.
+    # response's `subscription`/`plan`/`plan_id` fields don't N+1 per row.
+    # Every device belonging to the same owner now shows that owner's one
+    # actual Subscription — see app/services/plan_resolution.py — rather
+    # than a per-device linked plan.
     #
     # This is pure enrichment: the device list must come back even when the
     # subscription data can't be read (e.g. the DB is missing a column the
@@ -455,11 +427,6 @@ async def list_devices(
     # 500ing the whole list; devices are the payload, subscription mode is
     # optional metadata.
     latest_sub = {}
-    # (clerk_user_id, plan_slug) -> latest subscription — so each device can
-    # show the subscription for its OWN linked plan instead of whatever the
-    # owner most recently purchased.
-    sub_by_owner_plan = {}
-    plans_by_slug = {}
     clerk_by_owner = {}
     owners_by_id = {}
     try:
@@ -474,6 +441,7 @@ async def list_devices(
         clerk_ids = [c for c in clerk_by_owner.values() if c]
         subs = (
             db.query(Subscription)
+            .options(joinedload(Subscription.plan))
             .filter(Subscription.clerk_user_id.in_(clerk_ids))
             .order_by(Subscription.created_at.desc())
             .all()
@@ -482,10 +450,6 @@ async def list_devices(
         )
         for s in subs:
             latest_sub.setdefault(s.clerk_user_id, s)
-            sub_by_owner_plan.setdefault(
-                (s.clerk_user_id, (s.plan_id or "").lower()), s
-            )
-        plans_by_slug = _plans_by_slug(db)
     except SQLAlchemyError as e:
         # Roll back the aborted transaction BEFORE doing anything else with
         # this session: after a failed statement PostgreSQL refuses all
@@ -520,17 +484,15 @@ async def list_devices(
         device.trip_count = trip_count or 0
         device.last_trip_at = last_trip_at
         clerk = clerk_by_owner.get(device.user_id)
-        # Prefer the subscription for the device's OWN linked plan (eager-
-        # loaded via selectinload(Device.plan)); fall back to the owner's
-        # latest only when the device has no linked plan.
-        sub = None
-        linked_plan = device.plan
-        if clerk:
-            if linked_plan is not None:
-                sub = sub_by_owner_plan.get((clerk, linked_plan.slug.lower()))
-            if sub is None and linked_plan is None:
-                sub = latest_sub.get(clerk)
-        device.subscription = _build_subscription_info(sub, plans_by_slug)
+        sub = latest_sub.get(clerk) if clerk else None
+        device.subscription = _subscription_info_from_sub(sub)
+        # DeviceResponse.plan/plan_id now mirror the owner's own Subscription
+        # instead of the retired Device.plan_id column. Overwriting these
+        # mapped attributes in place is safe here: the session is
+        # autoflush=False (app/core/database.py) and this endpoint never
+        # commits, so the in-memory override never reaches the DB.
+        device.plan = sub.plan if sub else None
+        device.plan_id = sub.plan_id if sub else None
         _apply_vehicle_info(device, vehicle_by_device_id.get(device.id))
         owner = owners_by_id.get(device.user_id)
         if owner is not None:
@@ -582,9 +544,9 @@ async def get_device_billing(
     user: User = Depends(get_current_user),
 ):
     """
-    Full billing picture for one device: the linked subscription scheme
-    (plan), the owner's current subscription mode, and the payment history
-    matching that plan. Owner or admin only (require_device_access).
+    Full billing picture for one device: the owner's actual subscription
+    plan, current subscription mode, and matching payment history. Owner or
+    admin only (require_device_access).
     """
     device = db.query(Device).filter(Device.id == device_id).first()
     if not device:
@@ -595,22 +557,21 @@ async def get_device_billing(
         db.query(User).filter(User.id == device.user_id).first()
         if device.user_id else None
     )
-    plan = (
-        db.query(SubscriptionPlan).filter(SubscriptionPlan.id == device.plan_id).first()
-        if device.plan_id else None
-    )
+    resolved = resolve_owner_plan(db, owner)
+    plan = resolved.plan
+    subscription_info = _subscription_info_from_sub(resolved.subscription)
 
-    # Subscription for THIS device's own linked plan (falls back to the
-    # owner's latest only when the device has no linked plan).
-    subscription_info = _subscription_for_device(db, owner, plan)
-
-    # Payments: the owner's payments, narrowed to this device's linked plan
-    # slug when one is set (so the panel shows only payments for this scheme).
+    # Payments: the owner's payments, narrowed to their current plan when one
+    # is set (so the panel shows only payments for this scheme).
     payments = []
     if owner:
-        q = db.query(Payment).filter(Payment.clerk_user_id == owner.clerk_user_id)
+        q = (
+            db.query(Payment)
+            .options(joinedload(Payment.plan))
+            .filter(Payment.clerk_user_id == owner.clerk_user_id)
+        )
         if plan:
-            q = q.filter(Payment.plan_id == plan.slug)
+            q = q.filter(Payment.plan_id == plan.id)
         payments = q.order_by(Payment.verified_at.desc()).limit(50).all()
 
     return DeviceBillingResponse(
@@ -629,7 +590,11 @@ async def get_device_billing(
         payments=[
             PaymentInfo(
                 tx_ref=p.tx_ref,
-                plan_id=p.plan_id,
+                # PaymentInfo.plan_id is the plan's slug (wire-format
+                # contract predates the FK — see PaymentInfo's class doc),
+                # resolved via the relationship now that Payment.plan_id
+                # itself is a real integer FK (migrations 041/042).
+                plan_id=p.plan.slug if p.plan else "",
                 amount=p.amount,
                 currency=p.currency,
                 status=p.status,
@@ -676,7 +641,13 @@ async def get_device(
         db.query(User).filter(User.id == device.user_id).first()
         if device.user_id else None
     )
-    device.subscription = _subscription_for_device(db, owner, device.plan)
+    resolved = resolve_owner_plan(db, owner)
+    device.subscription = _subscription_info_from_sub(resolved.subscription)
+    # DeviceResponse.plan/plan_id mirror the owner's own Subscription — see
+    # app/services/plan_resolution.py. Safe to overwrite these mapped
+    # attributes in place: autoflush=False and this endpoint never commits.
+    device.plan = resolved.plan
+    device.plan_id = resolved.plan.id if resolved.plan else None
     _apply_vehicle_info(device, _latest_vehicle_by_device_id(db, {device.id}).get(device.id))
     return device
 
@@ -765,7 +736,7 @@ async def update_device(
     return device
 
 
-@router.put("/{device_id}/plan", response_model=DeviceResponse)
+@router.put("/{device_id}/plan")
 async def set_device_plan(
     device_id: int,
     body: DevicePlanUpdate,
@@ -773,33 +744,29 @@ async def set_device_plan(
     _: User = Depends(require_admin),
 ):
     """
-    Link (or unlink) an admin-configured subscription scheme to a device.
-    Admin only.
+    DEPRECATED — device-level plan assignment has been removed (Phase 1 of
+    the plan/subscription consolidation: see app/services/plan_resolution.py
+    for why). A device's plan is now always derived from its owner's own
+    Subscription; there is no longer a per-device override to set.
 
-    The plan determines what the client is billed for this device (see the
-    subscription-plans API). Send `plan_id: null` to remove the link.
+    Kept as a 410 (rather than deleting the route outright) so existing
+    callers — notably car-management-portal's device-assignment dialog —
+    get an explicit, actionable error instead of a bare 404 until they're
+    updated to manage the user's Subscription directly (see the admin
+    Subscription-management endpoint being added in Phase 2).
     """
     device = db.query(Device).filter(Device.id == device_id).first()
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
-
-    if body.plan_id is not None:
-        plan = db.query(SubscriptionPlan).filter(
-            SubscriptionPlan.id == body.plan_id
-        ).first()
-        if not plan:
-            raise HTTPException(status_code=404, detail="Plan not found")
-
-    device.plan_id = body.plan_id
-    device.updated_at = datetime.utcnow()
-    db.commit()
-    db.refresh(device)
-
-    logger.info(
-        "Device %s (id=%s) plan -> %s",
-        device.imei, device.id, body.plan_id if body.plan_id is not None else "unlinked",
+    raise HTTPException(
+        status_code=410,
+        detail=(
+            "Device-level plan assignment has been removed. A device's plan "
+            "is now always the owner's own subscription — manage it via the "
+            "user's Subscription (see /api/subscriptions and the admin "
+            "subscription-management endpoints), not per device."
+        ),
     )
-    return device
 
 
 @router.patch("/{device_id}", response_model=DeviceResponse)

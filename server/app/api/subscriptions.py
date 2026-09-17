@@ -9,8 +9,9 @@ A plan defines:
   - max_devices (None = unlimited)
 
 Admins create/manage plans here; the mobile app lists active plans via
-GET /api/subscription-plans. Plans can be linked to GPS devices
-(see PUT /api/devices/{device_id}/plan).
+GET /api/subscription-plans. A plan is assigned to a user by creating a
+Subscription (see POST /api/subscriptions), never directly to a device —
+device-level plan links were retired; see app/services/plan_resolution.py.
 """
 
 import logging

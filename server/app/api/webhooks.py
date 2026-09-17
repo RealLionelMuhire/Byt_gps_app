@@ -15,7 +15,7 @@ from app.core.database import get_db
 from app.models.user import User
 from app.models.device import Device
 from app.models.vehicle import Vehicle
-from app.models.subscription import Subscription, Payment, SubscriptionPlan
+from app.models.subscription import Subscription, Payment
 from app.models.trip import Trip
 from app.api.auth import claim_pending_client_user
 from app.services.intouchpay import get_transaction_status, classify_status, IntouchPayError
@@ -206,13 +206,6 @@ def _intouch_ack(request_id: str) -> dict:
     return {"message": "success", "success": True, "request_id": request_id or ""}
 
 
-def _plan_display_name(db: Session, plan_id: str) -> str:
-    plan = db.query(SubscriptionPlan).filter(
-        SubscriptionPlan.slug.ilike(plan_id or "")
-    ).first()
-    return plan.name if plan else (plan_id or "").capitalize()
-
-
 async def _send_payment_result_email(db: Session, payment: Payment, *, succeeded: bool) -> None:
     """Fire-and-forget email after a Payment's status has already been
     committed — a slow/failing email must never affect the payment state
@@ -221,7 +214,9 @@ async def _send_payment_result_email(db: Session, payment: Payment, *, succeeded
     if not user:
         return
     if succeeded:
-        plan_name = _plan_display_name(db, payment.plan_id)
+        # Payment.plan_id is a real FK (migrations 041/042) — payment.plan
+        # is the relationship, not a slug to re-look-up.
+        plan_name = payment.plan.name if payment.plan else "Unknown"
         await send_payment_receipt_email(user, payment, plan_name)
     else:
         await send_payment_failed_email(user, payment)
