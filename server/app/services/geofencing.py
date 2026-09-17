@@ -19,6 +19,18 @@ Both shapes are additionally scoped to specific devices via GeofenceDevice
 never evaluates for it, regardless of shape or is_active. That join lives
 in the initial fetch below, shared by both branches, so device scoping
 can't drift out of sync between them.
+
+A single is_inside flip never fires a transition by itself (migration
+040) — it takes a second, consecutive fix agreeing with the new side to
+commit it. A stationary vehicle's GPS fix can wobble a few meters ping to
+ping even once the position is corroborated as "not really moving" (see
+app/services/live_position.py's CONFIRM_RADIUS_METERS — that tolerance is
+tuned for the live map marker not visibly jumping around, not for a
+geofence boundary sitting inside that same jitter envelope); with no
+debounce of its own, one noisy ping past a boundary used to be
+indistinguishable from a real crossing. This mirrors live_position.py's
+own pending-then-confirmed shape, just applied to the boolean is_inside
+signal instead of a lat/lon jump — see GeofenceDeviceState.pending_is_inside.
 """
 
 from typing import List, NamedTuple
@@ -53,6 +65,13 @@ def evaluate_geofences(
     state without firing an event: otherwise a device already inside a
     brand-new geofence would fire a spurious "Enter fence" the moment
     it's first evaluated.
+
+    A flip away from the persisted state is held as `pending_is_inside`
+    rather than committed immediately — it only becomes a real, fired
+    transition once a second consecutive fix agrees with it (see module
+    doc). A fix that instead agrees with the still-committed state clears
+    any pending candidate: a single-ping wobble away and back is exactly
+    the jitter this debounce absorbs, not the start of a real crossing.
 
     Mutates `db` (adds/updates GeofenceDeviceState rows) but does not
     commit — the caller is expected to commit alongside its own writes
@@ -129,12 +148,27 @@ def evaluate_geofences(
             db.add(GeofenceDeviceState(device_id=device_id, geofence_id=gf.id, is_inside=is_inside))
             continue
 
-        if is_inside != state.is_inside:
-            # Ground truth is always kept current, even if the flag below
-            # suppresses the alert — otherwise a muted enter would leave
-            # state stale and the next real exit would never fire either.
+        if is_inside == state.is_inside:
+            # Agrees with the committed state. Also clears a pending
+            # candidate from a prior fix, if any — a wobble away and back
+            # within one ping is the jitter this debounce exists to
+            # absorb, not the start of a real crossing.
+            if state.pending_is_inside is not None:
+                state.pending_is_inside = None
+            continue
+
+        if state.pending_is_inside == is_inside:
+            # Second consecutive fix agreeing on the new side — corroborated,
+            # commit it. Ground truth is always kept current even if the
+            # flag below suppresses the alert — otherwise a muted enter
+            # would leave state stale and the next real exit would never
+            # fire either.
             state.is_inside = is_inside
+            state.pending_is_inside = None
             if (is_inside and gf.alert_on_enter) or (not is_inside and gf.alert_on_exit):
                 transitions.append(GeofenceTransition(geofence=gf, entered=is_inside))
+        else:
+            # First fix suggesting a flip — hold it, don't fire yet.
+            state.pending_is_inside = is_inside
 
     return transitions

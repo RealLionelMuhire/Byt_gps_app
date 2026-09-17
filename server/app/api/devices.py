@@ -181,6 +181,19 @@ class DeviceResponse(DeviceBase):
     plate: Optional[str] = None
     make: Optional[str] = None
     model: Optional[str] = None
+    # The assigned client's own name/email — populated by list_devices (see
+    # its owners/owners_by_id batch-load, the same User rows already
+    # fetched there for clerk_by_owner) via the same transient-attribute
+    # pattern as trip_count/last_trip_at/subscription above. None for every
+    # other endpoint returning a bare Device ORM object (get_device,
+    # create_device, etc.), and for an unassigned (user_id is None) device.
+    # An admin viewing the fleet-wide device list needs this to tell whose
+    # vehicle is whose — previously every row showed only the vehicle's own
+    # name/plate with no owner context, which for an admin (who sees every
+    # device in the system, not just their own) read as if the whole fleet
+    # belonged to them.
+    owner_name: Optional[str] = None
+    owner_email: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -448,12 +461,16 @@ async def list_devices(
     sub_by_owner_plan = {}
     plans_by_slug = {}
     clerk_by_owner = {}
+    owners_by_id = {}
     try:
         owner_ids = {d[0].user_id for d in rows if d[0].user_id}
         owners = (
             db.query(User).filter(User.id.in_(owner_ids)).all() if owner_ids else []
         )
         clerk_by_owner = {u.id: u.clerk_user_id for u in owners}
+        # Same owner rows, also indexed for the owner_name/owner_email
+        # fields below — see DeviceResponse.owner_name's doc.
+        owners_by_id = {u.id: u for u in owners}
         clerk_ids = [c for c in clerk_by_owner.values() if c]
         subs = (
             db.query(Subscription)
@@ -515,6 +532,10 @@ async def list_devices(
                 sub = latest_sub.get(clerk)
         device.subscription = _build_subscription_info(sub, plans_by_slug)
         _apply_vehicle_info(device, vehicle_by_device_id.get(device.id))
+        owner = owners_by_id.get(device.user_id)
+        if owner is not None:
+            device.owner_name = f"{owner.first_name} {owner.last_name}".strip() or owner.email
+            device.owner_email = owner.email
         devices.append(device)
     return devices
 

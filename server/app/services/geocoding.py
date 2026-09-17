@@ -87,8 +87,8 @@ def _extract_place_name(address: dict) -> Optional[str]:
     return ", ".join(parts)
 
 
-def _format_fallback(lat: float, lon: float) -> str:
-    """Fallback when geocoding fails: use coordinates."""
+def format_fallback_location(lat: float, lon: float) -> str:
+    """Fallback when geocoding fails or finds no address: use coordinates."""
     return f"{lat:.4f}, {lon:.4f}"
 
 
@@ -321,7 +321,7 @@ def build_trip_display_name(
     time.sleep(1)  # Nominatim: max 1 request per second
     end_name = reverse_geocode(end_lat, end_lon)
 
-    start_str = start_name if start_name else _format_fallback(start_lat, start_lon)
-    end_str = end_name if end_name else _format_fallback(end_lat, end_lon)
+    start_str = start_name if start_name else format_fallback_location(start_lat, start_lon)
+    end_str = end_name if end_name else format_fallback_location(end_lat, end_lon)
 
     return f"{start_str} → {end_str}"

@@ -118,7 +118,9 @@ def test_first_observation_seeds_state_without_firing(db_session):
 
 def test_enter_and_exit_fire_once_per_transition_not_per_ping(db_session):
     """The core requirement: repeated pings while inside (or outside) must
-    not re-fire the alarm — only the boundary crossings themselves."""
+    not re-fire the alarm — only a *corroborated* boundary crossing
+    (migration 040: two consecutive fixes agreeing on the new side) fires,
+    exactly once."""
     owner = make_user(db_session)
     device = make_device(db_session, owner)
     make_geofence(db_session, owner, device=device)
@@ -132,19 +134,69 @@ def test_enter_and_exit_fire_once_per_transition_not_per_ping(db_session):
     assert ping(*OUTSIDE) == []
     # 2: still outside — no event.
     assert ping(*OUTSIDE) == []
-    # 3: crosses into the zone — exactly one "enter" event.
+    # 3: first fix inside — held as a pending candidate, not yet fired.
+    assert ping(*INSIDE) == []
+    # 4: second consecutive fix inside — corroborated, exactly one "enter".
     t = ping(*INSIDE)
     assert len(t) == 1
     assert t[0].entered is True
-    # 4, 5: still inside (different points within the radius) — no re-fire.
+    # 5, 6: still inside (different points within the radius) — no re-fire.
     assert ping(*INSIDE) == []
     assert ping(*INSIDE_NEARBY) == []
-    # 6: crosses back out — exactly one "exit" event.
+    # 7: first fix outside — held, not yet fired.
+    assert ping(*OUTSIDE) == []
+    # 8: second consecutive fix outside — corroborated, exactly one "exit".
     t = ping(*OUTSIDE)
     assert len(t) == 1
     assert t[0].entered is False
-    # 7: still outside — no event.
+    # 9: still outside — no event.
     assert ping(*OUTSIDE) == []
+
+
+def test_a_single_flip_never_fires_alone(db_session):
+    """One fix disagreeing with the committed state, immediately followed
+    by a fix agreeing with the ORIGINAL state again, must never fire —
+    this is exactly the shape of GPS jitter for a vehicle that never
+    actually moved, which is what migration 040's debounce exists to
+    absorb."""
+    owner = make_user(db_session)
+    device = make_device(db_session, owner)
+    make_geofence(db_session, owner, device=device)
+
+    def ping(lon, lat):
+        transitions = evaluate_geofences(db_session, device.id, owner.id, lon, lat)
+        db_session.commit()
+        return transitions
+
+    assert ping(*OUTSIDE) == []  # baseline
+    assert ping(*INSIDE) == []   # one noisy fix inside — held, not fired
+    assert ping(*OUTSIDE) == []  # back outside — pending candidate discarded, no event
+    assert ping(*OUTSIDE) == []  # still outside — no event (state never actually changed)
+
+
+def test_alternating_jitter_never_fires_despite_constant_flipping(db_session):
+    """A stationary vehicle whose raw fix wobbles back and forth across a
+    boundary every single ping (is_inside flips on literally every fix,
+    but never repeats the same side twice in a row) must never fire a
+    single transition — the exact "not moving at all" false-positive
+    pattern this migration exists to fix."""
+    owner = make_user(db_session)
+    device = make_device(db_session, owner)
+    make_geofence(db_session, owner, device=device)
+
+    def ping(lon, lat):
+        transitions = evaluate_geofences(db_session, device.id, owner.id, lon, lat)
+        db_session.commit()
+        return transitions
+
+    assert ping(*OUTSIDE) == []  # baseline
+    for _ in range(6):
+        assert ping(*INSIDE) == []
+        assert ping(*OUTSIDE) == []
+
+    # Confirmed state never actually moved off the baseline.
+    state = db_session.query(GeofenceDeviceState).filter_by(device_id=device.id).first()
+    assert state.is_inside is False
 
 
 def test_inactive_geofence_never_fires(db_session):
@@ -168,8 +220,10 @@ def test_alert_on_enter_false_suppresses_enter_but_state_still_tracks(db_session
         return transitions
 
     assert ping(*OUTSIDE) == []          # baseline
-    assert ping(*INSIDE) == []           # enter suppressed by alert_on_enter=False
-    t = ping(*OUTSIDE)                   # exit still fires — state wasn't left stale
+    assert ping(*INSIDE) == []           # 1st inside fix — pending
+    assert ping(*INSIDE) == []           # 2nd inside fix — corroborated, enter suppressed
+    assert ping(*OUTSIDE) == []          # 1st outside fix — pending
+    t = ping(*OUTSIDE)                   # 2nd outside fix — exit still fires, state wasn't left stale
     assert len(t) == 1
     assert t[0].entered is False
 
@@ -341,7 +395,7 @@ def test_polygon_boundary_point_is_treated_as_outside(db_session):
 def test_polygon_enter_and_exit_fire_once_per_transition_not_per_ping(db_session):
     """Same requirement as the circle version above, adapted to a polygon
     zone: repeated pings while inside (or outside) must not re-fire — only
-    the boundary crossings themselves, exactly once each."""
+    a *corroborated* crossing (migration 040) fires, exactly once each."""
     owner = make_user(db_session)
     device = make_device(db_session, owner)
     make_polygon_geofence(db_session, owner, device=device)
@@ -355,28 +409,29 @@ def test_polygon_enter_and_exit_fire_once_per_transition_not_per_ping(db_session
     assert ping(*POLY_OUTSIDE) == []
     # 2: still outside — no event.
     assert ping(*POLY_OUTSIDE) == []
-    # 3: crosses into the zone — exactly one "enter" event.
-    t = ping(*POLY_INSIDE)
-    assert len(t) == 1
-    assert t[0].entered is True
-    # 4: still inside — no re-fire.
+    # 3: first fix inside — held as a pending candidate.
     assert ping(*POLY_INSIDE) == []
-    # 5: sitting on the boundary counts as outside (ST_Contains excludes
-    # it), so this does NOT re-fire "enter" — it's already "outside" from
-    # step 3's perspective... except step 3 made it inside, so touching the
-    # boundary now is itself an exit.
-    t = ping(*POLY_BOUNDARY)
-    assert len(t) == 1
-    assert t[0].entered is False
-    # 6: crosses back in.
+    # 4: second consecutive fix inside — corroborated, exactly one "enter".
     t = ping(*POLY_INSIDE)
     assert len(t) == 1
     assert t[0].entered is True
-    # 7: crosses back out — exactly one "exit" event.
+    # 5: still inside — no re-fire.
+    assert ping(*POLY_INSIDE) == []
+    # 6: a single touch of the boundary (ST_Contains treats it as
+    # "outside") is exactly the jitter migration 040's debounce exists to
+    # absorb — held as a pending candidate, not fired.
+    assert ping(*POLY_BOUNDARY) == []
+    # 7: back inside before that boundary touch was ever corroborated — the
+    # pending "outside" candidate is discarded. No event, and the state
+    # never actually left "inside".
+    assert ping(*POLY_INSIDE) == []
+    # 8: first fix genuinely outside — held.
+    assert ping(*POLY_OUTSIDE) == []
+    # 9: second consecutive fix outside — corroborated, exactly one "exit".
     t = ping(*POLY_OUTSIDE)
     assert len(t) == 1
     assert t[0].entered is False
-    # 8: still outside — no event.
+    # 10: still outside — no event.
     assert ping(*POLY_OUTSIDE) == []
 
 
@@ -394,6 +449,14 @@ def _location(device, is_alarm=False, alarm_type=None):
     )
 
 
+def _set_confirmed_position(device, lon_lat):
+    """`_apply_geofence_transitions` now reads device.last_latitude/
+    last_longitude (the CONFIRMED position) rather than taking lon/lat
+    directly — see that function's doc for why. OUTSIDE/INSIDE/etc. are
+    (lon, lat) tuples, matching evaluate_geofences' own param order."""
+    device.last_longitude, device.last_latitude = lon_lat
+
+
 def test_apply_geofence_transitions_snapshots_the_fence_name_on_enter(db_session):
     owner = make_user(db_session)
     device = make_device(db_session, owner)
@@ -402,12 +465,21 @@ def test_apply_geofence_transitions_snapshots_the_fence_name_on_enter(db_session
     # Baseline observation (outside) — seeds state, no alarm yet.
     baseline = _location(device)
     db_session.add(baseline)
-    _apply_geofence_transitions(db_session, device, baseline, *OUTSIDE)
+    _set_confirmed_position(device, OUTSIDE)
+    _apply_geofence_transitions(db_session, device, baseline)
     db_session.commit()
 
+    # First fix inside — held as a pending candidate, not yet fired.
+    pending = _location(device)
+    db_session.add(pending)
+    _set_confirmed_position(device, INSIDE)
+    assert _apply_geofence_transitions(db_session, device, pending) == []
+    db_session.commit()
+
+    # Second consecutive fix inside — corroborated, fires.
     location = _location(device)
     db_session.add(location)
-    transitions = _apply_geofence_transitions(db_session, device, location, *INSIDE)
+    transitions = _apply_geofence_transitions(db_session, device, location)
     db_session.commit()
 
     assert len(transitions) == 1
@@ -423,12 +495,19 @@ def test_apply_geofence_transitions_snapshots_the_fence_name_on_exit(db_session)
 
     baseline = _location(device)
     db_session.add(baseline)
-    _apply_geofence_transitions(db_session, device, baseline, *INSIDE)
+    _set_confirmed_position(device, INSIDE)
+    _apply_geofence_transitions(db_session, device, baseline)
+    db_session.commit()
+
+    pending = _location(device)
+    db_session.add(pending)
+    _set_confirmed_position(device, OUTSIDE)
+    assert _apply_geofence_transitions(db_session, device, pending) == []
     db_session.commit()
 
     location = _location(device)
     db_session.add(location)
-    _apply_geofence_transitions(db_session, device, location, *OUTSIDE)
+    _apply_geofence_transitions(db_session, device, location)
     db_session.commit()
 
     assert location.alarm_type == "Exit fence"
@@ -445,12 +524,19 @@ def test_apply_geofence_transitions_does_not_override_an_existing_alarm(db_sessi
 
     baseline = _location(device)
     db_session.add(baseline)
-    _apply_geofence_transitions(db_session, device, baseline, *OUTSIDE)
+    _set_confirmed_position(device, OUTSIDE)
+    _apply_geofence_transitions(db_session, device, baseline)
+    db_session.commit()
+
+    pending = _location(device)
+    db_session.add(pending)
+    _set_confirmed_position(device, INSIDE)
+    assert _apply_geofence_transitions(db_session, device, pending) == []
     db_session.commit()
 
     location = _location(device, is_alarm=True, alarm_type="Shock")
     db_session.add(location)
-    transitions = _apply_geofence_transitions(db_session, device, location, *INSIDE)
+    transitions = _apply_geofence_transitions(db_session, device, location)
     db_session.commit()
 
     # The transition is still reported (state tracking must not be
@@ -459,3 +545,25 @@ def test_apply_geofence_transitions_does_not_override_an_existing_alarm(db_sessi
     assert len(transitions) == 1
     assert location.alarm_type == "Shock"
     assert location.geofence_name is None
+
+
+def test_apply_geofence_transitions_uses_confirmed_position_not_stale_raw_ping(db_session):
+    """No confirmed position yet (device.last_latitude/longitude both
+    None) — evaluation is skipped entirely rather than crashing or
+    evaluating (0, 0)."""
+    owner = make_user(db_session)
+    device = Device(
+        imei="999999999999999", name="Fresh Device", lifecycle="sold", user_id=owner.id,
+    )
+    db_session.add(device)
+    db_session.commit()
+    db_session.refresh(device)
+    make_geofence(db_session, owner, device=device)
+
+    location = _location(device)
+    db_session.add(location)
+    transitions = _apply_geofence_transitions(db_session, device, location)
+    db_session.commit()
+
+    assert transitions == []
+    assert location.is_alarm is False

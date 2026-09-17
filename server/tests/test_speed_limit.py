@@ -11,12 +11,14 @@ conftest.py for the model-level and route-level tests, matching
 test_geofencing.py and test_vehicles_api.py's own patterns.
 """
 
+import asyncio
 from datetime import datetime
 
 import app.tcp_server as tcp_server_module
 from app.models.device import Device
 from app.models.location import Location
 from app.models.user import User, Role
+from app.services.geocoding import format_fallback_location
 from app.services.speed_limit import evaluate_speed_limit
 from app.services.alarm_rules import ALARM_LABELS, ALARM_SETTING_FIELDS, get_severity
 from app.tcp_server import _apply_speed_limit_check, _resolve_overspeed_road_name
@@ -64,6 +66,31 @@ def test_dropping_back_under_resolves_without_firing_and_a_later_crossing_fires_
     assert device.is_overspeeding is False
 
     # Crossing again after resolving is a genuinely new event.
+    assert evaluate_speed_limit(device, speed_kmh=85, gps_valid=True) is True
+    assert device.is_overspeeding is True
+
+
+def test_hysteresis_blip_back_toward_the_limit_does_not_disarm():
+    """A fix that dips back under the bare limit, but not all the way to
+    limit - HYSTERESIS_KMH, must not re-arm -- this is the noisy-GPS-speed
+    chatter case: without the margin, this same blip would silently
+    disarm and the very next over-limit fix would fire a spurious repeat
+    alarm for what is really one continuous overspeed episode."""
+    device = _device(speed_limit_kmh=80, is_overspeeding=True)
+    assert evaluate_speed_limit(device, speed_kmh=78, gps_valid=True) is False
+    assert device.is_overspeeding is True
+
+    # Still armed, so climbing back over the limit fires nothing new.
+    assert evaluate_speed_limit(device, speed_kmh=90, gps_valid=True) is False
+    assert device.is_overspeeding is True
+
+
+def test_hysteresis_drop_past_the_floor_disarms_and_a_later_crossing_fires_again():
+    device = _device(speed_limit_kmh=80, is_overspeeding=True)
+    # 75 == 80 - HYSTERESIS_KMH(5) -- right at the floor, must disarm.
+    assert evaluate_speed_limit(device, speed_kmh=75, gps_valid=True) is False
+    assert device.is_overspeeding is False
+
     assert evaluate_speed_limit(device, speed_kmh=85, gps_valid=True) is True
     assert device.is_overspeeding is True
 
@@ -133,26 +160,23 @@ def test_apply_speed_limit_check_does_not_override_an_existing_alarm(db_session)
 
 
 # ---------------------------------------------------------------------------
-# _resolve_overspeed_road_name — the cache-only geocoding lookup an
-# overspeed alarm uses to name the road in its push, without ever waiting
-# on a live Nominatim call (see the function's docstring in tcp_server.py
-# and the design note on the overspeed block in handle_location).
+# _resolve_overspeed_road_name — a bounded, cache-first-then-live
+# reverse-geocode lookup for a just-fired overspeed alarm's position (see
+# the function's docstring in tcp_server.py and the design note on the
+# overspeed block in handle_location). Never raises and never returns
+# None: a resolved name wins, anything else falls back to formatted
+# coordinates.
 # ---------------------------------------------------------------------------
 
-def test_resolve_overspeed_road_name_returns_cached_name_with_nothing_to_warm(monkeypatch):
+def test_resolve_overspeed_road_name_returns_the_resolved_name(monkeypatch):
     device = Device(imei="1", name="Test", speed_limit_kmh=80)
     location = _location(device)
 
-    def fake_cached_only(coords, results):
-        results[coords[0]] = "KN 247 Street"
-        return []
+    monkeypatch.setattr(tcp_server_module, "reverse_geocode", lambda lat, lon: "KN 247 Street")
 
-    monkeypatch.setattr(tcp_server_module, "reverse_geocode_many_cached_only", fake_cached_only)
-
-    road_name, missing = _resolve_overspeed_road_name(location)
+    road_name = asyncio.run(_resolve_overspeed_road_name(location))
 
     assert road_name == "KN 247 Street"
-    assert missing == []
 
 
 def test_location_road_name_column_round_trips(db_session):
@@ -173,23 +197,43 @@ def test_location_road_name_column_round_trips(db_session):
     assert location.road_name == "KN 247 Street"
 
 
-def test_resolve_overspeed_road_name_returns_none_and_the_coord_to_warm_on_a_cache_miss(monkeypatch):
-    """A cache miss must resolve instantly (no network call, no sleep) and
-    hand back the coord for the caller to warm asynchronously — this is
-    what lets the overspeed alarm ship immediately with a coordinate
-    fallback instead of waiting on Nominatim."""
+def test_resolve_overspeed_road_name_falls_back_to_coordinates_when_unresolved(monkeypatch):
+    """A genuine no-address-found response (or any other non-exception
+    miss) must fall back to a formatted coordinate string, never None —
+    every overspeed alert has to carry *some* location text."""
     device = Device(imei="1", name="Test", speed_limit_kmh=80)
     location = _location(device)
 
-    def fake_cached_only(coords, results):
-        return list(coords)
+    monkeypatch.setattr(tcp_server_module, "reverse_geocode", lambda lat, lon: None)
 
-    monkeypatch.setattr(tcp_server_module, "reverse_geocode_many_cached_only", fake_cached_only)
+    road_name = asyncio.run(_resolve_overspeed_road_name(location))
 
-    road_name, missing = _resolve_overspeed_road_name(location)
+    assert road_name == format_fallback_location(location.latitude, location.longitude)
 
-    assert road_name is None
-    assert missing == [(location.latitude, location.longitude)]
+
+def test_resolve_overspeed_road_name_falls_back_on_timeout(monkeypatch):
+    """A Nominatim call that hangs past OVERSPEED_GEOCODE_TIMEOUT_SECONDS
+    must not block the alert — it falls back to coordinates instead of
+    propagating the timeout."""
+    import time
+
+    device = Device(imei="1", name="Test", speed_limit_kmh=80)
+    location = _location(device)
+
+    def slow_lookup(lat, lon):
+        # Short, not the real hang duration -- asyncio.run()'s shutdown
+        # still waits for this background thread to actually finish (a
+        # timed-out wait_for cancels the *await*, not the thread), so
+        # keeping this small keeps the test fast.
+        time.sleep(0.3)
+        return "Should never be seen"
+
+    monkeypatch.setattr(tcp_server_module, "reverse_geocode", slow_lookup)
+    monkeypatch.setattr(tcp_server_module, "OVERSPEED_GEOCODE_TIMEOUT_SECONDS", 0.05)
+
+    road_name = asyncio.run(_resolve_overspeed_road_name(location))
+
+    assert road_name == format_fallback_location(location.latitude, location.longitude)
 
 
 # ---------------------------------------------------------------------------

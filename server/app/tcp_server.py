@@ -6,7 +6,7 @@ Handles binary protocol communication
 
 import asyncio
 import logging
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set
 from datetime import datetime, timedelta
 import struct
 
@@ -21,7 +21,8 @@ from app.api.locations import classify_outlier, compute_quality_log_fields, loca
 from app.services.geofencing import evaluate_geofences, GeofenceTransition
 from app.services.speed_limit import evaluate_speed_limit
 from app.services.live_position import resolve_live_position
-from app.services.geocoding import reverse_geocode_many, reverse_geocode_many_cached_only
+from app.services.geocoding import reverse_geocode, format_fallback_location
+from app.core.config import settings
 from app.services.trip_settings_service import DEFAULT_STOP_SPEED_KMH, get_or_create_trip_settings
 from app.services.push_notifications import send_push_notification
 from app.services.alarm_rules import (
@@ -83,14 +84,42 @@ def _evaluate_incoming_point(
 
 
 def _apply_geofence_transitions(
-    db: Session, device: Device, location: Location, lon: float, lat: float,
+    db: Session, device: Device, location: Location,
 ) -> List[GeofenceTransition]:
     """
-    Evaluate the just-ingested point against the device owner's geofences
-    (see app/services/geofencing.py) and, if any enter/exit transitions
-    fired, reflect the first one on `location` — unless it already carries
-    a hardware-reported alarm_type (handle_alarm's case), which takes
-    priority since it's a real device alarm, not a synthesized one.
+    Evaluate the device's CONFIRMED live position (device.last_latitude/
+    last_longitude) against the owner's geofences (see
+    app/services/geofencing.py), not the raw per-packet lat/lon — a
+    stationary vehicle's raw GPS fix wobbles a few meters ping to ping even
+    while genuinely parked, and with no buffer/hysteresis in
+    evaluate_geofences itself, evaluating that raw noise directly flipped
+    `is_inside` and fired a real "Enter fence"/"Exit fence" alarm for a
+    vehicle that never moved (confirmed against production logs — repeated
+    crossing alarms for a parked device with no speed and no real
+    displacement between fixes).
+
+    device.last_latitude/last_longitude is exactly the field
+    resolve_live_position() already produces for this same reason (see its
+    module doc) — confirmed immediately for a real move (device reporting
+    actual speed) or a small in-place jitter within CONFIRM_RADIUS_METERS,
+    but held as a pending candidate, NOT written here, until a second fix
+    corroborates a larger jump while the device claims to be stopped. Using
+    that same field means a genuine crossing at driving speed is still
+    evaluated on the very same fix it happens (no added latency — see
+    resolve_live_position's "reports actual speed" branch), while a
+    jitter-sized wobble past a boundary is never even seen by
+    evaluate_geofences until (if ever) it's corroborated as real movement.
+    handle_alarm (unlike handle_location) writes this field directly with
+    no corroboration hold at all — a device's own hardware alarm position
+    must never be silently delayed — so this still evaluates that alarm's
+    own reported position there, just still gated on gps_valid/is_outlier
+    like every other write to this field.
+
+    Skips evaluation entirely (returns []) when there's no confirmed
+    position yet — nothing to evaluate against — which also covers an
+    invalid/outlier/still-pending fix that left this field untouched: an
+    unchanged confirmed position can't produce a new is_inside flip, so
+    there's nothing new worth re-querying for.
 
     Must be called after `location` has been added to `db` and before
     `db.commit()` — GeofenceDeviceState rows are staged on the same
@@ -99,8 +128,12 @@ def _apply_geofence_transitions(
     """
     if not device.user_id:
         return []
+    if device.last_latitude is None or device.last_longitude is None:
+        return []
 
-    transitions = evaluate_geofences(db, device.id, device.user_id, lon, lat)
+    transitions = evaluate_geofences(
+        db, device.id, device.user_id, device.last_longitude, device.last_latitude,
+    )
     if transitions and not location.is_alarm:
         location.is_alarm = True
         location.alarm_type = "Enter fence" if transitions[0].entered else "Exit fence"
@@ -156,24 +189,43 @@ def _apply_speed_limit_check(device: Device, location: Location, speed_kmh: floa
     return False
 
 
-def _resolve_overspeed_road_name(location: Location) -> Tuple[Optional[str], List[Tuple[float, float]]]:
-    """
-    Cache-only reverse-geocode lookup for a just-fired overspeed alarm's
-    position (see app/services/geocoding.py — same cache the period-route
-    endpoint reads from). Never makes a Nominatim network call and never
-    sleeps, so it adds ~no latency to this alarm's delivery: a cache hit
-    returns the road name immediately, a miss returns None immediately.
+# A cache-only lookup (see app/api/locations.py's period-route endpoint)
+# almost never hits for an overspeed alarm — a moving vehicle rarely
+# re-enters the exact ~100m cell it was last in, so an alarm's own
+# position is nearly always cold at fire time. This bounds a *real*
+# Nominatim lookup instead, so the alarm actually carries the road name
+# in the common case rather than the cache only ever warming up in time
+# for some hypothetical later alarm at the same spot. The bound is the
+# HTTP client's own timeout plus a small buffer for cache-check/thread
+# dispatch overhead — long enough to let a genuine network round trip
+# finish rather than truncating it early.
+OVERSPEED_GEOCODE_TIMEOUT_SECONDS = settings.NOMINATIM_TIMEOUT_SECONDS + 1.0
 
-    Returns (road_name_or_None, coords_to_warm) — the caller should kick
-    off a background task with `coords_to_warm` (via reverse_geocode_many)
-    to resolve and cache it for next time, without waiting on it. This
-    alarm intentionally ships with a coordinate fallback rather than being
-    delayed, or double-sent once the background lookup resolves.
+
+async def _resolve_overspeed_road_name(location: Location) -> str:
     """
-    places: Dict[Tuple[float, float], Optional[str]] = {}
-    coord = (location.latitude, location.longitude)
-    missing = reverse_geocode_many_cached_only([coord], places)
-    return places.get(coord), missing
+    Resolve a road name for a just-fired overspeed alarm's position,
+    cache-first with a live Nominatim fallback (see
+    app/services/geocoding.py:reverse_geocode), bounded by
+    OVERSPEED_GEOCODE_TIMEOUT_SECONDS. Runs off the event loop via
+    asyncio.to_thread so a slow or hung lookup only delays this alarm
+    (and this device's own next few packets) — it never stalls other
+    devices' connections.
+
+    Never returns None and never raises: a timeout, a network failure, or
+    a genuine no-address-found response all fall back to a formatted
+    "lat, lon" string, so every overspeed alert always carries some
+    location text.
+    """
+    try:
+        name = await asyncio.wait_for(
+            asyncio.to_thread(reverse_geocode, location.latitude, location.longitude),
+            timeout=OVERSPEED_GEOCODE_TIMEOUT_SECONDS,
+        )
+    except Exception as e:
+        logger.warning("Overspeed road-name lookup failed/timed out: %s", e)
+        name = None
+    return name or format_fallback_location(location.latitude, location.longitude)
 
 
 class GPSTrackerConnection:
@@ -423,9 +475,7 @@ class GPSTrackerConnection:
                     device.last_update = datetime.utcnow()
                     device.status = 'online'
 
-                    geofence_transitions = _apply_geofence_transitions(
-                        db, device, location, data['longitude'], data['latitude']
-                    )
+                    geofence_transitions = _apply_geofence_transitions(db, device, location)
                     speed_limit_fired = _apply_speed_limit_check(
                         device, location, data['speed'], data['gps_valid']
                     )
@@ -465,18 +515,13 @@ class GPSTrackerConnection:
                         await self.server.broadcast_location_update(device.id, live_data)
                     await _broadcast_geofence_transitions(self.server, device.id, data, geofence_transitions, location_id=location.id)
                     if speed_limit_fired:
-                        road_name, missing_coords = _resolve_overspeed_road_name(location)
-                        if missing_coords:
-                            asyncio.create_task(asyncio.to_thread(reverse_geocode_many, missing_coords))
-                        if road_name:
-                            # Persist only on a cache hit -- a miss has
-                            # nothing worth recording (see
-                            # _resolve_overspeed_road_name's docstring);
-                            # GET /{device_id}/alarms can then show this
-                            # alarm's road the same way the live push/WS
-                            # broadcast just did, not just at fire time.
-                            location.road_name = road_name
-                            db.commit()
+                        road_name = await _resolve_overspeed_road_name(location)
+                        # Always persist -- format_fallback_location's
+                        # coordinate string is still worth recording, so
+                        # GET /{device_id}/alarms shows the same text the
+                        # live push/WS broadcast just did.
+                        location.road_name = road_name
+                        db.commit()
                         speed_alarm_data = {**data, "alarm_type": "Over speed", "road_name": road_name}
                         await self.server.broadcast_alarm(device.id, speed_alarm_data, location_id=location.id)
 
@@ -640,9 +685,7 @@ class GPSTrackerConnection:
                     # own alarm_type above, so this can only add *additional*
                     # geofence transitions to broadcast — it never overwrites
                     # a real device alarm on the stored row.
-                    geofence_transitions = _apply_geofence_transitions(
-                        db, device, location, data['longitude'], data['latitude']
-                    )
+                    geofence_transitions = _apply_geofence_transitions(db, device, location)
 
                     db.commit()
 

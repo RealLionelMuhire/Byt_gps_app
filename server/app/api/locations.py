@@ -1,5 +1,8 @@
 """Location API endpoints"""
 
+import asyncio
+import logging
+import time
 from typing import Dict, List, Optional, Tuple
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
@@ -7,6 +10,7 @@ from datetime import datetime, timedelta
 from pydantic import BaseModel
 from math import radians, degrees, cos, sin, asin, atan2, sqrt
 
+from app.core.config import settings
 from app.core.database import get_db
 from app.core.auth import get_current_user, require_device_access
 from app.models.location import Location
@@ -14,9 +18,15 @@ from app.models.location_quality_log import LocationQualityLog
 from app.models.device import Device
 from app.models.user import User, Role
 from app.services.trip_settings_service import get_or_create_trip_settings
-from app.services.geocoding import reverse_geocode_many, reverse_geocode_many_cached_only
+from app.services.geocoding import (
+    format_fallback_location,
+    reverse_geocode,
+    reverse_geocode_many,
+    reverse_geocode_many_cached_only,
+)
 
 router = APIRouter()
+logger = logging.getLogger(__name__)
 
 
 def haversine_km(lon1: float, lat1: float, lon2: float, lat2: float) -> float:
@@ -1299,10 +1309,94 @@ async def get_nearby_devices(
             })
     
     nearby.sort(key=lambda x: x['distance_km'])
-    
+
     return {
         "center": {"latitude": latitude, "longitude": longitude},
         "radius_km": radius_km,
         "devices_found": len(nearby),
         "devices": nearby
     }
+
+
+class LiveRoadNameResponse(BaseModel):
+    device_id: int
+    latitude: float
+    longitude: float
+    road_name: str
+    position_confirmed_at: Optional[datetime] = None
+
+
+# Same reasoning/shape as tcp_server.py's OVERSPEED_GEOCODE_TIMEOUT_SECONDS:
+# long enough to let a genuine Nominatim round trip finish (the HTTP
+# client's own timeout) plus a small buffer for cache-check/thread-dispatch
+# overhead, rather than truncating a real network call early.
+LIVE_ROAD_NAME_GEOCODE_TIMEOUT_SECONDS = settings.NOMINATIM_TIMEOUT_SECONDS + 1.0
+
+# Per-device floor between live road-name requests -- this is a read
+# endpoint a client is expected to poll every 30-60s while a vehicle is
+# selected and driving, not a device command, so it doesn't go through
+# CommandSettings/_enforce_command_policy at all. In-process only (reset on
+# restart, not shared across workers), same tradeoff as commands.py's own
+# _command_attempts rate limiter -- good enough to stop a misbehaving/too-
+# aggressive client from firing back-to-back live Nominatim calls for one
+# device, not a distributed guarantee.
+_LIVE_ROAD_NAME_MIN_INTERVAL_SECONDS = 20.0
+_last_road_name_request: Dict[int, float] = {}
+
+
+@router.get("/{device_id}/live_road_name", response_model=LiveRoadNameResponse)
+async def get_live_road_name(
+    device_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """
+    On-demand reverse-geocode of a device's current *confirmed* live
+    position (Device.last_latitude/last_longitude -- the same trusted
+    position the live map/status HUD shows, not a possibly-unconfirmed raw
+    Location row). Backs the Traq-IQ Flutter app's Monitoring screen, which
+    polls this while a vehicle is selected and driving to show the real
+    road name instead of a flat "Driving" label.
+
+    Deliberately duplicates (rather than shares) the cache-first/bounded-
+    Nominatim-fallback pattern app/tcp_server.py's _resolve_overspeed_road_
+    name uses: that function was only just fixed for a real production bug
+    (see its own doc/CLAUDE.md), so this endpoint intentionally doesn't
+    risk it by refactoring it into a shared helper right now. Never 500s on
+    a geocode failure -- falls back to a formatted "lat, lon" string, same
+    as the overspeed path.
+    """
+    device = verify_device_access(device_id, user, db)
+
+    if device.last_latitude is None or device.last_longitude is None:
+        raise HTTPException(status_code=404, detail="No live position for this device yet")
+
+    now = time.monotonic()
+    last_request = _last_road_name_request.get(device_id)
+    if last_request is not None and now - last_request < _LIVE_ROAD_NAME_MIN_INTERVAL_SECONDS:
+        raise HTTPException(
+            status_code=429,
+            detail=(
+                f"Please wait at least {_LIVE_ROAD_NAME_MIN_INTERVAL_SECONDS:.0f}s "
+                "between road-name requests for this device."
+            ),
+        )
+    _last_road_name_request[device_id] = now
+
+    try:
+        name = await asyncio.wait_for(
+            asyncio.to_thread(reverse_geocode, device.last_latitude, device.last_longitude),
+            timeout=LIVE_ROAD_NAME_GEOCODE_TIMEOUT_SECONDS,
+        )
+    except Exception as e:
+        logger.warning("Live road-name lookup failed/timed out for device %s: %s", device_id, e)
+        name = None
+    road_name = name or format_fallback_location(device.last_latitude, device.last_longitude)
+
+    return LiveRoadNameResponse(
+        device_id=device_id,
+        latitude=device.last_latitude,
+        longitude=device.last_longitude,
+        road_name=road_name,
+        position_confirmed_at=device.position_confirmed_at,
+    )

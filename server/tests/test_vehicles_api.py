@@ -223,6 +223,40 @@ def test_list_vehicles_admin_sees_all(client, db_session, current_clerk_id):
     assert "Owner Car" in nicknames
 
 
+def test_list_vehicles_admin_view_shows_the_real_owner_name(client, db_session, current_clerk_id):
+    """Regression: an admin's fleet-wide /api/vehicles used to carry no
+    owner info at all, under a section literally titled "Your vehicles" in
+    the app — every client's car looked like it belonged to the admin."""
+    owner = make_user(db_session, "clerk_owner", email="owner@example.com")
+    admin = make_user(db_session, "clerk_admin", role=Role.ADMIN)
+    device1 = make_device(db_session, owner, imei="111111111111111")
+    make_vehicle(db_session, owner, device1, nickname="Owner Car")
+
+    current_clerk_id["value"] = admin.clerk_user_id
+    resp = client.get("/api/vehicles")
+
+    assert resp.status_code == 200
+    vehicle = next(v for v in resp.json()["vehicles"] if v["nickname"] == "Owner Car")
+    assert vehicle["owner_name"] == "Test User"
+    assert vehicle["owner_email"] == "owner@example.com"
+
+
+def test_list_vehicles_owner_view_has_no_owner_name(client, db_session, current_clerk_id):
+    """A regular user's own vehicles don't bother looking up/returning
+    owner info — they're trivially the caller's own."""
+    owner = make_user(db_session, "clerk_owner")
+    device1 = make_device(db_session, owner, imei="111111111111111")
+    make_vehicle(db_session, owner, device1, nickname="Owner Car")
+
+    current_clerk_id["value"] = owner.clerk_user_id
+    resp = client.get("/api/vehicles")
+
+    assert resp.status_code == 200
+    vehicle = resp.json()["vehicles"][0]
+    assert vehicle["owner_name"] is None
+    assert vehicle["owner_email"] is None
+
+
 # ── POST /api/vehicles — ownership + admin-on-behalf-of ────────────────────
 
 def test_create_vehicle_rejects_device_not_owned_by_caller(client, db_session, current_clerk_id):

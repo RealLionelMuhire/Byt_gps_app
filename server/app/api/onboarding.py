@@ -805,7 +805,7 @@ async def get_admin_billing_summary(
 
 # ── Vehicle serialization (shared by list + update) ───────────────────────────
 
-def _serialize_vehicle(v: Vehicle) -> dict:
+def _serialize_vehicle(v: Vehicle, owner: Optional[User] = None) -> dict:
     device = v.device
     return {
         "id":        v.id,
@@ -822,6 +822,15 @@ def _serialize_vehicle(v: Vehicle) -> dict:
             "last_seen": device.last_update    if device else None,
         } if device else None,
         "created_at": v.created_at,
+        # The vehicle's real owner — None for a regular user's own request
+        # (list_vehicles doesn't bother looking it up there, since it's
+        # trivially themselves). Populated for an admin's request, where
+        # this endpoint returns every vehicle in the system: without this,
+        # every row here showed no owner at all under a section literally
+        # titled "Your vehicles" (AccountView), which for an admin reads as
+        # if the whole fleet belonged to them.
+        "owner_name":  (f"{owner.first_name} {owner.last_name}".strip() or owner.email) if owner else None,
+        "owner_email": owner.email if owner else None,
     }
 
 
@@ -838,11 +847,30 @@ async def list_vehicles(
     admin-sees-everything pattern GET /api/devices already uses.
     """
     query = db.query(Vehicle)
-    if user.role not in REQUIRE_ADMIN_ROLES:
+    is_admin = user.role in REQUIRE_ADMIN_ROLES
+    if not is_admin:
         query = query.filter(Vehicle.clerk_user_id == user.clerk_user_id)
 
     vehicles = query.all()
-    return {"vehicles": [_serialize_vehicle(v) for v in vehicles]}
+
+    # Only worth the batch-load for an admin's fleet-wide view — a regular
+    # user's own vehicles are trivially their own, no lookup needed (and
+    # _serialize_vehicle's owner_name/owner_email are simply left None for
+    # them, same as before this admin-owner fix).
+    owner_by_clerk_id = {}
+    if is_admin and vehicles:
+        clerk_ids = {v.clerk_user_id for v in vehicles}
+        owner_by_clerk_id = {
+            u.clerk_user_id: u
+            for u in db.query(User).filter(User.clerk_user_id.in_(clerk_ids)).all()
+        }
+
+    return {
+        "vehicles": [
+            _serialize_vehicle(v, owner_by_clerk_id.get(v.clerk_user_id))
+            for v in vehicles
+        ]
+    }
 
 
 # ── PUT /api/vehicles/{id}  — rename (nickname only) ──────────────────────────

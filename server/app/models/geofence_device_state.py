@@ -28,6 +28,11 @@ class GeofenceDeviceState(Base):
     device_id = Column(Integer, ForeignKey("devices.id", ondelete="CASCADE"), nullable=False, index=True)
     geofence_id = Column(Integer, ForeignKey("geofences.id", ondelete="CASCADE"), nullable=False, index=True)
     is_inside = Column(Boolean, nullable=False)
+    # A candidate is_inside flip awaiting a second, corroborating fix
+    # before it's committed to is_inside above and a transition fires
+    # (migration 040) — see evaluate_geofences. NULL when nothing is
+    # currently being held.
+    pending_is_inside = Column(Boolean, nullable=True)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
 
     device = relationship("Device")
