@@ -179,6 +179,16 @@ async def send_deposit(
     triggered automatically by anything in this codebase (admin-initiated
     only, see app/api/disbursements.py).
 
+    No `callbackurl` is sent (confirmed directly with the IntouchPay team,
+    2026-09-20): their production server only honors callbackurl for
+    request_payment, not requestdeposit, so including one on a deposit
+    would have been silently ignored anyway. This means a deposit is NEVER
+    confirmed via app/api/webhooks.py's intouchpay_webhook — only the
+    synchronous response below and scripts/cron_expiry.py's
+    reconcile_pending_disbursements() (polling get_transaction_status) ever
+    resolve a Disbursement's final status. _handle_disbursement_callback
+    is kept only as a defensive no-op path in case that ever changes.
+
     `transaction_id` is OUR reference (requesttransactionid) — same
     global-uniqueness requirement as request_payment's.
 
@@ -199,9 +209,10 @@ async def send_deposit(
     request_payment()/get_transaction_status()/get_balance(). The docs'
     worked example shows an immediate "Successfull"/2001 response (unlike
     request_payment's always-pending acknowledgment), but callers must still
-    treat this as unconfirmed and reconcile via get_transaction_status or
-    the webhook callback — nothing here guarantees IntouchPay never responds
-    with a genuinely pending state instead.
+    treat this as unconfirmed and reconcile via get_transaction_status —
+    there is no webhook callback for a deposit (see the no-callbackurl note
+    above) — nothing here guarantees IntouchPay never responds with a
+    genuinely pending state instead.
     """
     if amount < MINIMUM_DEPOSIT_AMOUNT:
         raise InvalidDepositAmountError(
@@ -213,7 +224,6 @@ async def send_deposit(
         "amount": amount,
         "mobilephone": phone,
         "requesttransactionid": transaction_id,
-        "callbackurl": settings.INTOUCH_CALLBACK_URL,
         "reason": reason,
         "withdrawcharge": withdrawcharge,
         "sid": sid,

@@ -163,6 +163,10 @@ async def test_send_deposit_posts_expected_fields_to_sandbox_url(monkeypatch):
     assert body["reason"] == "Refund"
     assert body["withdrawcharge"] == 1
     assert body["sid"] == 1
+    # IntouchPay confirmed 2026-09-20 their production server only honors
+    # callbackurl for request_payment, never requestdeposit — sending one
+    # here would be silently ignored, so it must never be included.
+    assert "callbackurl" not in body
 
 
 async def test_send_deposit_uses_production_url_when_not_sandbox(monkeypatch):

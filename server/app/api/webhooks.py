@@ -281,6 +281,15 @@ async def _handle_disbursement_callback(
     already recognizes "2001" (deposit success) alongside "01" (payment
     success). No email side effect yet — there's no "you received a payout"
     template in app/services/email.py; add one if that's ever needed.
+
+    DEAD IN PRACTICE (kept as a defensive no-op): IntouchPay confirmed
+    2026-09-20 that their production server only calls back for
+    request_payment, never requestdeposit, and send_deposit() (see
+    app/services/intouchpay.py) no longer even sends a callbackurl on a
+    deposit. So this function should never actually be reached for a real
+    Disbursement row — the synchronous send_deposit() response and
+    scripts/cron_expiry.py's reconcile_pending_disbursements() (polling
+    get_transaction_status) are the only paths that ever resolve one.
     """
     if disbursement.status != "pending":
         logger.info(
