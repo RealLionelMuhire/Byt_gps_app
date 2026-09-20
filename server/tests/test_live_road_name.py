@@ -1,7 +1,7 @@
 """
 Tests for GET /api/locations/{device_id}/live_road_name (app/api/locations.py)
 — an on-demand reverse-geocode of a device's current confirmed live position
-(Device.last_latitude/last_longitude), backing the Traq-IQ Flutter app's
+(Device.last_latitude/last_longitude), backing the Track IQ Flutter app's
 Monitoring screen "Driving: <road name>" status box.
 
 Uses the `db_session`/`client`/`current_clerk_id` fixtures from conftest.py

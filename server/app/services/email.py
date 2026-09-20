@@ -105,7 +105,7 @@ async def send_payment_receipt_email(user: User, payment: Payment, plan_name: st
         to_name=_user_display_name(user),
         template_id=settings.EMAILJS_TEMPLATE_ID_RECEIPT,
         template_params={
-            "subject": "Payment received — Traq-IQ",
+            "subject": "Payment received — Track IQ",
             "plan_name": plan_name,
             "amount": f"{payment.amount:.0f}",
             "currency": payment.currency,
@@ -124,7 +124,7 @@ async def send_subscription_expiring_email(
         to_name=_user_display_name(user),
         template_id=settings.EMAILJS_TEMPLATE_ID_EXPIRING,
         template_params={
-            "subject": "Your Traq-IQ plan is about to expire",
+            "subject": "Your Track IQ plan is about to expire",
             "plan_name": plan_name,
             "days_left": str(days_left),
             "expires_at": subscription.expires_at.isoformat(),
@@ -140,7 +140,7 @@ async def send_subscription_expired_email(user: User, plan_name: str) -> bool:
         to_name=_user_display_name(user),
         template_id=settings.EMAILJS_TEMPLATE_ID_EXPIRED,
         template_params={
-            "subject": "Your Traq-IQ plan has expired",
+            "subject": "Your Track IQ plan has expired",
             "plan_name": plan_name,
             "message": f"Your {plan_name} plan has expired. Renew to keep tracking your vehicles.",
         },
@@ -155,7 +155,7 @@ async def send_payment_failed_email(user: User, payment: Payment) -> bool:
         to_name=_user_display_name(user),
         template_id=settings.EMAILJS_TEMPLATE_ID_PAYMENT_FAILED,
         template_params={
-            "subject": "Your Traq-IQ payment could not be completed",
+            "subject": "Your Track IQ payment could not be completed",
             "amount": f"{payment.amount:.0f}",
             "currency": payment.currency,
             "tx_ref": payment.tx_ref,

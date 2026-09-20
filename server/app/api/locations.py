@@ -1354,7 +1354,7 @@ async def get_live_road_name(
     On-demand reverse-geocode of a device's current *confirmed* live
     position (Device.last_latitude/last_longitude -- the same trusted
     position the live map/status HUD shows, not a possibly-unconfirmed raw
-    Location row). Backs the Traq-IQ Flutter app's Monitoring screen, which
+    Location row). Backs the Track IQ Flutter app's Monitoring screen, which
     polls this while a vehicle is selected and driving to show the real
     road name instead of a flat "Driving" label.
 
