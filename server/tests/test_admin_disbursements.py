@@ -1,12 +1,14 @@
 """
 Route-level tests for the admin disbursement API (app/api/disbursements.py)
 — POST/GET /api/admin/disbursements, wrapping app/services/intouchpay.py's
-send_deposit(). intouch send_deposit is monkeypatched at the module level it
-was imported under (app.api.disbursements.send_deposit) so these tests
-never make a real IntouchPay call.
+send_deposit()/get_balance(). Both are monkeypatched at the module level
+they were imported under (app.api.disbursements.send_deposit/get_balance)
+so these tests never make a real IntouchPay call.
 
 Uses the `client`/`db_session`/`current_clerk_id` fixtures from conftest.py.
 """
+
+import pytest
 
 from datetime import datetime
 
@@ -15,6 +17,16 @@ from app.models.user import User, Role
 from app.models.subscription import Payment, SubscriptionPlan
 from app.models.disbursement import Disbursement
 from app.services.intouchpay import IntouchPayError, InvalidDepositAmountError
+
+
+@pytest.fixture(autouse=True)
+def _sufficient_balance(monkeypatch):
+    """A large default balance so every test below reaches send_deposit()
+    unless it explicitly overrides this to test the pre-flight check
+    itself."""
+    async def fake_get_balance():
+        return {"balance": "1000000.00", "success": True}
+    monkeypatch.setattr(disbursements_module, "get_balance", fake_get_balance)
 
 
 def make_user(db, clerk_id, role=Role.USER, email=None):
@@ -237,3 +249,76 @@ def test_list_disbursements_non_admin_forbidden(client, db_session, current_cler
 
     resp = client.get("/api/admin/disbursements")
     assert resp.status_code == 403
+
+
+# ── Pre-flight balance check ─────────────────────────────────────────────────
+
+def test_create_disbursement_blocked_when_balance_insufficient(client, db_session, current_clerk_id, monkeypatch):
+    admin = make_user(db_session, "clerk_admin", role=Role.ADMIN)
+    target = make_user(db_session, "clerk_target")
+    as_admin(current_clerk_id, admin)
+
+    async def low_balance():
+        return {"balance": "500.00", "success": True}
+    monkeypatch.setattr(disbursements_module, "get_balance", low_balance)
+
+    send_deposit_calls = []
+    async def fake_send_deposit(**kwargs):
+        send_deposit_calls.append(kwargs)
+        return {"success": True, "responsecode": "2001"}
+    monkeypatch.setattr(disbursements_module, "send_deposit", fake_send_deposit)
+
+    resp = client.post("/api/admin/disbursements", json={
+        "user_id": target.id, "phone": "250781234567", "amount": 1000, "reason": "Refund",
+    })
+
+    assert resp.status_code == 400
+    assert "Insufficient" in resp.json()["detail"]
+    assert send_deposit_calls == []  # never reached IntouchPay's requestdeposit
+
+    row = db_session.query(Disbursement).filter(Disbursement.clerk_user_id == target.clerk_user_id).one()
+    assert row.status == "failed"
+
+
+def test_create_disbursement_proceeds_when_balance_check_unavailable(client, db_session, current_clerk_id, monkeypatch):
+    """If get_balance() itself fails, the pre-check is skipped (fail open)
+    rather than blocking a legitimate disbursement attempt."""
+    admin = make_user(db_session, "clerk_admin", role=Role.ADMIN)
+    target = make_user(db_session, "clerk_target")
+    as_admin(current_clerk_id, admin)
+
+    async def failing_balance():
+        raise IntouchPayError("connection refused")
+    monkeypatch.setattr(disbursements_module, "get_balance", failing_balance)
+
+    async def fake_send_deposit(**kwargs):
+        return {"success": True, "responsecode": "2001", "transactionid": "PROV-BAL"}
+    monkeypatch.setattr(disbursements_module, "send_deposit", fake_send_deposit)
+
+    resp = client.post("/api/admin/disbursements", json={
+        "user_id": target.id, "phone": "250781234567", "amount": 1000, "reason": "Refund",
+    })
+
+    assert resp.status_code == 201
+    assert resp.json()["status"] == "successful"
+
+
+def test_create_disbursement_proceeds_when_balance_exactly_sufficient(client, db_session, current_clerk_id, monkeypatch):
+    admin = make_user(db_session, "clerk_admin", role=Role.ADMIN)
+    target = make_user(db_session, "clerk_target")
+    as_admin(current_clerk_id, admin)
+
+    async def exact_balance():
+        return {"balance": "1000.00", "success": True}
+    monkeypatch.setattr(disbursements_module, "get_balance", exact_balance)
+
+    async def fake_send_deposit(**kwargs):
+        return {"success": True, "responsecode": "2001"}
+    monkeypatch.setattr(disbursements_module, "send_deposit", fake_send_deposit)
+
+    resp = client.post("/api/admin/disbursements", json={
+        "user_id": target.id, "phone": "250781234567", "amount": 1000, "reason": "Refund",
+    })
+
+    assert resp.status_code == 201
+    assert resp.json()["status"] == "successful"

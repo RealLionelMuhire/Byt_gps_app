@@ -28,6 +28,7 @@ from app.models.subscription import Payment
 from app.models.user import User
 from app.services.intouchpay import (
     send_deposit,
+    get_balance,
     IntouchPayError,
     InvalidDepositAmountError,
     RESPONSECODE_DEPOSIT_SUCCESSFUL,
@@ -106,6 +107,16 @@ async def create_disbursement(
     never leave zero record that the attempt happened. The row is then
     updated in place once the call returns (or left "pending" if IntouchPay
     is unreachable, for scripts/cron_expiry.py-style reconciliation).
+
+    After the row is created, a best-effort GET balance pre-check runs
+    before send_deposit() — if the account's known balance is below the
+    requested amount, the row is marked "failed" immediately and this
+    returns 400 without ever calling IntouchPay's requestdeposit, matching
+    their own documented recommendation. If the balance itself can't be
+    determined (IntouchPay unreachable, malformed response), the check is
+    skipped rather than blocking a legitimate attempt — send_deposit()'s
+    own handling of IntouchPay's 1108 Insufficient Account Balance
+    rejection is the fallback in that case.
     """
     user = db.query(User).filter(User.id == body.user_id).first()
     if not user:
@@ -152,6 +163,38 @@ async def create_disbursement(
         db.rollback()
         logger.error("DB error creating disbursement tx_ref=%s: %s", tx_ref, exc)
         raise HTTPException(status_code=500, detail="Database error")
+
+    # Pre-flight balance check (per IntouchPay's own docs: "Check your
+    # account balance with Get Balance before initiating bulk disbursements
+    # to avoid insufficient-funds failures mid-batch"). Best-effort only —
+    # if the balance itself can't be determined, don't block a legitimate
+    # disbursement attempt on it; send_deposit() below still has its own
+    # handling for IntouchPay's own 1108 Insufficient Account Balance
+    # rejection, so failing open here never risks an unchecked payout.
+    available_balance: Optional[float] = None
+    try:
+        balance_resp = await get_balance()
+        raw_balance = balance_resp.get("balance")
+        available_balance = float(raw_balance) if raw_balance is not None else None
+    except (IntouchPayError, TypeError, ValueError) as exc:
+        logger.warning(
+            "Could not verify IntouchPay balance before disbursement tx_ref=%s: %s", tx_ref, exc
+        )
+
+    if available_balance is not None and available_balance < body.amount:
+        disbursement.status = "failed"
+        db.commit()
+        logger.warning(
+            "Disbursement blocked pre-flight (insufficient balance): tx_ref=%s requested=%s available=%s",
+            tx_ref, body.amount, available_balance,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Insufficient IntouchPay balance: available {available_balance:.0f} RWF, "
+                f"requested {body.amount:.0f} RWF"
+            ),
+        )
 
     try:
         resp = await send_deposit(
