@@ -6,6 +6,7 @@ exposes a command to push a zone definition to it.
 """
 
 import logging
+from datetime import datetime, timedelta, timezone
 from typing import List, Literal, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -15,10 +16,11 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from app.core.database import get_db
-from app.core.auth import get_current_user
+from app.core.auth import get_current_user, require_device_access
 from app.models.device import Device
 from app.models.geofence import Geofence
 from app.models.geofence_device import GeofenceDevice
+from app.models.geofence_version import GeofenceVersion
 from app.models.user import User
 
 logger = logging.getLogger(__name__)
@@ -27,6 +29,9 @@ router = APIRouter()
 MIN_RADIUS_METERS = 10
 MAX_RADIUS_METERS = 50_000  # 50km — a generous ceiling for a single circle zone
 MIN_POLYGON_POINTS = 3
+# Same ceiling as locations.py's period-route MAX_PERIOD_DAYS — history is
+# only ever requested for a period Historical Routes can itself display.
+MAX_HISTORY_DAYS = 30
 
 
 # --- Field-level validation, shared between create (required fields) and
@@ -186,6 +191,25 @@ class GeofenceResponse(BaseModel):
         from_attributes = True
 
 
+class GeofenceActivePeriod(BaseModel):
+    # Real (unclipped) bounds, so the client can label "active since 22 Jun
+    # 14:00" even when that's before the requested range. active_to None =
+    # still active now.
+    active_from: datetime
+    active_to: Optional[datetime] = None
+
+
+class GeofenceHistoryEntry(BaseModel):
+    geofence_id: int
+    name: str
+    shape_type: str
+    center_latitude: Optional[float] = None
+    center_longitude: Optional[float] = None
+    radius_meters: Optional[float] = None
+    points: Optional[List[PointOut]] = None
+    periods: List[GeofenceActivePeriod]
+
+
 # --- Helpers ---
 
 
@@ -249,6 +273,115 @@ def _set_device_links(geofence: Geofence, device_ids: List[int], db: Session) ->
         db.add(GeofenceDevice(geofence_id=geofence.id, device_id=device_id))
 
 
+def _utcnow() -> datetime:
+    """Naive UTC, matching every other timestamp column in this schema."""
+    return datetime.utcnow()
+
+
+def _to_naive_utc(value: datetime) -> datetime:
+    if value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
+
+
+_VERSIONED_FIELDS = (
+    "name", "shape_type", "center_latitude", "center_longitude",
+    "radius_meters", "points", "device_ids", "is_active",
+)
+
+
+def _version_snapshot(response: "GeofenceResponse") -> dict:
+    """The subset of a geofence's state that Historical Routes draws.
+    Description and alert_on_enter/exit are deliberately excluded — they
+    don't change what's on the map, so editing them shouldn't split
+    history into a new version."""
+    return dict(
+        name=response.name,
+        shape_type=response.shape_type,
+        center_latitude=response.center_latitude,
+        center_longitude=response.center_longitude,
+        radius_meters=response.radius_meters,
+        points=[p.model_dump() for p in response.points] if response.points is not None else None,
+        device_ids=sorted(response.device_ids),
+        is_active=response.is_active,
+    )
+
+
+def _open_version(geofence_id: int, db: Session) -> Optional[GeofenceVersion]:
+    return (
+        db.query(GeofenceVersion)
+        .filter(GeofenceVersion.geofence_id == geofence_id, GeofenceVersion.valid_to.is_(None))
+        .order_by(GeofenceVersion.valid_from.desc())
+        .first()
+    )
+
+
+def _record_version(geofence: Geofence, response: "GeofenceResponse", db: Session) -> None:
+    """Close the geofence's current version and open a new one, unless
+    nothing Historical Routes cares about changed. Call inside the same
+    transaction as the geofence write itself, so the two can't diverge."""
+    snapshot = _version_snapshot(response)
+    current = _open_version(geofence.id, db)
+    if current is not None:
+        if all(getattr(current, f) == snapshot[f] for f in _VERSIONED_FIELDS):
+            return
+        now = _utcnow()
+        current.valid_to = now
+    else:
+        now = _utcnow()
+    db.add(GeofenceVersion(geofence_id=geofence.id, user_id=geofence.user_id, valid_from=now, **snapshot))
+
+
+def _close_version(geofence: Geofence, db: Session) -> None:
+    current = _open_version(geofence.id, db)
+    if current is not None:
+        current.valid_to = _utcnow()
+
+
+def _merge_history(versions: List[GeofenceVersion], device_id: int) -> List[GeofenceHistoryEntry]:
+    """Group the active, device-scoped versions of each geofence by shape,
+    merging back-to-back windows (e.g. a device reassignment that kept this
+    device, or a rename) into one period, so an unchanged zone is drawn
+    once rather than once per version. Name is the latest one in range."""
+    entries: dict = {}
+    for v in sorted(versions, key=lambda v: v.valid_from):
+        if not v.is_active or device_id not in (v.device_ids or []):
+            continue
+        shape_key = (
+            v.geofence_id, v.shape_type, v.center_latitude, v.center_longitude,
+            v.radius_meters, repr(v.points),
+        )
+        entry = entries.get(shape_key)
+        if entry is None:
+            entries[shape_key] = entry = dict(
+                geofence_id=v.geofence_id,
+                name=v.name,
+                shape_type=v.shape_type,
+                center_latitude=v.center_latitude,
+                center_longitude=v.center_longitude,
+                radius_meters=v.radius_meters,
+                points=v.points,
+                periods=[],
+            )
+        entry["name"] = v.name
+        periods = entry["periods"]
+        if periods and periods[-1]["active_to"] == v.valid_from:
+            periods[-1]["active_to"] = v.valid_to
+        else:
+            periods.append(dict(active_from=v.valid_from, active_to=v.valid_to))
+
+    def aware(value: Optional[datetime]) -> Optional[datetime]:
+        # Stored naive-UTC; serialized with an explicit offset so clients
+        # don't have to guess.
+        return value.replace(tzinfo=timezone.utc) if value is not None else None
+
+    for e in entries.values():
+        e["periods"] = [
+            dict(active_from=aware(p["active_from"]), active_to=aware(p["active_to"])) for p in e["periods"]
+        ]
+    return [GeofenceHistoryEntry(**e) for e in entries.values()]
+
+
 def _serialize(geofence: Geofence, db: Session) -> GeofenceResponse:
     """Build the response, returning only the fields relevant to this row's
     shape_type rather than both shapes' fields populated meaninglessly."""
@@ -305,9 +438,11 @@ async def create_geofence(
     db.add(geofence)
     db.flush()  # assigns geofence.id, needed by the device links below, before the single commit
     _set_device_links(geofence, body.device_ids, db)
+    db.flush()
+    response = _serialize(geofence, db)
+    _record_version(geofence, response, db)
     db.commit()
-    db.refresh(geofence)
-    return _serialize(geofence, db)
+    return response
 
 
 @router.get("", response_model=List[GeofenceResponse])
@@ -321,6 +456,54 @@ async def list_geofences(
         query = query.filter(Geofence.is_active == is_active)
     geofences = query.order_by(Geofence.created_at.desc()).all()
     return [_serialize(g, db) for g in geofences]
+
+
+# Declared before /{geofence_id} so "history" isn't parsed as an id.
+@router.get("/history", response_model=List[GeofenceHistoryEntry])
+async def get_geofence_history(
+    device_id: int = Query(...),
+    start: datetime = Query(..., description="Period start (UTC)"),
+    end: datetime = Query(..., description="Period end (UTC)"),
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """
+    Geofences that were active AND assigned to `device_id` at any point in
+    [start, end], with the exact windows they were in effect — for drawing
+    zones on a Historical Routes map. A zone created after `end`, or only
+    active before `start`, is excluded; a zone disabled or deleted mid-period
+    is included with its window ending at that moment. Scoped to the
+    device's owner's zones, so an admin viewing someone's device sees that
+    owner's zones, not their own.
+    """
+    start = _to_naive_utc(start)
+    end = _to_naive_utc(end)
+    if end <= start:
+        raise HTTPException(status_code=400, detail="end must be after start")
+    if (end - start) > timedelta(days=MAX_HISTORY_DAYS):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Period exceeds max of {MAX_HISTORY_DAYS} days; narrow the start/end range.",
+        )
+
+    device = db.query(Device).filter(Device.id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    require_device_access(device, user)
+
+    # Only versions overlapping [start, end]. device_ids is filtered in
+    # Python (JSON containment isn't portable across Postgres/SQLite, and a
+    # user's version count is small).
+    versions = (
+        db.query(GeofenceVersion)
+        .filter(
+            GeofenceVersion.user_id == device.user_id,
+            GeofenceVersion.valid_from < end,
+            (GeofenceVersion.valid_to.is_(None)) | (GeofenceVersion.valid_to > start),
+        )
+        .all()
+    )
+    return _merge_history(versions, device.id)
 
 
 @router.get("/{geofence_id}", response_model=GeofenceResponse)
@@ -391,9 +574,11 @@ async def update_geofence(
         setattr(geofence, field, value)
     if body.device_ids is not None:
         _set_device_links(geofence, body.device_ids, db)
+    db.flush()
+    response = _serialize(geofence, db)
+    _record_version(geofence, response, db)
     db.commit()
-    db.refresh(geofence)
-    return _serialize(geofence, db)
+    return response
 
 
 @router.delete("/{geofence_id}", status_code=204)
@@ -403,5 +588,6 @@ async def delete_geofence(
     user: User = Depends(get_current_user),
 ):
     geofence = _get_owned_geofence(geofence_id, user, db)
+    _close_version(geofence, db)
     db.delete(geofence)
     db.commit()
