@@ -141,6 +141,22 @@ def _apply_geofence_transitions(
     return transitions
 
 
+# The GT06 protocol's own fence alarm bytes (0x04/0x05, see
+# app/protocol_parser.py's alarm_names). Neither supported device model can
+# have a zone pushed to it (see app/services/geofencing.py), so these never
+# mean "crossed one of the owner's geofences" — confirmed against production
+# data 2026-09-22: device 1 reported 58 hardware "Enter fence" vs 2 "Exit
+# fence" since 2026-09-01, almost all while parked for hours and minutes
+# before it started moving (or just after parking), at arbitrary locations
+# inside and outside any configured zone — some undocumented firmware
+# parking/ignition event, not a zone crossing. Surfacing them as "Enter
+# fence" alerts told owners a vehicle already parked inside a zone had just
+# entered it. Real geofence alerts come only from evaluate_geofences (which
+# always carries geofence_name), so handle_alarm stores these as plain
+# position fixes instead of alarms.
+HARDWARE_FENCE_ALARM_TYPES = frozenset({"Enter fence", "Exit fence"})
+
+
 async def _broadcast_geofence_transitions(
     server: 'TCPServer', device_id: int, data: Dict, transitions: List[GeofenceTransition],
     location_id: Optional[int] = None,
@@ -630,8 +646,17 @@ class GPSTrackerConnection:
                 return
             
             alarm_type = data.get('alarm_type', 'Unknown')
-            logger.warning(f"ALARM from {self.device_imei}: {alarm_type} "
-                          f"at ({data['latitude']:.6f}, {data['longitude']:.6f})")
+            # See HARDWARE_FENCE_ALARM_TYPES: kept as a position fix (it's
+            # still a real GPS report, and still runs through server-side
+            # geofence evaluation below), never surfaced as an alarm.
+            is_real_alarm = alarm_type not in HARDWARE_FENCE_ALARM_TYPES
+            if is_real_alarm:
+                logger.warning(f"ALARM from {self.device_imei}: {alarm_type} "
+                              f"at ({data['latitude']:.6f}, {data['longitude']:.6f})")
+            else:
+                logger.info(f"Ignoring hardware '{alarm_type}' alarm from {self.device_imei} "
+                            f"at ({data['latitude']:.6f}, {data['longitude']:.6f}) — "
+                            f"not a server-side geofence crossing")
             
             # Store alarm as location with alarm flag
             db = SessionLocal()
@@ -653,8 +678,8 @@ class GPSTrackerConnection:
                         satellites=data['satellites'],
                         gps_valid=data['gps_valid'],
                         timestamp=data['timestamp'],
-                        is_alarm=True,
-                        alarm_type=alarm_type,
+                        is_alarm=is_real_alarm,
+                        alarm_type=alarm_type if is_real_alarm else None,
                         is_outlier=is_outlier
                     )
                     db.add(location)
@@ -681,16 +706,20 @@ class GPSTrackerConnection:
                     device.pending_since = None
                     device.last_update = datetime.utcnow()
 
-                    # location.is_alarm is already True with the hardware's
-                    # own alarm_type above, so this can only add *additional*
-                    # geofence transitions to broadcast — it never overwrites
-                    # a real device alarm on the stored row.
+                    # For a real hardware alarm, location.is_alarm is already
+                    # True with its own alarm_type above, so this can only
+                    # add *additional* geofence transitions to broadcast — it
+                    # never overwrites a real device alarm on the stored row.
+                    # For an ignored hardware fence byte the row is a plain
+                    # fix, so a genuine server-side transition is recorded on
+                    # it exactly as handle_location would.
                     geofence_transitions = _apply_geofence_transitions(db, device, location)
 
                     db.commit()
 
                     # Broadcast alarm to WebSocket clients
-                    await self.server.broadcast_alarm(device.id, data, location_id=location.id)
+                    if is_real_alarm:
+                        await self.server.broadcast_alarm(device.id, data, location_id=location.id)
                     await _broadcast_geofence_transitions(self.server, device.id, data, geofence_transitions, location_id=location.id)
             
             finally:
