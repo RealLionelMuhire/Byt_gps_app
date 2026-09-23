@@ -82,3 +82,8 @@ class Payment(Base):
     currency = Column(String(10), default="RWF")
     status = Column(String(20), nullable=False)
     verified_at = Column(DateTime, default=datetime.utcnow)
+    # Set once this payment has activated a subscription (migration 046) —
+    # a consumed payment can never fund another one. Claimed atomically by
+    # app/api/onboarding.py's _claim_payment.
+    consumed_at = Column(DateTime, nullable=True)
+    subscription_id = Column(Integer, ForeignKey("subscriptions.id"), nullable=True)

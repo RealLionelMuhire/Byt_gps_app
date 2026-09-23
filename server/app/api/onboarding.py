@@ -84,6 +84,32 @@ def _get_active_subscription(db: Session, clerk_user_id: str) -> Optional[Subscr
     )
 
 
+def _claim_payment(db: Session, payment: Payment, subscription: Subscription) -> bool:
+    """Atomically mark `payment` as consumed by `subscription` (migration
+    046). Returns False if it was already consumed — including by a
+    concurrent request that won the race, which is why this is a
+    conditional UPDATE (`WHERE consumed_at IS NULL`, checked via rowcount)
+    rather than a read-then-write: on Postgres the second request blocks on
+    the row lock, then re-evaluates the condition and matches nothing.
+
+    `subscription` must already be flushed (it needs an id). Before this
+    existed, nothing recorded that a payment had been used, so one payment
+    could fund any number of subscriptions — see the migration's header.
+    """
+    claimed = (
+        db.query(Payment)
+        .filter(Payment.id == payment.id, Payment.consumed_at.is_(None))
+        .update(
+            {Payment.consumed_at: datetime.utcnow(), Payment.subscription_id: subscription.id},
+            synchronize_session=False,
+        )
+    )
+    return claimed == 1
+
+
+PAYMENT_ALREADY_USED = "This payment has already been used to activate a plan."
+
+
 def _cancel_active_subscription(db: Session, clerk_user_id: str) -> Optional[Subscription]:
     """Shared cancellation logic — the one code path behind both the
     self-service (POST /api/subscriptions/cancel) and admin
@@ -530,6 +556,19 @@ async def initiate_payment(
         logger.error("No subscription_plans row for purchasable planId=%s — has migration 041 run?", body.planId)
         raise HTTPException(status_code=500, detail="This plan isn't fully set up yet. Please try again later.")
 
+    # Activation refuses a paid switch to the plan the user is already
+    # actively on ("Already on this plan"), so charging for it here would
+    # take the customer's money for nothing. Refuse before any money moves.
+    active_sub = _get_active_subscription(db, clerk_user_id)
+    if active_sub and active_sub.plan_id == plan.id:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"You're already on this plan until {active_sub.expires_at:%b %d, %Y}. "
+                "You can renew it once it expires, or choose a different plan."
+            ),
+        )
+
     phone = body.phone.strip()
     if not phone:
         raise HTTPException(status_code=400, detail="phone is required")
@@ -679,12 +718,20 @@ async def create_subscription(
     # Postpaid plans are the exception: they are invoiced AFTER the period,
     # so activation is flagged here (logged, no Payment row required)
     # instead of rejected.
+    #
+    # Only an UNCONSUMED payment counts (migration 046) — otherwise the
+    # payment behind an already-expired subscription would activate a new
+    # period for free, forever. Still 402 (the app's "payment pending, keep
+    # polling" signal) when none exists, since that's also the normal state
+    # while a just-initiated payment awaits confirmation.
+    payment = None
     if body.planId != "trial" and not is_postpaid:
         payment = db.query(Payment).filter(
             Payment.clerk_user_id == clerk_user_id,
             Payment.plan_id == plan.id,
             Payment.status == "successful",
-        ).first()
+            Payment.consumed_at.is_(None),
+        ).order_by(Payment.verified_at.asc()).first()
         if not payment:
             raise HTTPException(
                 status_code=402,
@@ -703,6 +750,10 @@ async def create_subscription(
             expires_at=expires_at,
         )
         db.add(subscription)
+        db.flush()  # assigns subscription.id for the payment link below
+        if payment is not None and not _claim_payment(db, payment, subscription):
+            db.rollback()
+            raise HTTPException(status_code=409, detail=PAYMENT_ALREADY_USED)
 
         # Finalise onboarding on the user record
         user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
@@ -760,6 +811,13 @@ async def upgrade_subscription(
     # 1. Confirm payment record exists and is successful — skipped for
     #    postpaid target plans (invoiced after the period; there is no
     #    upfront payment to verify).
+    #
+    #    The payment must also be for THIS plan and not already used
+    #    (migration 046) — previously any successful payment by the caller
+    #    was accepted, so a cheap plan's payment could buy an expensive one,
+    #    and the same txRef could fund upgrade after upgrade. Those are 409s,
+    #    not 402s: 402 is the app's "still pending, keep polling" signal.
+    payment = None
     if not is_postpaid:
         payment = db.query(Payment).filter(
             Payment.tx_ref == body.txRef,
@@ -769,6 +827,31 @@ async def upgrade_subscription(
 
         if not payment:
             raise HTTPException(status_code=402, detail="Payment not verified or not found")
+
+        if payment.consumed_at is not None:
+            # A retry of an activation that already succeeded (e.g. the
+            # response was lost to a dropped connection) gets the same
+            # result back, not an error.
+            funded = (
+                db.query(Subscription)
+                .filter(
+                    Subscription.id == payment.subscription_id,
+                    Subscription.clerk_user_id == clerk_user_id,
+                    Subscription.plan_id == plan.id,
+                )
+                .first()
+                if payment.subscription_id is not None
+                else None
+            )
+            if funded is not None:
+                return SubscriptionResponse(subscriptionId=funded.id, expiresAt=funded.expires_at)
+            raise HTTPException(status_code=409, detail=PAYMENT_ALREADY_USED)
+
+        if payment.plan_id != plan.id:
+            raise HTTPException(
+                status_code=409,
+                detail="This payment was made for a different plan. Pay for the plan you want to switch to.",
+            )
 
     # 2. Confirm upgrade (different plan slug — the mobile app controls
     # pricing-tier ordering, the backend just ensures they're not re-buying
@@ -807,6 +890,10 @@ async def upgrade_subscription(
             expires_at=expires_at,
         )
         db.add(new_sub)
+        db.flush()  # assigns new_sub.id for the payment link below
+        if payment is not None and not _claim_payment(db, payment, new_sub):
+            db.rollback()
+            raise HTTPException(status_code=409, detail=PAYMENT_ALREADY_USED)
 
         # Update user
         user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
