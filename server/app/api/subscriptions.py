@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 from app.core.database import get_db
 from app.core.serialization import UtcDateTime
 from app.core.auth import require_auth, require_admin
+from app.services.entitlements import seed_plan_features
 from app.models.subscription import SubscriptionPlan
 from app.models.user import User
 
@@ -288,6 +289,10 @@ async def create_subscription_plan(
         is_active=body.is_active,
     )
     db.add(plan)
+    db.flush()  # assigns plan.id for its default features
+    # Every catalog feature, until the admin plan builder exists — a new
+    # plan must not silently lack what every other plan has.
+    seed_plan_features(db, plan)
     db.commit()
     db.refresh(plan)
     logger.info("Created subscription plan %s (%s %s/%s %s)",

@@ -14,6 +14,7 @@ from app.core.auth import get_current_user, require_device_access
 from app.models.command_settings import CommandSettings
 from app.models.device import Device
 from app.models.user import User
+from app.services.entitlements import require_feature
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -209,7 +210,7 @@ def _get_tcp_server(request: Request):
     return tcp_server
 
 
-@router.post("/{device_id}/command")
+@router.post("/{device_id}/command", dependencies=[require_feature("commands.raw")])
 async def send_raw_command(
     device_id: int,
     body: CommandRequest,
@@ -266,7 +267,7 @@ async def send_raw_command(
 #     but there's no known way to configure them from this backend.)
 
 
-@router.post("/{device_id}/alarm/vibration")
+@router.post("/{device_id}/alarm/vibration", dependencies=[require_feature("commands.alarm_config")])
 async def toggle_vibration_alarm(
     device_id: int,
     body: VibrationAlarmRequest,
@@ -279,7 +280,7 @@ async def toggle_vibration_alarm(
     return await _send(device_id, cmd, "vibration alarm", request, db, user)
 
 
-@router.post("/{device_id}/alarm/power-cut")
+@router.post("/{device_id}/alarm/power-cut", dependencies=[require_feature("commands.alarm_config")])
 async def toggle_power_cut_alarm(
     device_id: int,
     body: PowerCutAlarmRequest,
@@ -300,7 +301,7 @@ async def toggle_power_cut_alarm(
     return await _send(device_id, cmd, "power cut alarm", request, db, user)
 
 
-@router.post("/{device_id}/alarm/ignition-on")
+@router.post("/{device_id}/alarm/ignition-on", dependencies=[require_feature("commands.alarm_config")])
 async def toggle_ignition_on_alarm(
     device_id: int,
     body: IgnitionAlarmRequest,
@@ -317,7 +318,7 @@ async def toggle_ignition_on_alarm(
     return await _send(device_id, cmd, "ignition-on alarm", request, db, user)
 
 
-@router.post("/{device_id}/alarm/ignition-off")
+@router.post("/{device_id}/alarm/ignition-off", dependencies=[require_feature("commands.alarm_config")])
 async def toggle_ignition_off_alarm(
     device_id: int,
     body: IgnitionAlarmRequest,
@@ -340,7 +341,7 @@ class FuelCutRequest(BaseModel):
         json_schema_extra = {"example": {"confirm": True}}
 
 
-@router.post("/{device_id}/fuel/cut")
+@router.post("/{device_id}/fuel/cut", dependencies=[require_feature("commands.fuel_cut")])
 async def cut_fuel(
     device_id: int,
     request: Request,
@@ -369,7 +370,7 @@ async def cut_fuel(
     return await _send(device_id, _CUT_FUEL_COMMAND, "cut fuel", request, db, user)
 
 
-@router.post("/{device_id}/fuel/restore")
+@router.post("/{device_id}/fuel/restore", dependencies=[require_feature("commands.fuel_cut")])
 async def restore_fuel(
     device_id: int,
     request: Request,
@@ -380,7 +381,7 @@ async def restore_fuel(
     return await _send(device_id, "RELAY,0#", "restore fuel", request, db, user)
 
 
-@router.post("/{device_id}/query/location")
+@router.post("/{device_id}/query/location", dependencies=[require_feature("commands.query")])
 async def query_location(
     device_id: int,
     request: Request,
@@ -391,7 +392,7 @@ async def query_location(
     return await _send(device_id, "WHERE#", "query location", request, db, user)
 
 
-@router.post("/{device_id}/query/status")
+@router.post("/{device_id}/query/status", dependencies=[require_feature("commands.query")])
 async def query_status(
     device_id: int,
     request: Request,

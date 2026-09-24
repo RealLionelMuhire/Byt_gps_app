@@ -51,7 +51,7 @@ from sqlalchemy.pool import StaticPool
 
 from app.core.database import Base, get_db
 from app.core.auth import require_auth
-from app.api import devices, onboarding, geofences, locations, disbursements
+from app.api import devices, onboarding, geofences, locations, disbursements, commands, trips, entitlements
 
 # Import every model module so all Base.metadata tables are registered —
 # relied on below by Base.metadata.create_all() with no `tables=` filter.
@@ -208,6 +208,10 @@ def client(db_session, current_clerk_id):
     app.include_router(geofences.router, prefix="/api/geofences")
     app.include_router(locations.router, prefix="/api/locations")
     app.include_router(disbursements.router, prefix="/api/admin/disbursements")
+    app.include_router(commands.router, prefix="/api/devices")
+    app.include_router(trips.router, prefix="/api/trips")
+    app.include_router(entitlements.me_router, prefix="/api/me")
+    app.include_router(entitlements.admin_router, prefix="/api/admin")
 
     def _override_get_db():
         yield db_session

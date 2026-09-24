@@ -26,6 +26,7 @@ from app.api.subscriptions import SubscriptionPlanResponse
 from app.core.config import settings
 from app.models.user import User, Role
 from app.services.plan_resolution import resolve_owner_plan
+from app.services.entitlements import require_feature
 from pydantic import BaseModel, field_validator, model_validator
 
 logger = logging.getLogger(__name__)
@@ -1075,7 +1076,7 @@ async def get_device_status(
     }
 
 
-@router.get("/{device_id}/diagnostics", response_model=DeviceDiagnosticsResponse)
+@router.get("/{device_id}/diagnostics", response_model=DeviceDiagnosticsResponse, dependencies=[require_feature("diagnostics")])
 async def get_device_diagnostics(
     device_id: int,
     samples: int = Query(20, ge=2, le=200, description="Number of recent location points to analyze"),
@@ -1222,7 +1223,7 @@ def _alert_settings_response(
     )
 
 
-@router.get("/{device_id}/alert_settings", response_model=AlertSettingsResponse)
+@router.get("/{device_id}/alert_settings", response_model=AlertSettingsResponse, dependencies=[require_feature("alerts.rules")])
 async def get_alert_settings(
     device_id: int,
     db: Session = Depends(get_db),
@@ -1239,7 +1240,7 @@ async def get_alert_settings(
     return _alert_settings_response(device_id, settings_row)
 
 
-@router.put("/{device_id}/alert_settings", response_model=AlertSettingsResponse)
+@router.put("/{device_id}/alert_settings", response_model=AlertSettingsResponse, dependencies=[require_feature("alerts.rules")])
 async def update_alert_settings(
     device_id: int,
     body: AlertSettingsUpdate,
@@ -1291,7 +1292,7 @@ class SpeedLimitUpdate(BaseModel):
         return v
 
 
-@router.get("/{device_id}/speed_limit", response_model=SpeedLimitResponse)
+@router.get("/{device_id}/speed_limit", response_model=SpeedLimitResponse, dependencies=[require_feature("alerts.overspeed")])
 async def get_speed_limit(
     device_id: int,
     db: Session = Depends(get_db),
@@ -1309,7 +1310,7 @@ async def get_speed_limit(
     return SpeedLimitResponse(device_id=device_id, speed_limit_kmh=device.speed_limit_kmh)
 
 
-@router.put("/{device_id}/speed_limit", response_model=SpeedLimitResponse)
+@router.put("/{device_id}/speed_limit", response_model=SpeedLimitResponse, dependencies=[require_feature("alerts.overspeed")])
 async def update_speed_limit(
     device_id: int,
     body: SpeedLimitUpdate,

@@ -34,6 +34,7 @@ from urllib.parse import quote
 from app.core.database import get_db
 from app.core.config import settings
 from app.core.auth import _verify_clerk_token
+from app.services.entitlements import seed_plan_features
 from app.models.device import Device
 from app.models.location import Location
 from app.models.user import User, Role
@@ -717,6 +718,10 @@ async def admin_create_plan(
         is_active=True,
     )
     db.add(plan)
+    db.flush()  # assigns plan.id for its default features
+    # Every catalog feature, until the admin plan builder exists — a new
+    # plan must not silently lack what every other plan has.
+    seed_plan_features(db, plan)
     db.commit()
     logger.info("Admin created subscription plan %s (%s %s / %s %s)",
                 plan.slug, plan.price, plan.currency, plan.duration_value, plan.duration_unit)

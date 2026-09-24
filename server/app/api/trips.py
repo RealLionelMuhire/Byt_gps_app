@@ -21,6 +21,7 @@ from app.api.locations import (
 from app.services.geocoding import build_trip_display_name
 from app.services.trip_detection import detect_trip_segments, SuggestedTrip
 from app.services.trip_settings_service import get_or_create_trip_settings
+from app.services.entitlements import require_feature
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -193,7 +194,7 @@ async def update_trip_settings(
     )
 
 
-@router.get("/suggested", response_model=List[SuggestedTripResponse])
+@router.get("/suggested", response_model=List[SuggestedTripResponse], dependencies=[require_feature("history.trips")])
 async def get_suggested_trips(
     device_id: int = Query(..., description="Device ID"),
     start_time: Optional[datetime] = Query(None, description="Start of time range (UTC)"),
@@ -233,7 +234,7 @@ async def get_suggested_trips(
     ]
 
 
-@router.post("/start", response_model=TripResponse, status_code=201)
+@router.post("/start", response_model=TripResponse, status_code=201, dependencies=[require_feature("history.trips")])
 async def start_trip(
     body: TripStartRequest,
     db: Session = Depends(get_db),
@@ -267,7 +268,7 @@ async def start_trip(
     return trip
 
 
-@router.post("", response_model=TripResponse, status_code=201)
+@router.post("", response_model=TripResponse, status_code=201, dependencies=[require_feature("history.trips")])
 async def create_trip(
     body: TripCreate,
     db: Session = Depends(get_db),
@@ -333,7 +334,7 @@ async def create_trip(
     return trip
 
 
-@router.get("", response_model=List[TripResponse])
+@router.get("", response_model=List[TripResponse], dependencies=[require_feature("history.trips")])
 async def list_trips(
     device_id: int = Query(..., description="Device ID (required - one can have many devices)"),
     db: Session = Depends(get_db),
@@ -352,7 +353,7 @@ async def list_trips(
     return trips
 
 
-@router.get("/{trip_id}", response_model=TripDetailResponse)
+@router.get("/{trip_id}", response_model=TripDetailResponse, dependencies=[require_feature("history.trips")])
 async def get_trip(
     trip_id: int,
     device_id: int = Query(..., description="Device ID (required for context)"),
@@ -405,7 +406,7 @@ async def get_trip(
     )
 
 
-@router.post("/{trip_id}/end", response_model=TripResponse)
+@router.post("/{trip_id}/end", response_model=TripResponse, dependencies=[require_feature("history.trips")])
 async def end_trip_manually(
     trip_id: int,
     device_id: int = Query(..., description="Device ID"),
@@ -431,7 +432,7 @@ async def end_trip_manually(
     return trip
 
 
-@router.delete("/{trip_id}", status_code=204)
+@router.delete("/{trip_id}", status_code=204, dependencies=[require_feature("history.trips")])
 async def delete_trip(
     trip_id: int,
     device_id: int = Query(..., description="Device ID"),

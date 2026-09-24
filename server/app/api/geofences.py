@@ -22,6 +22,7 @@ from app.models.geofence import Geofence
 from app.models.geofence_device import GeofenceDevice
 from app.models.geofence_version import GeofenceVersion
 from app.models.user import User
+from app.services.entitlements import check_feature, check_limit, require_feature
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -412,13 +413,18 @@ def _serialize(geofence: Geofence, db: Session) -> GeofenceResponse:
 # --- Routes ---
 
 
-@router.post("", response_model=GeofenceResponse, status_code=201)
+@router.post("", response_model=GeofenceResponse, status_code=201, dependencies=[require_feature("geofences.enabled")])
 async def create_geofence(
     body: GeofenceCreate,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
 ):
     _validate_device_ids(body.device_ids, user, db)
+    zone_count = db.query(Geofence).filter(Geofence.user_id == user.id).count()
+    check_limit(db, owner=user, actor=user, key="geofences.max_zones", current=zone_count,
+                route="POST /api/geofences")
+    if body.shape_type == "polygon":
+        check_feature(db, owner=user, actor=user, key="geofences.polygon", route="POST /api/geofences")
 
     geofence = Geofence(
         user_id=user.id,
@@ -445,7 +451,7 @@ async def create_geofence(
     return response
 
 
-@router.get("", response_model=List[GeofenceResponse])
+@router.get("", response_model=List[GeofenceResponse], dependencies=[require_feature("geofences.enabled")])
 async def list_geofences(
     is_active: Optional[bool] = Query(None),
     db: Session = Depends(get_db),
@@ -459,7 +465,7 @@ async def list_geofences(
 
 
 # Declared before /{geofence_id} so "history" isn't parsed as an id.
-@router.get("/history", response_model=List[GeofenceHistoryEntry])
+@router.get("/history", response_model=List[GeofenceHistoryEntry], dependencies=[require_feature("geofences.enabled")])
 async def get_geofence_history(
     device_id: int = Query(...),
     start: datetime = Query(..., description="Period start (UTC)"),
@@ -506,7 +512,7 @@ async def get_geofence_history(
     return _merge_history(versions, device.id)
 
 
-@router.get("/{geofence_id}", response_model=GeofenceResponse)
+@router.get("/{geofence_id}", response_model=GeofenceResponse, dependencies=[require_feature("geofences.enabled")])
 async def get_geofence(
     geofence_id: int,
     db: Session = Depends(get_db),
@@ -516,7 +522,7 @@ async def get_geofence(
     return _serialize(geofence, db)
 
 
-@router.put("/{geofence_id}", response_model=GeofenceResponse)
+@router.put("/{geofence_id}", response_model=GeofenceResponse, dependencies=[require_feature("geofences.enabled")])
 async def update_geofence(
     geofence_id: int,
     body: GeofenceUpdate,
@@ -526,6 +532,9 @@ async def update_geofence(
     geofence = _get_owned_geofence(geofence_id, user, db)
     if body.device_ids is not None:
         _validate_device_ids(body.device_ids, user, db)
+    if body.shape_type == "polygon" or body.points is not None:
+        check_feature(db, owner=user, actor=user, key="geofences.polygon",
+                      route="PUT /api/geofences/{geofence_id}")
 
     data = body.model_dump(exclude_unset=True)
     data.pop("points", None)
@@ -581,7 +590,7 @@ async def update_geofence(
     return response
 
 
-@router.delete("/{geofence_id}", status_code=204)
+@router.delete("/{geofence_id}", status_code=204, dependencies=[require_feature("geofences.enabled")])
 async def delete_geofence(
     geofence_id: int,
     db: Session = Depends(get_db),

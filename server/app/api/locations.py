@@ -13,6 +13,7 @@ from math import radians, degrees, cos, sin, asin, atan2, sqrt
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.auth import get_current_user, require_device_access
+from app.services.entitlements import require_feature
 from app.models.location import Location
 from app.models.location_quality_log import LocationQualityLog
 from app.models.device import Device
@@ -738,7 +739,7 @@ class LocationQualityLogResponse(BaseModel):
     entries: List[LocationQualityLogEntry]
 
 
-@router.get("/{device_id}/latest", response_model=LocationResponse)
+@router.get("/{device_id}/latest", response_model=LocationResponse, dependencies=[require_feature("tracking.live")])
 async def get_latest_location(
     device_id: int,
     db: Session = Depends(get_db),
@@ -757,7 +758,7 @@ async def get_latest_location(
     return location
 
 
-@router.get("/{device_id}/history", response_model=LocationHistoryResponse)
+@router.get("/{device_id}/history", response_model=LocationHistoryResponse, dependencies=[require_feature("history.trips")])
 async def get_location_history(
     device_id: int,
     start_time: Optional[datetime] = Query(None, description="Start time (UTC)"),
@@ -798,7 +799,7 @@ async def get_location_history(
     )
 
 
-@router.get("/{device_id}/quality-log", response_model=LocationQualityLogResponse)
+@router.get("/{device_id}/quality-log", response_model=LocationQualityLogResponse, dependencies=[require_feature("diagnostics")])
 async def get_location_quality_log(
     device_id: int,
     start_time: Optional[datetime] = Query(None, description="Start time (UTC)"),
@@ -914,7 +915,7 @@ def _build_route_response(
     }
 
 
-@router.get("/{device_id}/route")
+@router.get("/{device_id}/route", dependencies=[require_feature("history.trips")])
 async def get_device_route(
     device_id: int,
     start_time: Optional[datetime] = Query(None),
@@ -948,7 +949,7 @@ async def get_device_route(
     )
 
 
-@router.get("/{device_id}/distance", response_model=DistanceResponse)
+@router.get("/{device_id}/distance", response_model=DistanceResponse, dependencies=[require_feature("history.trips")])
 async def get_device_distance(
     device_id: int,
     start_time: Optional[datetime] = Query(None, description="Start time (UTC)"),
@@ -984,7 +985,7 @@ async def get_device_distance(
     )
 
 
-@router.get("/{device_id}/route-line", response_model=RouteLineStringResponse)
+@router.get("/{device_id}/route-line", response_model=RouteLineStringResponse, dependencies=[require_feature("history.trips")])
 async def get_device_route_line(
     device_id: int,
     start_time: Optional[datetime] = Query(None, description="Start time (UTC)"),
@@ -1011,7 +1012,7 @@ async def get_device_route_line(
     return result
 
 
-@router.get("/{device_id}/period-route")
+@router.get("/{device_id}/period-route", dependencies=[require_feature("history.period")])
 async def get_period_route(
     device_id: int,
     background_tasks: BackgroundTasks,
@@ -1105,7 +1106,7 @@ async def get_period_route(
     }
 
 
-@router.get("/{device_id}/since-last-stop")
+@router.get("/{device_id}/since-last-stop", dependencies=[require_feature("tracking.live")])
 async def get_route_since_last_stop(
     device_id: int,
     simplify: bool = Query(False, description="Simplify route via Douglas-Peucker to reduce point count"),
@@ -1160,7 +1161,7 @@ async def get_route_since_last_stop(
     return response
 
 
-@router.get("/{device_id}/alarms", response_model=List[LocationResponse])
+@router.get("/{device_id}/alarms", response_model=List[LocationResponse], dependencies=[require_feature("alerts.history")])
 async def get_device_alarms(
     device_id: int,
     start_time: Optional[datetime] = Query(None),
@@ -1191,7 +1192,7 @@ async def get_device_alarms(
     return alarms
 
 
-@router.post("/{location_id}/acknowledge", response_model=LocationResponse)
+@router.post("/{location_id}/acknowledge", response_model=LocationResponse, dependencies=[require_feature("alerts.history")])
 async def acknowledge_alarm(
     location_id: int,
     db: Session = Depends(get_db),
@@ -1237,7 +1238,7 @@ class RecentAlarmResponse(BaseModel):
         from_attributes = True
 
 
-@router.get("/alarms/recent", response_model=List[RecentAlarmResponse])
+@router.get("/alarms/recent", response_model=List[RecentAlarmResponse], dependencies=[require_feature("alerts.history")])
 async def get_recent_alarms(
     limit: int = Query(20, ge=1, le=100),
     db: Session = Depends(get_db),
@@ -1277,7 +1278,7 @@ async def get_recent_alarms(
     ]
 
 
-@router.get("/nearby")
+@router.get("/nearby", dependencies=[require_feature("tracking.live")])
 async def get_nearby_devices(
     latitude: float = Query(..., ge=-90, le=90),
     longitude: float = Query(..., ge=-180, le=180),
@@ -1344,7 +1345,7 @@ _LIVE_ROAD_NAME_MIN_INTERVAL_SECONDS = 20.0
 _last_road_name_request: Dict[int, float] = {}
 
 
-@router.get("/{device_id}/live_road_name", response_model=LiveRoadNameResponse)
+@router.get("/{device_id}/live_road_name", response_model=LiveRoadNameResponse, dependencies=[require_feature("tracking.live")])
 async def get_live_road_name(
     device_id: int,
     db: Session = Depends(get_db),

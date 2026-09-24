@@ -42,6 +42,11 @@ class Settings(BaseSettings):
     # e.g. "user_2abc123,user_2xyz456" — copy from Clerk Dashboard > Users
     ADMIN_CLERK_USER_IDS: str = ""
 
+    # Plan feature checks — "off" | "log" | "enforce". "log" records what
+    # would be denied (entitlement_check_log) without blocking anything.
+    # See app/services/entitlements.py before switching to "enforce".
+    ENTITLEMENT_MODE: str = "log"
+
     # Legacy admin secret (kept for fallback / non-Clerk environments)
     ADMIN_SECRET: Optional[str] = None
 

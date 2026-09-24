@@ -8,6 +8,7 @@ from app.models.geofence import Geofence
 from app.models.geofence_device_state import GeofenceDeviceState
 from app.models.geofence_device import GeofenceDevice
 from app.models.geofence_version import GeofenceVersion
+from app.models.entitlement import Feature, PlanFeature, EntitlementCheckLog
 from app.models.trip import Trip
 from app.models.trip_settings import TripSettings
 from app.models.vehicle import Vehicle
@@ -18,4 +19,4 @@ from app.models.alert_settings import AlertSettings
 from app.models.alarm_push_state import AlarmPushState
 from app.models.contact_request import ContactRequest
 
-__all__ = ['Device', 'Location', 'LocationQualityLog', 'User', 'Geofence', 'GeofenceDeviceState', 'GeofenceDevice', 'GeofenceVersion', 'Trip', 'TripSettings', 'Vehicle', 'Subscription', 'Payment', 'GeocodeCache', 'CommandSettings', 'AlertSettings', 'AlarmPushState', 'ContactRequest']
+__all__ = ['Device', 'Location', 'LocationQualityLog', 'User', 'Geofence', 'GeofenceDeviceState', 'GeofenceDevice', 'GeofenceVersion', 'Feature', 'PlanFeature', 'EntitlementCheckLog', 'Trip', 'TripSettings', 'Vehicle', 'Subscription', 'Payment', 'GeocodeCache', 'CommandSettings', 'AlertSettings', 'AlarmPushState', 'ContactRequest']
