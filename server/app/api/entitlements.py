@@ -47,6 +47,8 @@ class EntitlementsResponse(BaseModel):
     plan: Optional[EntitlementsPlan] = None
     expires_at: Optional[UtcDateTime] = None
     features: Dict[str, GrantResponse]
+    # Vehicles the subscription covers; plan features apply only to these.
+    covered_vehicle_ids: List[int] = []
 
 
 class FeatureResponse(BaseModel):
@@ -100,6 +102,7 @@ async def get_my_entitlements(
             key: GrantResponse(enabled=ent.denial_reason(key) is None, limit=ent.limit_for(key))
             for key in FEATURES_BY_KEY
         },
+        covered_vehicle_ids=sorted(ent.covered_vehicle_ids),
     )
 
 

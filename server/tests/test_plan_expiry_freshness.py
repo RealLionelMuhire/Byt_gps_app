@@ -100,26 +100,30 @@ def make_stale_active_subscription(db, owner: User, plan: SubscriptionPlan):
     return sub
 
 
-# ── create_vehicle (POST /api/vehicles) — vehicle-limit enforcement ─────────
+# ── create_vehicle (POST /api/vehicles) — no plan cap (migration 048) ──────
 
-def test_stale_subscription_does_not_grant_its_vehicle_limit(client, db_session, current_clerk_id):
-    """basic's fallback limit is 3; trial's is 1. A stale "active" basic
-    subscription must NOT be honored — the account should be measured
-    against trial's limit of 1 instead."""
+def test_vehicles_beyond_the_plan_can_still_be_added(client, db_session, current_clerk_id):
+    """Every plan is priced per vehicle now: an account can hold more
+    vehicles than its subscription covers — the extras are just uncovered
+    until added to the plan (formerly a 403 at the plan's vehicle limit)."""
     owner = make_user(db_session, "clerk_owner")
     device1 = make_device(db_session, owner, imei="100000000000001")
-    make_vehicle(db_session, owner, device1)  # 1 vehicle already registered
+    make_vehicle(db_session, owner, device1)
     device2 = make_device(db_session, owner, imei="100000000000002")
-    basic_plan = make_plan(db_session, "basic", max_devices=3)
-    make_stale_active_subscription(db_session, owner, basic_plan)
+    trial_plan = make_plan(db_session, "trial", price=0, max_devices=1)
+    sub = Subscription(
+        clerk_user_id=owner.clerk_user_id, plan_id=trial_plan.id, status="active",
+        price=0, started_at=datetime.utcnow(), expires_at=datetime.utcnow() + timedelta(days=10),
+    )
+    db_session.add(sub)
+    db_session.commit()
     current_clerk_id["value"] = owner.clerk_user_id
 
     resp = client.post("/api/vehicles", json={
         "nickname": "Second Car", "plate": "RAB456C",
         "make": "Honda", "model": "Civic", "deviceImei": device2.imei,
     })
-    assert resp.status_code == 403
-    assert "trial" in resp.json()["detail"].lower()
+    assert resp.status_code == 201
 
 
 def test_genuinely_active_subscription_still_grants_its_limit(client, db_session, current_clerk_id):

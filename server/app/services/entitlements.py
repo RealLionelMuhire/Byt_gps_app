@@ -39,7 +39,9 @@ from app.models.device import Device
 from app.models.entitlement import EntitlementCheckLog, Feature, PlanFeature
 from app.models.subscription import SubscriptionPlan
 from app.models.user import User
+from app.models.vehicle import Vehicle
 from app.services.plan_resolution import resolve_owner_plan
+from app.services.subscription_billing import covered_vehicle_ids
 
 logger = logging.getLogger(__name__)
 
@@ -115,6 +117,9 @@ class Entitlements:
     plan: Optional[SubscriptionPlan] = None
     expires_at: Optional[datetime] = None
     grants: Dict[str, Grant] = field(default_factory=dict)
+    # Vehicles the active subscription covers (migration 048) — every plan
+    # is per vehicle, so plan features apply only to these.
+    covered_vehicle_ids: set = field(default_factory=set)
 
     @property
     def is_admin(self) -> bool:
@@ -164,7 +169,22 @@ def resolve_entitlements(db: Session, owner: Optional[User]) -> Entitlements:
     grants["vehicles.max"] = Grant(True, plan.max_devices)
     return Entitlements(
         status="active", plan=plan, expires_at=resolved.subscription.expires_at, grants=grants,
+        covered_vehicle_ids=covered_vehicle_ids(db, resolved.subscription),
     )
+
+
+def _vehicle_not_covered(db: Session, entitlements: Entitlements, owner: User, device_id: Optional[int]) -> bool:
+    """True when the request is about a device whose vehicle the owner's
+    active subscription doesn't cover. A device with no vehicle record
+    can't be chosen at checkout, so it isn't held against the owner."""
+    if device_id is None or entitlements.status != "active":
+        return False
+    vehicle = (
+        db.query(Vehicle)
+        .filter(Vehicle.device_id == device_id, Vehicle.clerk_user_id == owner.clerk_user_id)
+        .first()
+    )
+    return vehicle is not None and vehicle.id not in entitlements.covered_vehicle_ids
 
 
 def _mode() -> str:
@@ -227,6 +247,8 @@ def _denial_message(name: str, reason: str, limit: Optional[int]) -> str:
         return f"Your plan has expired. Renew it to use {name}."
     if reason == "over_limit":
         return f"Your plan allows up to {limit} for {name}. Upgrade to add more."
+    if reason == "vehicle_not_covered":
+        return f"This vehicle isn't on your plan yet. Add it to your plan to use {name}."
     return f"{name} isn't included in your plan. Upgrade to use it."
 
 
@@ -245,7 +267,7 @@ def _safe_resolve(db: Session, owner: User) -> Optional[Entitlements]:
 
 
 def check_feature(db: Session, *, owner: Optional[User], actor: Optional[User], key: str,
-                  route: str) -> None:
+                  route: str, device_id: Optional[int] = None) -> None:
     """Gate on a boolean feature. Log-only mode records and returns; enforce
     mode raises 402. No-op when there's no owner to measure against.
 
@@ -259,6 +281,8 @@ def check_feature(db: Session, *, owner: Optional[User], actor: Optional[User], 
     if entitlements is None:
         return
     reason = entitlements.denial_reason(key)
+    if reason is None and _vehicle_not_covered(db, entitlements, owner, device_id):
+        reason = "vehicle_not_covered"
     if reason:
         _deny(db, owner=owner, actor=actor, key=key, reason=reason, route=route, mode=mode)
 
@@ -288,23 +312,24 @@ def _route_label(request: Request) -> str:
     return f"{request.method} {path}"
 
 
-def _owner_for_request(db: Session, request: Request, user: User) -> Optional[User]:
-    """The device owner when the route is about a device (device_id in the
-    path or query), otherwise the caller. None when the device doesn't
-    exist or has no owner — the route itself will 404/403 as it always has."""
+def _owner_for_request(db: Session, request: Request, user: User) -> tuple:
+    """(owner, device_id): the device owner when the route is about a device
+    (device_id in the path or query), otherwise (caller, None). Owner None
+    when the device doesn't exist or has no owner — the route itself will
+    404/403 as it always has."""
     raw = request.path_params.get("device_id") or request.query_params.get("device_id")
     if raw is None:
-        return user
+        return user, None
     try:
         device_id = int(raw)
     except (TypeError, ValueError):
-        return None
+        return None, None
     device = db.query(Device).filter(Device.id == device_id).first()
     if device is None or device.user_id is None:
-        return None
+        return None, None
     if device.user_id == user.id:
-        return user
-    return db.query(User).filter(User.id == device.user_id).first()
+        return user, device_id
+    return db.query(User).filter(User.id == device.user_id).first(), device_id
 
 
 def require_feature(key: str):
@@ -321,8 +346,8 @@ def require_feature(key: str):
         user: User = Depends(get_current_user),
         db: Session = Depends(get_db),
     ) -> None:
-        owner = _owner_for_request(db, request, user)
-        check_feature(db, owner=owner, actor=user, key=key, route=_route_label(request))
+        owner, device_id = _owner_for_request(db, request, user)
+        check_feature(db, owner=owner, actor=user, key=key, route=_route_label(request), device_id=device_id)
 
     return Depends(_check)
 

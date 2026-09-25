@@ -10,7 +10,6 @@ from datetime import datetime, timedelta
 
 import pytest
 
-from app.models.device import Device
 from app.models.entitlement import PlanFeature
 from app.models.subscription import Subscription
 from tests.test_entitlements import catalog, full_plan  # noqa: F401
@@ -119,22 +118,25 @@ def test_quote_for_a_new_customer(client, db_session, current_clerk_id):
     assert (q["planId"], q["planName"], q["amount"], q["currency"]) == ("basic", "Basic", 2450, "RWF")
     assert q["requiresPayment"] is True
     assert q["replaces"] is None and q["blockedReason"] is None
-    assert q["billableVehicles"] is None
+    # No vehicles yet: a subscription still has one slot.
+    assert q["billableVehicles"] == 1
     assert q["durationDays"] == 30
 
 
-def test_quote_per_vehicle_plan_multiplies_by_paired_devices(client, db_session, current_clerk_id):
+def test_quote_without_a_selection_prices_every_vehicle(client, db_session, current_clerk_id):
+    # What app versions from before vehicle selection get.
+    from app.models.vehicle import Vehicle
     user = make_user(db_session, "clerk_user")
-    plan = make_plan(db_session, "fleet", price=1000, max_devices=None)
-    plan.charge_scope = "per_device"
+    make_plan(db_session, "fleet", price=1000, max_devices=None)
     for i in range(3):
-        db_session.add(Device(imei=f"10000000000000{i}", name="Car", user_id=user.id, lifecycle="sold"))
+        db_session.add(Vehicle(clerk_user_id=user.clerk_user_id, nickname=f"Car {i}", plate=f"RA{i}",
+                               make="Toyota", model="Hilux"))
     db_session.commit()
     current_clerk_id["value"] = user.clerk_user_id
 
     q = quote(client, "fleet")
 
-    assert (q["amount"], q["unitPrice"], q["billableVehicles"], q["chargeScope"]) == (3000, 1000, 3, "per_device")
+    assert (q["amount"], q["unitPrice"], q["billableVehicles"]) == (3000, 1000, 3)
 
 
 def test_quote_for_a_switch_says_what_it_replaces(client, db_session, current_clerk_id):

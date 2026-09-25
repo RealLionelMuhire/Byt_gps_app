@@ -19,9 +19,9 @@ All routes require a valid Clerk Bearer token (via require_auth dependency).
 import logging
 import uuid
 from datetime import datetime, timedelta
-from typing import Optional
+from typing import List, Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
@@ -44,6 +44,11 @@ from app.models.subscription import Subscription, Payment
 from app.api.devices import _check_pair_rate_limit, _release_device_to_inventory
 from app.api.auth import claim_pending_client_user
 from app.api.subscriptions import plan_config, plan_purchasable, get_plan_by_slug
+from app.services.subscription_billing import (
+    SelectionError, check_slot_cap, cover_vehicles, covered_vehicle_ids, monthly_price,
+    owner_vehicles, paid_slots, plan_add_vehicles, resolve_selection, subscribe_amount,
+    vehicles_for_payment,
+)
 from app.services.intouchpay import (
     request_payment as intouch_request_payment,
     get_balance as intouch_get_balance,
@@ -188,6 +193,13 @@ class VehicleUpdateRequest(BaseModel):
 class PaymentInitiateRequest(BaseModel):
     planId: str
     phone:  str  # mobile money number, e.g. "250781234567"
+    # The vehicles this payment is for (every plan is priced per vehicle).
+    # Omitted by app versions from before vehicle selection = all of the
+    # account's vehicles, which is how those were charged.
+    vehicleIds: Optional[List[int]] = None
+    # "subscribe" (new subscription or plan switch) or "add_vehicles"
+    # (extra slots on the current subscription, prorated).
+    purpose: Literal["subscribe", "add_vehicles"] = "subscribe"
 
 
 class PaymentInitiateResponse(BaseModel):
@@ -198,6 +210,9 @@ class PaymentInitiateResponse(BaseModel):
 
 class SubscriptionRequest(BaseModel):
     planId: str
+    # Only used where no payment fixes the selection (trial, postpaid);
+    # a paid activation covers exactly what its payment was for.
+    vehicleIds: Optional[List[int]] = None
 
 
 class SubscriptionResponse(BaseModel):
@@ -208,6 +223,20 @@ class SubscriptionResponse(BaseModel):
 class SubscriptionUpgradeRequest(BaseModel):
     planId: str
     txRef: str
+    vehicleIds: Optional[List[int]] = None  # postpaid switches only
+
+
+class AddVehiclesRequest(BaseModel):
+    vehicleIds: List[int]
+    # Required when the vehicles need more slots than the plan has free.
+    txRef: Optional[str] = None
+
+
+class AddVehiclesResponse(BaseModel):
+    subscriptionId: int
+    expiresAt: UtcDateTime
+    quantity: int
+    coveredVehicleIds: List[int]
 
 
 class SubscriptionCancelResponse(BaseModel):
@@ -227,6 +256,12 @@ class PaymentRecord(BaseModel):
         from_attributes = True
 
 
+class QuoteVehicle(BaseModel):
+    id: int
+    nickname: str
+    plate: str
+
+
 class BillingResponse(BaseModel):
     currentPlan: str
     expiresAt: Optional[UtcDateTime]
@@ -236,6 +271,10 @@ class BillingResponse(BaseModel):
     # "Basic" instead of a slug-derived label, and an accurate time-used bar.
     currentPlanName: Optional[str] = None
     startedAt: Optional[UtcDateTime] = None
+    # Per-vehicle coverage (migration 048): paid slots, and which vehicles
+    # the current subscription covers.
+    quantity: Optional[int] = None
+    coveredVehicles: List[QuoteVehicle] = []
 
 
 class QuoteReplaces(BaseModel):
@@ -244,15 +283,29 @@ class QuoteReplaces(BaseModel):
     expiresAt: UtcDateTime
 
 
+class QuoteLineItem(BaseModel):
+    description: str
+    quantity: int
+    unitAmount: float
+    amount: float
+
+
 class PaymentQuoteResponse(BaseModel):
     planId: str
     planName: str
+    purpose: str  # "subscribe" | "add_vehicles"
     amount: float
     currency: str
     chargeScope: str
+    # Per-vehicle price for the plan's full period, and normalized per month.
     unitPrice: float
-    # Vehicles the amount covers (per_device plans only).
+    monthlyPerVehicle: float
+    # Vehicles the quote is for, and how many the amount pays for (fewer
+    # than len(vehicles) when adding vehicles uses free slots).
+    vehicles: List[QuoteVehicle] = []
     billableVehicles: Optional[int] = None
+    # Invoice-style breakdown; amounts sum to `amount`.
+    lineItems: List[QuoteLineItem] = []
     durationDays: int
     startsAt: UtcDateTime
     expiresAt: UtcDateTime
@@ -475,26 +528,11 @@ async def create_vehicle(
     owner = device.user
     owner_clerk_id = owner.clerk_user_id
 
-    # Enforce plan limits (admin-configured via subscription_plans) —
-    # always against the device owner's plan/vehicle count, not the
-    # caller's, so an admin acting on a client's behalf doesn't get
-    # measured against their own (nonexistent) subscription. Checked
-    # expiry-freshness inline (_get_active_subscription), not just the
-    # cached status column — see its docstring for why.
-    sub = _get_active_subscription(db, owner_clerk_id)
-
-    # sub.plan_id is a real FK (migrations 041/042) — plan_config/the error
-    # message below both want the plan's slug, not its raw integer id.
-    current_plan = sub.plan.slug if sub and sub.plan else "trial"
-    vehicle_limit = plan_config(db, current_plan)["max_devices"]
-
-    if vehicle_limit is not None:
-        current_vehicles_count = db.query(Vehicle).filter(Vehicle.clerk_user_id == owner_clerk_id).count()
-        if current_vehicles_count >= vehicle_limit:
-            raise HTTPException(
-                status_code=403,
-                detail=f"Your {current_plan} plan only allows up to {vehicle_limit} vehicle(s). Please upgrade your plan."
-            )
+    # No plan cap here any more (migration 048): every plan is priced per
+    # vehicle, so an account can hold any number of vehicles — ones beyond
+    # what the subscription covers are simply uncovered (premium features
+    # refused, see entitlements' vehicle_not_covered) until added to the
+    # plan. The plan's max_devices now caps vehicles per subscription.
 
     try:
         vehicle = Vehicle(
@@ -522,38 +560,6 @@ async def create_vehicle(
         raise HTTPException(status_code=500, detail="Database error")
 
 
-# ── Charging helpers (per-device plans / postpaid plans) ─────────────────────
-
-def _device_count_for_user(db: Session, clerk_user_id: str) -> int:
-    """Number of GPS devices paired to the user's account (min 1 — buying a
-    plan always covers at least one vehicle)."""
-    user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
-    if not user:
-        return 1
-    count = db.query(Device).filter(Device.user_id == user.id).count()
-    return max(1, count)
-
-
-def _effective_charge(db: Session, cfg: dict, clerk_user_id: str) -> float:
-    """Price actually charged to this user for a plan.
-
-    - per_device plans: price × the user's paired device count (capped by the
-      plan's max_devices when set — "Up to N vehicles")
-    - flat plans: price once, regardless of device count
-
-    The same formula runs at payment initiation and at subscription
-    activation, so the amount collected always matches the amount stored on
-    the Subscription row."""
-    price = float(cfg.get("price", 0.0))
-    if cfg.get("charge_scope") == "per_device":
-        devices = _device_count_for_user(db, clerk_user_id)
-        max_devices = cfg.get("max_devices")
-        if max_devices and devices > max_devices:
-            devices = max_devices
-        price = round(price * devices, 2)
-    return price
-
-
 # ── Endpoint 5: POST /api/payments/initiate  (Step 8, paid plans, IntouchPay) ──
 
 @router.post("/payments/initiate", response_model=PaymentInitiateResponse)
@@ -574,54 +580,76 @@ async def initiate_payment(
     POST /api/subscriptions afterwards — that endpoint already requires a
     Payment with status="successful" for paid plans and is unchanged.
     """
-    if not plan_purchasable(db, body.planId):
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid or unavailable planId — choose an active plan from the pricing screen.",
-        )
-
-    # Payment.plan_id is a real FK (migrations 041/042) — a subscription_plans
-    # row must exist to write this Payment, not just a FALLBACK_PLANS entry.
-    # plan_purchasable's fallback-slug-with-no-DB-row branch is unreachable in
-    # practice once migration 041 has seeded the three legacy slugs; this is
-    # a defensive 500 (not a 400) precisely because it should never happen —
-    # a missing row here means those migrations haven't been run.
-    plan = get_plan_by_slug(db, body.planId, include_inactive=True)
-    if plan is None:
-        logger.error("No subscription_plans row for purchasable planId=%s — has migration 041 run?", body.planId)
-        raise HTTPException(status_code=500, detail="This plan isn't fully set up yet. Please try again later.")
-
-    # Activation refuses a paid switch to the plan the user is already
-    # actively on ("Already on this plan"), so charging for it here would
-    # take the customer's money for nothing. Refuse before any money moves.
-    active_sub = _get_active_subscription(db, clerk_user_id)
-    if active_sub and active_sub.plan_id == plan.id:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"You're already on this plan until {active_sub.expires_at:%b %d, %Y}. "
-                "You can renew it once it expires, or choose a different plan."
-            ),
-        )
-
     phone = body.phone.strip()
     if not phone:
         raise HTTPException(status_code=400, detail="phone is required")
 
-    cfg = plan_config(db, body.planId)
+    if body.purpose == "add_vehicles":
+        # Extra slots on the CURRENT subscription — its plan is used even if
+        # since deactivated (grandfathered), so plan_purchasable isn't asked.
+        active_sub = _get_active_subscription(db, clerk_user_id)
+        if active_sub is None or active_sub.plan is None:
+            raise HTTPException(status_code=409, detail="You don't have an active plan to add vehicles to.")
+        plan = active_sub.plan
+        if plan.slug != body.planId:
+            raise HTTPException(status_code=400, detail="Vehicles can only be added to your current plan.")
+        cfg = plan_config(db, plan.slug)
+        try:
+            vehicles = resolve_selection(db, clerk_user_id, body.vehicleIds or [])
+            add = plan_add_vehicles(db, active_sub, cfg, plan.name, vehicles)
+        except SelectionError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        if add.amount <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="No payment needed — these vehicles fit in your plan's free slots.",
+            )
+        amount = add.amount
+    else:
+        if not plan_purchasable(db, body.planId):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid or unavailable planId — choose an active plan from the pricing screen.",
+            )
 
-    # Postpaid plans are invoiced AFTER the period — there is nothing to
-    # collect up-front, so reject the mobile-money flow rather than charging
-    # the customer the wrong amount.
-    if cfg.get("billing_model") == "postpaid":
-        raise HTTPException(
-            status_code=400,
-            detail="This plan is postpaid — you will be invoiced after the period; no upfront payment is required.",
-        )
+        # Payment.plan_id is a real FK (migrations 041/042) — a missing row
+        # here means those migrations haven't been run (defensive 500).
+        plan = get_plan_by_slug(db, body.planId, include_inactive=True)
+        if plan is None:
+            logger.error("No subscription_plans row for purchasable planId=%s — has migration 041 run?", body.planId)
+            raise HTTPException(status_code=500, detail="This plan isn't fully set up yet. Please try again later.")
 
-    # per_device plans are charged price × the user's device count; flat
-    # plans are charged the price once.
-    amount = _effective_charge(db, cfg, clerk_user_id)
+        # Activation refuses a paid switch to the plan the user is already
+        # actively on ("Already on this plan"), so charging for it here would
+        # take the customer's money for nothing. Refuse before any money moves.
+        active_sub = _get_active_subscription(db, clerk_user_id)
+        if active_sub and active_sub.plan_id == plan.id:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"You're already on this plan until {active_sub.expires_at:%b %d, %Y}. "
+                    "You can renew it once it expires, add vehicles to it, or choose a different plan."
+                ),
+            )
+
+        cfg = plan_config(db, body.planId)
+
+        # Postpaid plans are invoiced AFTER the period — there is nothing to
+        # collect up-front, so reject the mobile-money flow rather than
+        # charging the customer the wrong amount.
+        if cfg.get("billing_model") == "postpaid":
+            raise HTTPException(
+                status_code=400,
+                detail="This plan is postpaid — you will be invoiced after the period; no upfront payment is required.",
+            )
+
+        try:
+            vehicles = resolve_selection(db, clerk_user_id, body.vehicleIds)
+            check_slot_cap(cfg, plan.name, len(vehicles))
+        except SelectionError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        # Per-vehicle price × the vehicles chosen.
+        amount = subscribe_amount(cfg, len(vehicles))
 
     # Our own reference — IntouchPay requires this to be globally unique
     # across every request ever sent to them.
@@ -648,6 +676,9 @@ async def initiate_payment(
             amount=amount,
             currency=cfg["currency"],
             status=status,
+            # Fixed now, so activation covers exactly what was paid for.
+            purpose=body.purpose,
+            vehicle_ids=[v.id for v in vehicles],
             # Not yet "verified" — this timestamp marks when the request was
             # initiated. It's overwritten with the real confirmation time once
             # the webhook (or cron reconciliation) confirms success. Reusing
@@ -669,11 +700,30 @@ async def initiate_payment(
             message=resp.get("message") or "Payment request was rejected.",
         )
 
-    logger.info("IntouchPay payment initiated: tx_ref=%s planId=%s user=%s", tx_ref, body.planId, clerk_user_id)
+    logger.info("IntouchPay payment initiated: tx_ref=%s planId=%s purpose=%s vehicles=%d amount=%.2f user=%s",
+                tx_ref, body.planId, body.purpose, len(vehicles), amount, clerk_user_id)
     return PaymentInitiateResponse(
         txRef=tx_ref, status="pending",
         message=resp.get("message") or "Approve the payment on your phone to continue.",
     )
+
+
+def _activation_selection(db, clerk_user_id, plan, cfg, payment, requested_ids):
+    """(vehicles, paid slots, amount charged) for activating `plan`.
+
+    With a payment: exactly the vehicles it was made for, the slots it
+    bought, and what was actually collected. Without one (trial, postpaid):
+    the requested vehicles — or, from an app that predates vehicle
+    selection, all the account's vehicles up to the plan's cap."""
+    if payment is not None:
+        vehicles = vehicles_for_payment(db, payment)
+        return vehicles, paid_slots(payment, len(vehicles)), float(payment.amount)
+    vehicles = resolve_selection(db, clerk_user_id, requested_ids)
+    if requested_ids is None and cfg.get("max_devices"):
+        vehicles = vehicles[: cfg["max_devices"]]
+    check_slot_cap(cfg, plan.name, len(vehicles))
+    charge = 0.0 if plan.slug == "trial" else subscribe_amount(cfg, len(vehicles))
+    return vehicles, max(1, len(vehicles)), charge
 
 
 # ── Endpoint 6: POST /api/subscriptions  (Step 8) ─────────────────────────────
@@ -743,7 +793,6 @@ async def create_subscription(
 
     cfg = plan_config(db, body.planId)
     is_postpaid = cfg.get("billing_model") == "postpaid"
-    charge = _effective_charge(db, cfg, clerk_user_id)
 
     # For paid prepaid plans: enforce that a successful payment was made
     # before activating the subscription. The mobile app should call
@@ -766,12 +815,23 @@ async def create_subscription(
             Payment.plan_id == plan.id,
             Payment.status == "successful",
             Payment.consumed_at.is_(None),
+            Payment.purpose == "subscribe",
         ).order_by(Payment.verified_at.asc()).first()
         if not payment:
             raise HTTPException(
                 status_code=402,
                 detail="Payment required. Complete payment verification before activating a paid plan.",
             )
+
+    # Which vehicles this subscription covers. A paid activation covers
+    # exactly what its payment was for (fixed at initiate_payment); the
+    # trial/postpaid have no payment, so the request says — and an app
+    # version from before vehicle selection gets all its vehicles, up to
+    # the plan's cap (the trial covers one).
+    try:
+        vehicles, quantity, charge = _activation_selection(db, clerk_user_id, plan, cfg, payment, body.vehicleIds)
+    except SelectionError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
     expires_at = datetime.utcnow() + timedelta(days=cfg["days"])
 
@@ -783,12 +843,14 @@ async def create_subscription(
             price=charge,
             started_at=datetime.utcnow(),
             expires_at=expires_at,
+            quantity=quantity,
         )
         db.add(subscription)
         db.flush()  # assigns subscription.id for the payment link below
         if payment is not None and not _claim_payment(db, payment, subscription):
             db.rollback()
             raise HTTPException(status_code=409, detail=PAYMENT_ALREADY_USED)
+        cover_vehicles(db, subscription, vehicles, payment)
 
         # Finalise onboarding on the user record
         user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
@@ -887,6 +949,16 @@ async def upgrade_subscription(
                 status_code=409,
                 detail="This payment was made for a different plan. Pay for the plan you want to switch to.",
             )
+        if payment.purpose != "subscribe":
+            raise HTTPException(
+                status_code=409,
+                detail="This payment was for adding vehicles, not for switching plans.",
+            )
+
+    try:
+        vehicles, quantity, charge = _activation_selection(db, clerk_user_id, plan, cfg, payment, body.vehicleIds)
+    except SelectionError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
     # 2. Confirm upgrade (different plan slug — the mobile app controls
     # pricing-tier ordering, the backend just ensures they're not re-buying
@@ -913,7 +985,6 @@ async def upgrade_subscription(
             current_sub.status = "cancelled"
             current_sub.updated_at = datetime.utcnow()
 
-        charge = _effective_charge(db, cfg, clerk_user_id)
         expires_at = datetime.utcnow() + timedelta(days=cfg["days"])
 
         new_sub = Subscription(
@@ -923,12 +994,14 @@ async def upgrade_subscription(
             price=charge,
             started_at=datetime.utcnow(),
             expires_at=expires_at,
+            quantity=quantity,
         )
         db.add(new_sub)
         db.flush()  # assigns new_sub.id for the payment link below
         if payment is not None and not _claim_payment(db, payment, new_sub):
             db.rollback()
             raise HTTPException(status_code=409, detail=PAYMENT_ALREADY_USED)
+        cover_vehicles(db, new_sub, vehicles, payment)
 
         # Update user
         user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
@@ -1034,75 +1107,210 @@ async def get_billing_history(
         payments=payment_records,
         currentPlanName=sub.plan.name if sub and sub.plan else None,
         startedAt=sub.started_at if sub else None,
+        quantity=sub.quantity if sub else None,
+        coveredVehicles=_covered_vehicles(db, sub) if sub else [],
     )
+
+
+def _covered_vehicles(db: Session, sub: Subscription) -> list:
+    covered = covered_vehicle_ids(db, sub)
+    return [
+        QuoteVehicle(id=v.id, nickname=v.nickname, plate=v.plate)
+        for v in owner_vehicles(db, sub.clerk_user_id) if v.id in covered
+    ]
 
 
 @router.get("/payments/quote", response_model=PaymentQuoteResponse)
 async def get_payment_quote(
     planId: str,
+    vehicleIds: Optional[str] = Query(None, description="Comma-separated vehicle ids; omitted = all the account's vehicles"),
+    purpose: Literal["subscribe", "add_vehicles"] = Query("subscribe"),
     clerk_user_id: str = Depends(require_auth),
     db: Session = Depends(get_db),
 ):
     """
-    What buying `planId` right now would cost and do — for the checkout
-    summary, shown before any payment starts. Uses exactly the same charge
-    formula as initiate_payment/activation (_effective_charge), and the
-    same refusal rules, so the summary can never promise something the
-    purchase then contradicts.
+    What a purchase would cost and do — the checkout's invoice, shown before
+    any payment starts. Uses exactly the same pricing (per-vehicle, and
+    prorated for add_vehicles) and refusal rules as initiate_payment and
+    activation, so the invoice can't promise something the purchase then
+    contradicts. A selection problem is returned as blockedReason (not an
+    error), so the app can show it next to the vehicle picker.
     """
-    if not plan_purchasable(db, planId):
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid or unavailable planId — choose an active plan from the pricing screen.",
-        )
-    plan = get_plan_by_slug(db, planId, include_inactive=True)
-    if plan is None:
-        raise HTTPException(status_code=500, detail="This plan isn't fully set up yet. Please try again later.")
-
-    cfg = plan_config(db, planId)
-    is_trial = plan.slug == "trial"
-    is_postpaid = cfg.get("billing_model") == "postpaid"
-    amount = 0.0 if is_trial else _effective_charge(db, cfg, clerk_user_id)
-
-    billable = None
-    if cfg.get("charge_scope") == "per_device" and not is_trial:
-        billable = _device_count_for_user(db, clerk_user_id)
-        if cfg.get("max_devices") and billable > cfg["max_devices"]:
-            billable = cfg["max_devices"]
-
-    active = _get_active_subscription(db, clerk_user_id)
-    blocked = None
-    replaces = None
-    if active and active.plan_id == plan.id:
-        blocked = (
-            f"You're already on this plan until {active.expires_at:%b %d, %Y}. "
-            "You can renew it once it expires, or choose a different plan."
-        )
-    elif is_trial and db.query(Subscription).filter(Subscription.clerk_user_id == clerk_user_id).first():
-        blocked = "Free trial already used. Please choose a paid plan."
-    elif active is not None:
-        replaces = QuoteReplaces(
-            planId=active.plan.slug if active.plan else "",
-            planName=active.plan.name if active.plan else "",
-            expiresAt=active.expires_at,
-        )
+    try:
+        requested = None if vehicleIds is None else [int(x) for x in vehicleIds.split(",") if x.strip()]
+    except ValueError:
+        raise HTTPException(status_code=400, detail="vehicleIds must be comma-separated numbers")
 
     now = datetime.utcnow()
+    active = _get_active_subscription(db, clerk_user_id)
+
+    if purpose == "add_vehicles":
+        if active is None or active.plan is None or active.plan.slug != planId:
+            raise HTTPException(status_code=400, detail="Vehicles can only be added to your current, active plan.")
+        plan = active.plan
+    else:
+        if not plan_purchasable(db, planId):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid or unavailable planId — choose an active plan from the pricing screen.",
+            )
+        plan = get_plan_by_slug(db, planId, include_inactive=True)
+        if plan is None:
+            raise HTTPException(status_code=500, detail="This plan isn't fully set up yet. Please try again later.")
+
+    cfg = plan_config(db, plan.slug)
+    is_trial = plan.slug == "trial"
+    is_postpaid = cfg.get("billing_model") == "postpaid"
+    unit_price = float(cfg.get("price", 0.0))
+    blocked = None
+    replaces = None
+    line_items: List[QuoteLineItem] = []
+    vehicles = []
+    billable = 0
+    amount = 0.0
+    starts_at, expires_at = now, now + timedelta(days=cfg["days"])
+
+    try:
+        vehicles = resolve_selection(db, clerk_user_id, requested)
+        if purpose == "add_vehicles":
+            add = plan_add_vehicles(db, active, cfg, plan.name, vehicles, now=now)
+            starts_at, expires_at = now, active.expires_at
+            billable, amount = add.extra_slots, add.amount
+            if add.free_slots_used:
+                line_items.append(QuoteLineItem(
+                    description=f"{plan.name} — vehicles using free slots already paid for",
+                    quantity=add.free_slots_used, unitAmount=0.0, amount=0.0,
+                ))
+            if add.extra_slots:
+                line_items.append(QuoteLineItem(
+                    description=(
+                        f"{plan.name} — extra vehicles, prorated for the {add.remaining_days} "
+                        f"of {add.period_days} days left until your plan renews"
+                    ),
+                    quantity=add.extra_slots, unitAmount=add.unit_price, amount=add.amount,
+                ))
+        else:
+            if requested is None and is_trial and cfg.get("max_devices"):
+                vehicles = vehicles[: cfg["max_devices"]]
+            check_slot_cap(cfg, plan.name, len(vehicles))
+            billable = max(1, len(vehicles))
+            amount = 0.0 if is_trial else subscribe_amount(cfg, len(vehicles))
+            period = f"{plan.duration_value} {plan.duration_unit}{'' if plan.duration_value == 1 else 's'}"
+            line_items.append(QuoteLineItem(
+                description=f"{plan.name} — per vehicle, {period}",
+                quantity=billable, unitAmount=0.0 if is_trial else unit_price, amount=amount,
+            ))
+    except SelectionError as exc:
+        blocked = str(exc)
+
+    if blocked is None and purpose == "subscribe":
+        if active and active.plan_id == plan.id:
+            blocked = (
+                f"You're already on this plan until {active.expires_at:%b %d, %Y}. "
+                "You can renew it once it expires, add vehicles to it, or choose a different plan."
+            )
+        elif is_trial and db.query(Subscription).filter(Subscription.clerk_user_id == clerk_user_id).first():
+            blocked = "Free trial already used. Please choose a paid plan."
+        elif active is not None:
+            replaces = QuoteReplaces(
+                planId=active.plan.slug if active.plan else "",
+                planName=active.plan.name if active.plan else "",
+                expiresAt=active.expires_at,
+            )
+
     return PaymentQuoteResponse(
         planId=plan.slug,
         planName=plan.name,
+        purpose=purpose,
         amount=amount,
         currency=cfg["currency"],
-        chargeScope=cfg.get("charge_scope", "flat"),
-        unitPrice=float(cfg.get("price", 0.0)),
+        chargeScope=cfg.get("charge_scope", "per_device"),
+        unitPrice=unit_price,
+        monthlyPerVehicle=monthly_price(unit_price, cfg["days"]),
+        vehicles=[QuoteVehicle(id=v.id, nickname=v.nickname, plate=v.plate) for v in vehicles],
         billableVehicles=billable,
+        lineItems=line_items,
         durationDays=cfg["days"],
-        startsAt=now,
-        expiresAt=now + timedelta(days=cfg["days"]),
-        requiresPayment=not (is_trial or is_postpaid),
+        startsAt=starts_at,
+        expiresAt=expires_at,
+        requiresPayment=not (is_trial or is_postpaid) and amount > 0,
         replaces=replaces,
         blockedReason=blocked,
     )
+
+
+@router.post("/subscriptions/vehicles", response_model=AddVehiclesResponse)
+async def add_vehicles_to_subscription(
+    body: AddVehiclesRequest,
+    clerk_user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    """
+    Put more vehicles on the current subscription. Vehicles that fit in free
+    slots are added at no charge; beyond that, `txRef` must be a successful
+    add_vehicles payment for exactly these vehicles (see initiate_payment),
+    which buys the extra slots. 402 while that payment is still pending,
+    same polling contract as POST /api/subscriptions. Retrying after
+    success returns the same result.
+    """
+    active = _get_active_subscription(db, clerk_user_id)
+    if active is None or active.plan is None:
+        raise HTTPException(status_code=409, detail="You don't have an active plan to add vehicles to.")
+    cfg = plan_config(db, active.plan.slug)
+
+    def response() -> AddVehiclesResponse:
+        return AddVehiclesResponse(
+            subscriptionId=active.id, expiresAt=active.expires_at, quantity=active.quantity,
+            coveredVehicleIds=sorted(covered_vehicle_ids(db, active)),
+        )
+
+    payment = None
+    if body.txRef:
+        payment = db.query(Payment).filter(
+            Payment.tx_ref == body.txRef,
+            Payment.clerk_user_id == clerk_user_id,
+            Payment.status == "successful",
+        ).first()
+        if payment is None:
+            raise HTTPException(status_code=402, detail="Payment not verified or not found")
+        if payment.purpose != "add_vehicles":
+            raise HTTPException(status_code=409, detail="This payment wasn't for adding vehicles.")
+        if payment.consumed_at is not None:
+            if payment.subscription_id == active.id and set(payment.vehicle_ids or []) <= covered_vehicle_ids(db, active):
+                return response()  # retry of a completed add
+            raise HTTPException(status_code=409, detail=PAYMENT_ALREADY_USED)
+        if set(payment.vehicle_ids or []) != set(body.vehicleIds):
+            raise HTTPException(status_code=409, detail="This payment was for different vehicles.")
+
+    try:
+        vehicles = resolve_selection(db, clerk_user_id, body.vehicleIds)
+        add = plan_add_vehicles(db, active, cfg, active.plan.name, vehicles)
+    except SelectionError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    if add.extra_slots and payment is None:
+        raise HTTPException(
+            status_code=402,
+            detail=f"Payment required for {add.extra_slots} extra vehicle slot{'' if add.extra_slots == 1 else 's'}.",
+        )
+
+    try:
+        if payment is not None:
+            if not _claim_payment(db, payment, active):
+                db.rollback()
+                raise HTTPException(status_code=409, detail=PAYMENT_ALREADY_USED)
+            # The slots the payment actually bought (priced when it started).
+            active.quantity = (active.quantity or 0) + add.extra_slots
+        cover_vehicles(db, active, vehicles, payment)
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error("DB error adding vehicles to subscription %s: %s", active.id, exc)
+        raise HTTPException(status_code=500, detail="Database error")
+
+    logger.info("Added %d vehicle(s) to subscription %s (extra slots %d) for user %s",
+                len(vehicles), active.id, add.extra_slots if payment else 0, clerk_user_id)
+    return response()
 
 
 # ── Endpoint 10: GET /api/billing/admin/summary ──────────────────────────────
@@ -1307,6 +1515,9 @@ async def admin_assign_subscription(
         expires_at = body.expires_at or (datetime.utcnow() + timedelta(days=cfg["days"]))
         price = body.price if body.price is not None else cfg.get("price", 0.0)
 
+        # An admin assignment covers every vehicle the client has (with a
+        # slot each) — the admin overrides, the client doesn't choose.
+        vehicles = owner_vehicles(db, user.clerk_user_id)
         new_sub = Subscription(
             clerk_user_id=user.clerk_user_id,
             plan_id=plan.id,
@@ -1314,8 +1525,11 @@ async def admin_assign_subscription(
             price=price,
             started_at=datetime.utcnow(),
             expires_at=expires_at,
+            quantity=max(1, len(vehicles)),
         )
         db.add(new_sub)
+        db.flush()
+        cover_vehicles(db, new_sub, vehicles)
         db.commit()
         db.refresh(new_sub)
     except SQLAlchemyError as exc:

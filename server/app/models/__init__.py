@@ -12,11 +12,11 @@ from app.models.entitlement import Feature, PlanFeature, EntitlementCheckLog
 from app.models.trip import Trip
 from app.models.trip_settings import TripSettings
 from app.models.vehicle import Vehicle
-from app.models.subscription import Subscription, Payment
+from app.models.subscription import Subscription, Payment, SubscriptionVehicle
 from app.models.geocode_cache import GeocodeCache
 from app.models.command_settings import CommandSettings
 from app.models.alert_settings import AlertSettings
 from app.models.alarm_push_state import AlarmPushState
 from app.models.contact_request import ContactRequest
 
-__all__ = ['Device', 'Location', 'LocationQualityLog', 'User', 'Geofence', 'GeofenceDeviceState', 'GeofenceDevice', 'GeofenceVersion', 'Feature', 'PlanFeature', 'EntitlementCheckLog', 'Trip', 'TripSettings', 'Vehicle', 'Subscription', 'Payment', 'GeocodeCache', 'CommandSettings', 'AlertSettings', 'AlarmPushState', 'ContactRequest']
+__all__ = ['Device', 'Location', 'LocationQualityLog', 'User', 'Geofence', 'GeofenceDeviceState', 'GeofenceDevice', 'GeofenceVersion', 'Feature', 'PlanFeature', 'EntitlementCheckLog', 'Trip', 'TripSettings', 'Vehicle', 'Subscription', 'Payment', 'SubscriptionVehicle', 'GeocodeCache', 'CommandSettings', 'AlertSettings', 'AlarmPushState', 'ContactRequest']

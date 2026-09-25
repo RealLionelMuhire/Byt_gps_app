@@ -1,4 +1,4 @@
-from sqlalchemy import Column, Integer, String, DateTime, Float, Boolean, ForeignKey
+from sqlalchemy import Column, Integer, String, DateTime, Float, Boolean, ForeignKey, JSON, UniqueConstraint
 from sqlalchemy.orm import relationship
 from datetime import datetime
 from app.core.database import Base
@@ -24,7 +24,7 @@ class SubscriptionPlan(Base):
     slug = Column(String(50), unique=True, nullable=False, index=True)
     billing_type = Column(String(20), nullable=False, default="recurrent")  # one_time | recurrent
     billing_model = Column(String(20), nullable=False, default="prepaid")   # prepaid | postpaid
-    charge_scope = Column(String(20), nullable=False, default="flat")       # per_device | flat
+    charge_scope = Column(String(20), nullable=False, default="per_device") # per_device | flat (all plans per vehicle since migration 048)
     price = Column(Float, nullable=False, default=0.0)
     currency = Column(String(10), nullable=False, default="RWF")
     duration_value = Column(Integer, nullable=False, default=1)
@@ -65,8 +65,34 @@ class Subscription(Base):
     # scripts/cron_expiry.py's notify_expiring_subscriptions) so the
     # reminder fires exactly once per subscription, not on every cron run.
     expiry_reminder_sent_at = Column(DateTime, nullable=True)
+    # Vehicle slots paid for (migration 048) — every plan is priced per
+    # vehicle, and a subscription covers at most this many vehicles (see
+    # SubscriptionVehicle). A vehicle can take a free slot at no charge;
+    # more vehicles than slots means buying extra slots, prorated.
+    quantity = Column(Integer, nullable=False, default=1)
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+
+    vehicles = relationship("SubscriptionVehicle", back_populates="subscription",
+                            cascade="all, delete-orphan", passive_deletes=True)
+
+
+class SubscriptionVehicle(Base):
+    """One vehicle a subscription covers (migration 048). Uncovered vehicles
+    stay on the account but their premium features are refused — see
+    app/services/entitlements.py's vehicle_not_covered reason."""
+    __tablename__ = "subscription_vehicles"
+    __table_args__ = (UniqueConstraint("subscription_id", "vehicle_id", name="uq_subscription_vehicles_pair"),)
+
+    id = Column(Integer, primary_key=True, index=True)
+    subscription_id = Column(Integer, ForeignKey("subscriptions.id", ondelete="CASCADE"), nullable=False, index=True)
+    vehicle_id = Column(Integer, ForeignKey("vehicles.id", ondelete="CASCADE"), nullable=False, index=True)
+    # The payment that bought this vehicle's slot, if any (NULL for a free
+    # slot, the trial, an admin assignment, or the migration backfill).
+    payment_id = Column(Integer, ForeignKey("payments.id"), nullable=True)
+    added_at = Column(DateTime, default=datetime.utcnow)
+
+    subscription = relationship("Subscription", back_populates="vehicles")
 
 
 class Payment(Base):
@@ -87,3 +113,9 @@ class Payment(Base):
     # app/api/onboarding.py's _claim_payment.
     consumed_at = Column(DateTime, nullable=True)
     subscription_id = Column(Integer, ForeignKey("subscriptions.id"), nullable=True)
+    # What the payment is for (migration 048): "subscribe" (a new
+    # subscription, incl. switching plans) or "add_vehicles" (extra slots
+    # on the current subscription, prorated), and exactly which vehicles —
+    # fixed at payment time so activation can't cover more than was paid.
+    purpose = Column(String(20), nullable=False, default="subscribe")
+    vehicle_ids = Column(JSON, nullable=True)

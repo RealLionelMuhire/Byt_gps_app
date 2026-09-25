@@ -27,6 +27,7 @@ from app.core.database import get_db
 from app.core.serialization import UtcDateTime
 from app.core.auth import require_auth, require_admin
 from app.services.entitlements import seed_plan_features
+from app.services.subscription_billing import monthly_price
 from app.models.entitlement import Feature, PlanFeature
 from app.models.subscription import SubscriptionPlan
 from app.models.user import User
@@ -45,9 +46,9 @@ VALID_CHARGE_SCOPES = {"per_device", "flat"}
 # Legacy hardcoded pricing — used only as a fallback when a plan with the
 # given slug doesn't exist in the DB yet (e.g. before migration 014 runs).
 FALLBACK_PLANS = {
-    "trial": {"price": 0, "days": 14, "max_devices": 1, "currency": "RWF", "billing_model": "prepaid", "charge_scope": "flat"},
-    "basic": {"price": 2450, "days": 30, "max_devices": 3, "currency": "RWF", "billing_model": "prepaid", "charge_scope": "flat"},
-    "fleet": {"price": 15000, "days": 30, "max_devices": None, "currency": "RWF", "billing_model": "prepaid", "charge_scope": "flat"},
+    "trial": {"price": 0, "days": 14, "max_devices": 1, "currency": "RWF", "billing_model": "prepaid", "charge_scope": "per_device"},
+    "basic": {"price": 2450, "days": 30, "max_devices": 3, "currency": "RWF", "billing_model": "prepaid", "charge_scope": "per_device"},
+    "fleet": {"price": 15000, "days": 30, "max_devices": None, "currency": "RWF", "billing_model": "prepaid", "charge_scope": "per_device"},
 }
 
 
@@ -109,7 +110,7 @@ class SubscriptionPlanCreate(BaseModel):
     slug: str
     billing_type: str = "recurrent"
     billing_model: str = "prepaid"
-    charge_scope: str = "flat"
+    charge_scope: str = "per_device"
     price: float = 0.0
     currency: str = "RWF"
     duration_value: int = 1
@@ -248,6 +249,9 @@ class SubscriptionPlanResponse(BaseModel):
     # What the plan includes, in catalog order — only filled in by the list
     # endpoint (the pricing screen's source); [] elsewhere.
     features: List[PlanFeatureSummary] = []
+    # Per-vehicle price normalized to 30 days, so plans of different
+    # lengths compare fairly (every plan is priced per vehicle).
+    monthly_price: Optional[float] = None
 
     class Config:
         from_attributes = True
@@ -293,7 +297,10 @@ async def list_subscription_plans(
     plans = query.order_by(SubscriptionPlan.price.asc(), SubscriptionPlan.id.asc()).all()
     features = _features_by_plan(db, [p.id for p in plans])
     return [
-        SubscriptionPlanResponse.model_validate(p).model_copy(update={"features": features.get(p.id, [])})
+        SubscriptionPlanResponse.model_validate(p).model_copy(update={
+            "features": features.get(p.id, []),
+            "monthly_price": monthly_price(p.price, p.duration_days),
+        })
         for p in plans
     ]
 
