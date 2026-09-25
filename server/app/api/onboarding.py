@@ -221,6 +221,7 @@ class PaymentRecord(BaseModel):
     amount: float
     status: str
     createdAt: UtcDateTime
+    currency: str = "RWF"
 
     class Config:
         from_attributes = True
@@ -230,6 +231,40 @@ class BillingResponse(BaseModel):
     currentPlan: str
     expiresAt: Optional[UtcDateTime]
     payments: list[PaymentRecord]
+    # Additive (older app versions ignore them): the plan's real display
+    # name, and when the current subscription started — so the app can show
+    # "Basic" instead of a slug-derived label, and an accurate time-used bar.
+    currentPlanName: Optional[str] = None
+    startedAt: Optional[UtcDateTime] = None
+
+
+class QuoteReplaces(BaseModel):
+    planId: str
+    planName: str
+    expiresAt: UtcDateTime
+
+
+class PaymentQuoteResponse(BaseModel):
+    planId: str
+    planName: str
+    amount: float
+    currency: str
+    chargeScope: str
+    unitPrice: float
+    # Vehicles the amount covers (per_device plans only).
+    billableVehicles: Optional[int] = None
+    durationDays: int
+    startsAt: UtcDateTime
+    expiresAt: UtcDateTime
+    # False for the trial and postpaid plans — no mobile-money step.
+    requiresPayment: bool
+    # The active subscription this purchase would end immediately (an
+    # upgrade/switch cancels the current plan, with no carry-over).
+    replaces: Optional[QuoteReplaces] = None
+    # Why this purchase would be refused, in words the app can show as-is —
+    # computed BEFORE the customer enters a phone number, so no one is sent
+    # a payment prompt for something activation would reject.
+    blockedReason: Optional[str] = None
 
 
 # ── Endpoint 1: POST /api/users  (Step 4) ────────────────────────────────────
@@ -989,13 +1024,84 @@ async def get_billing_history(
             planId=p.plan.slug if p.plan else "",
             amount=p.amount,
             status=p.status,
-            createdAt=p.verified_at
+            createdAt=p.verified_at,
+            currency=p.currency or "RWF",
         ))
 
     return BillingResponse(
         currentPlan=sub.plan.slug if sub and sub.plan else "trial",
         expiresAt=sub.expires_at if sub else None,
-        payments=payment_records
+        payments=payment_records,
+        currentPlanName=sub.plan.name if sub and sub.plan else None,
+        startedAt=sub.started_at if sub else None,
+    )
+
+
+@router.get("/payments/quote", response_model=PaymentQuoteResponse)
+async def get_payment_quote(
+    planId: str,
+    clerk_user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    """
+    What buying `planId` right now would cost and do — for the checkout
+    summary, shown before any payment starts. Uses exactly the same charge
+    formula as initiate_payment/activation (_effective_charge), and the
+    same refusal rules, so the summary can never promise something the
+    purchase then contradicts.
+    """
+    if not plan_purchasable(db, planId):
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid or unavailable planId — choose an active plan from the pricing screen.",
+        )
+    plan = get_plan_by_slug(db, planId, include_inactive=True)
+    if plan is None:
+        raise HTTPException(status_code=500, detail="This plan isn't fully set up yet. Please try again later.")
+
+    cfg = plan_config(db, planId)
+    is_trial = plan.slug == "trial"
+    is_postpaid = cfg.get("billing_model") == "postpaid"
+    amount = 0.0 if is_trial else _effective_charge(db, cfg, clerk_user_id)
+
+    billable = None
+    if cfg.get("charge_scope") == "per_device" and not is_trial:
+        billable = _device_count_for_user(db, clerk_user_id)
+        if cfg.get("max_devices") and billable > cfg["max_devices"]:
+            billable = cfg["max_devices"]
+
+    active = _get_active_subscription(db, clerk_user_id)
+    blocked = None
+    replaces = None
+    if active and active.plan_id == plan.id:
+        blocked = (
+            f"You're already on this plan until {active.expires_at:%b %d, %Y}. "
+            "You can renew it once it expires, or choose a different plan."
+        )
+    elif is_trial and db.query(Subscription).filter(Subscription.clerk_user_id == clerk_user_id).first():
+        blocked = "Free trial already used. Please choose a paid plan."
+    elif active is not None:
+        replaces = QuoteReplaces(
+            planId=active.plan.slug if active.plan else "",
+            planName=active.plan.name if active.plan else "",
+            expiresAt=active.expires_at,
+        )
+
+    now = datetime.utcnow()
+    return PaymentQuoteResponse(
+        planId=plan.slug,
+        planName=plan.name,
+        amount=amount,
+        currency=cfg["currency"],
+        chargeScope=cfg.get("charge_scope", "flat"),
+        unitPrice=float(cfg.get("price", 0.0)),
+        billableVehicles=billable,
+        durationDays=cfg["days"],
+        startsAt=now,
+        expiresAt=now + timedelta(days=cfg["days"]),
+        requiresPayment=not (is_trial or is_postpaid),
+        replaces=replaces,
+        blockedReason=blocked,
     )
 
 

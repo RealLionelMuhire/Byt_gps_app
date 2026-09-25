@@ -27,6 +27,7 @@ from app.core.database import get_db
 from app.core.serialization import UtcDateTime
 from app.core.auth import require_auth, require_admin
 from app.services.entitlements import seed_plan_features
+from app.models.entitlement import Feature, PlanFeature
 from app.models.subscription import SubscriptionPlan
 from app.models.user import User
 
@@ -217,6 +218,17 @@ class SubscriptionPlanUpdate(BaseModel):
         return v
 
 
+class PlanFeatureSummary(BaseModel):
+    """One feature a plan includes, for the pricing screen. `limit` only
+    applies to limit features (None = unlimited)."""
+    key: str
+    name: str
+    group: str
+    kind: str
+    unit: Optional[str] = None
+    limit: Optional[int] = None
+
+
 class SubscriptionPlanResponse(BaseModel):
     id: int
     name: str
@@ -233,9 +245,36 @@ class SubscriptionPlanResponse(BaseModel):
     description: Optional[str]
     is_active: bool
     created_at: Optional[UtcDateTime] = None
+    # What the plan includes, in catalog order — only filled in by the list
+    # endpoint (the pricing screen's source); [] elsewhere.
+    features: List[PlanFeatureSummary] = []
 
     class Config:
         from_attributes = True
+
+
+def _features_by_plan(db: Session, plan_ids: List[int]) -> dict:
+    """plan_id -> [PlanFeatureSummary], one query for every plan."""
+    if not plan_ids:
+        return {}
+    rows = (
+        db.query(PlanFeature, Feature)
+        .join(Feature, Feature.key == PlanFeature.feature_key)
+        .filter(
+            PlanFeature.plan_id.in_(plan_ids),
+            PlanFeature.enabled == True,  # noqa: E712
+            Feature.is_active == True,  # noqa: E712
+        )
+        .order_by(Feature.sort_order, Feature.key)
+        .all()
+    )
+    result: dict = {}
+    for pf, f in rows:
+        result.setdefault(pf.plan_id, []).append(PlanFeatureSummary(
+            key=f.key, name=f.name, group=f.group, kind=f.kind, unit=f.unit,
+            limit=pf.limit_value if f.kind == "limit" else None,
+        ))
+    return result
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────────
@@ -251,7 +290,12 @@ async def list_subscription_plans(
     query = db.query(SubscriptionPlan)
     if not include_inactive:
         query = query.filter(SubscriptionPlan.is_active == True)
-    return query.order_by(SubscriptionPlan.price.asc(), SubscriptionPlan.id.asc()).all()
+    plans = query.order_by(SubscriptionPlan.price.asc(), SubscriptionPlan.id.asc()).all()
+    features = _features_by_plan(db, [p.id for p in plans])
+    return [
+        SubscriptionPlanResponse.model_validate(p).model_copy(update={"features": features.get(p.id, [])})
+        for p in plans
+    ]
 
 
 @router.post("", response_model=SubscriptionPlanResponse, status_code=201)
