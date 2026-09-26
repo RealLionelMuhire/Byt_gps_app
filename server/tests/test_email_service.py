@@ -151,7 +151,7 @@ async def test_send_payment_receipt_email_uses_receipt_template(monkeypatch):
 
     assert result is True
     assert posts[0]["json"]["template_id"] == "template_receipt"
-    assert posts[0]["json"]["template_params"]["amount"] == "2450"
+    assert posts[0]["json"]["template_params"]["amount"] == "2,450"
     assert posts[0]["json"]["template_params"]["currency"] == "RWF"
 
 

@@ -72,6 +72,9 @@ class Settings(BaseSettings):
     EMAILJS_TEMPLATE_ID_EXPIRING: Optional[str] = None
     EMAILJS_TEMPLATE_ID_EXPIRED: Optional[str] = None
     EMAILJS_TEMPLATE_ID_PAYMENT_FAILED: Optional[str] = None
+    # Customer-facing dates in emails are shown in this fixed UTC offset —
+    # Rwanda (CAT, UTC+2, no daylight saving), where every customer pays.
+    DISPLAY_UTC_OFFSET_HOURS: int = 2
 
     # Firebase Cloud Messaging (push notifications) — see app/services/push_notifications.py.
     # Set exactly one of these to enable FCM sending; if neither is set, FCM sending

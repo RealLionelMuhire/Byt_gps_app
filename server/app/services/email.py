@@ -16,7 +16,8 @@ by whoever authors the template, not by this code.
 """
 
 import logging
-from typing import Optional
+from datetime import datetime, timedelta, timezone
+from typing import Iterable, Optional
 
 import httpx
 
@@ -98,20 +99,76 @@ def _user_display_name(user: User) -> str:
     return name or user.email
 
 
-async def send_payment_receipt_email(user: User, payment: Payment, plan_name: str) -> bool:
-    """Sent when a Payment row is confirmed successful (webhook or cron reconciliation)."""
+def _local_date(value: datetime) -> str:
+    """'Sep 26, 2026' in the customers' time zone (naive datetimes are UTC)."""
+    tz = timezone(timedelta(hours=settings.DISPLAY_UTC_OFFSET_HOURS))
+    aware = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+    local = aware.astimezone(tz)
+    return f"{local:%b} {local.day}, {local.year}"
+
+
+def _money(amount: float, currency: str) -> str:
+    return f"{amount:,.0f} {currency}" if float(amount).is_integer() else f"{amount:,.2f} {currency}"
+
+
+def receipt_details(
+    *, plan_name: str, payment: Payment, vehicles: Iterable, period_start: Optional[datetime],
+    period_end: datetime, added_vehicles: bool,
+) -> dict:
+    """The receipt's content, as EmailJS template params. `message` holds
+    the whole receipt as plain text so an existing template that only shows
+    {{message}} still carries everything; the individual fields are there
+    for a template that lays them out."""
+    vehicle_list = ", ".join(
+        f"{v.plate} ({v.nickname})" if v.plate and v.nickname else (v.plate or v.nickname) for v in vehicles
+    ) or "—"
+    coverage = (
+        f"Added to your plan until {_local_date(period_end)}"
+        if added_vehicles or period_start is None
+        else f"{_local_date(period_start)} – {_local_date(period_end)}"
+    )
+    paid_on = _local_date(payment.verified_at or datetime.utcnow())
+    amount = _money(payment.amount, payment.currency)
+    purchase = "Vehicles added to plan" if added_vehicles else "Plan purchase"
+    lines = [
+        f"{purchase} — {plan_name}",
+        f"Vehicles: {vehicle_list}",
+        f"Coverage: {coverage}",
+        f"Amount paid: {amount} (Mobile Money)",
+        f"Payment reference: {payment.tx_ref}",
+        f"Paid on: {paid_on}",
+    ]
+    return {
+        "subject": f"Receipt — {plan_name} — Track IQ",
+        "plan_name": plan_name,
+        "purchase": purchase,
+        "vehicles": vehicle_list,
+        "coverage": coverage,
+        "amount": f"{payment.amount:,.0f}",
+        "currency": payment.currency,
+        "amount_paid": amount,
+        "tx_ref": payment.tx_ref,
+        "paid_on": paid_on,
+        "message": "\n".join(lines),
+    }
+
+
+async def send_payment_receipt_email(
+    user: User, payment: Payment, plan_name: str, *, vehicles: Iterable = (),
+    period_start: Optional[datetime] = None, period_end: Optional[datetime] = None,
+    added_vehicles: bool = False,
+) -> bool:
+    """The customer's receipt, sent once a paid purchase is ACTIVATED
+    (app/api/onboarding.py) — that's when the plan, the vehicles covered and
+    the exact period are final, so one email carries all of it."""
     return await send_email(
         to_email=user.email,
         to_name=_user_display_name(user),
         template_id=settings.EMAILJS_TEMPLATE_ID_RECEIPT,
-        template_params={
-            "subject": "Payment received — Track IQ",
-            "plan_name": plan_name,
-            "amount": f"{payment.amount:.0f}",
-            "currency": payment.currency,
-            "tx_ref": payment.tx_ref,
-            "message": f"We received your payment of {payment.amount:.0f} {payment.currency} for the {plan_name} plan.",
-        },
+        template_params=receipt_details(
+            plan_name=plan_name, payment=payment, vehicles=vehicles, period_start=period_start,
+            period_end=period_end or datetime.utcnow(), added_vehicles=added_vehicles,
+        ),
     )
 
 

@@ -21,7 +21,7 @@ import uuid
 from datetime import datetime, timedelta
 from typing import List, Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Request
 from pydantic import BaseModel
 from sqlalchemy import func
 from sqlalchemy.orm import Session, joinedload
@@ -44,6 +44,8 @@ from app.models.subscription import Subscription, Payment
 from app.api.devices import _check_pair_rate_limit, _release_device_to_inventory
 from app.api.auth import claim_pending_client_user
 from app.api.subscriptions import plan_config, plan_purchasable, get_plan_by_slug
+from app.core.config import settings
+from app.services.email import _user_display_name as _email_display_name, receipt_details, send_email
 from app.services.subscription_billing import (
     SelectionError, check_slot_cap, cover_vehicles, covered_vehicle_ids, monthly_price,
     owner_vehicles, paid_slots, plan_add_vehicles, resolve_selection, subscribe_amount,
@@ -708,6 +710,31 @@ async def initiate_payment(
     )
 
 
+def _email_receipt(
+    background_tasks: BackgroundTasks, db: Session, clerk_user_id: str, payment: Optional[Payment],
+    plan_name: str, vehicles, period_start: Optional[datetime], period_end: datetime, added_vehicles: bool,
+) -> None:
+    """Queue the customer's receipt for a PAID activation, sent after the
+    response (EmailJS can take seconds). The content is built now, while
+    the session is open; only the send runs later. Never raises — a receipt
+    problem must not fail an activation that already committed."""
+    if payment is None:
+        return
+    try:
+        user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
+        if user is None or not user.email:
+            return
+        params = receipt_details(
+            plan_name=plan_name, payment=payment, vehicles=vehicles,
+            period_start=period_start, period_end=period_end, added_vehicles=added_vehicles,
+        )
+        background_tasks.add_task(
+            send_email, user.email, _email_display_name(user), settings.EMAILJS_TEMPLATE_ID_RECEIPT, params,
+        )
+    except Exception as exc:  # noqa: BLE001 — see docstring
+        logger.warning("Could not queue receipt email for payment %s: %s", getattr(payment, "tx_ref", "?"), exc)
+
+
 def _activation_selection(db, clerk_user_id, plan, cfg, payment, requested_ids):
     """(vehicles, paid slots, amount charged) for activating `plan`.
 
@@ -731,6 +758,7 @@ def _activation_selection(db, clerk_user_id, plan, cfg, payment, requested_ids):
 @router.post("/subscriptions", response_model=SubscriptionResponse, status_code=201)
 async def create_subscription(
     body: SubscriptionRequest,
+    background_tasks: BackgroundTasks,
     clerk_user_id: str = Depends(require_auth),
     db: Session = Depends(get_db),
 ):
@@ -868,6 +896,8 @@ async def create_subscription(
             " (postpaid — to be invoiced)" if is_postpaid else "",
             clerk_user_id, expires_at.isoformat(),
         )
+        _email_receipt(background_tasks, db, clerk_user_id, payment, plan.name, vehicles,
+                       subscription.started_at, expires_at, added_vehicles=False)
         return SubscriptionResponse(subscriptionId=subscription.id, expiresAt=expires_at)
 
     except SQLAlchemyError as exc:
@@ -881,6 +911,7 @@ async def create_subscription(
 @router.post("/subscriptions/upgrade", response_model=SubscriptionResponse, status_code=201)
 async def upgrade_subscription(
     body: SubscriptionUpgradeRequest,
+    background_tasks: BackgroundTasks,
     clerk_user_id: str = Depends(require_auth),
     db: Session = Depends(get_db),
 ):
@@ -1019,6 +1050,8 @@ async def upgrade_subscription(
             " (postpaid — to be invoiced)" if is_postpaid else "",
             clerk_user_id, expires_at.isoformat(),
         )
+        _email_receipt(background_tasks, db, clerk_user_id, payment, plan.name, vehicles,
+                       new_sub.started_at, expires_at, added_vehicles=False)
         return SubscriptionResponse(subscriptionId=new_sub.id, expiresAt=expires_at)
 
     except SQLAlchemyError as exc:
@@ -1242,6 +1275,7 @@ async def get_payment_quote(
 @router.post("/subscriptions/vehicles", response_model=AddVehiclesResponse)
 async def add_vehicles_to_subscription(
     body: AddVehiclesRequest,
+    background_tasks: BackgroundTasks,
     clerk_user_id: str = Depends(require_auth),
     db: Session = Depends(get_db),
 ):
@@ -1310,6 +1344,8 @@ async def add_vehicles_to_subscription(
 
     logger.info("Added %d vehicle(s) to subscription %s (extra slots %d) for user %s",
                 len(vehicles), active.id, add.extra_slots if payment else 0, clerk_user_id)
+    _email_receipt(background_tasks, db, clerk_user_id, payment, active.plan.name, vehicles,
+                   None, active.expires_at, added_vehicles=True)
     return response()
 
 

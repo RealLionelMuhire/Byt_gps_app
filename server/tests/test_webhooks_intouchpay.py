@@ -1,7 +1,8 @@
 """
-Tests for POST /api/webhooks/intouchpay's email side-effects: a receipt email
-on a payment reconciled successful, a failure email on one reconciled
-failed. get_transaction_status/classify_status (the actual IntouchPay call)
+Tests for POST /api/webhooks/intouchpay's email side-effects: a failure
+email on a payment reconciled failed, and NO email on success — the receipt
+is sent at activation instead (see tests/test_receipt_email.py), once the
+vehicles and period are final. get_transaction_status/classify_status (the actual IntouchPay call)
 and the email service are both monkeypatched — this only tests that the
 right email is triggered for the right outcome, not real IntouchPay/EmailJS
 delivery.
@@ -36,15 +37,10 @@ def webhook_client(db_session, monkeypatch):
 def emails_sent(monkeypatch):
     sent = []
 
-    async def fake_receipt(user, payment, plan_name):
-        sent.append(("receipt", user.id, payment.tx_ref, plan_name))
-        return True
-
     async def fake_failed(user, payment):
         sent.append(("failed", user.id, payment.tx_ref))
         return True
 
-    monkeypatch.setattr(webhooks, "send_payment_receipt_email", fake_receipt)
     monkeypatch.setattr(webhooks, "send_payment_failed_email", fake_failed)
     return sent
 
@@ -71,7 +67,7 @@ def user_and_payment(db_session):
     return user, payment
 
 
-def test_webhook_sends_receipt_email_on_success(webhook_client, emails_sent, user_and_payment, monkeypatch):
+def test_webhook_sends_no_email_on_success(webhook_client, emails_sent, user_and_payment, monkeypatch):
     user, payment = user_and_payment
 
     async def fake_get_transaction_status(tx_ref, provider_tx_id=None):
@@ -83,7 +79,7 @@ def test_webhook_sends_receipt_email_on_success(webhook_client, emails_sent, use
     resp = webhook_client.post("/api/webhooks/intouchpay", json={"requesttransactionid": "IPabc123", "status": "successful"})
 
     assert resp.status_code == 200
-    assert emails_sent == [("receipt", user.id, "IPabc123", "Basic")]
+    assert emails_sent == []  # the receipt goes out at activation
 
 
 def test_webhook_sends_failed_email_on_confirmed_failure(webhook_client, emails_sent, user_and_payment, monkeypatch):

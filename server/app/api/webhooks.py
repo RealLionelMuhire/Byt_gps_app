@@ -21,7 +21,7 @@ from app.models.disbursement import Disbursement
 from app.models.trip import Trip
 from app.api.auth import claim_pending_client_user
 from app.services.intouchpay import get_transaction_status, classify_status, IntouchPayError
-from app.services.email import send_payment_receipt_email, send_payment_failed_email
+from app.services.email import send_payment_failed_email
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -216,12 +216,12 @@ async def _send_payment_result_email(db: Session, payment: Payment, *, succeeded
     if not user:
         return
     if succeeded:
-        # Payment.plan_id is a real FK (migrations 041/042) — payment.plan
-        # is the relationship, not a slug to re-look-up.
-        plan_name = payment.plan.name if payment.plan else "Unknown"
-        await send_payment_receipt_email(user, payment, plan_name)
-    else:
-        await send_payment_failed_email(user, payment)
+        # The receipt is sent at activation instead (app/api/onboarding.py's
+        # _email_receipt), once the plan, vehicles and period are final —
+        # one complete email per purchase rather than a thin "payment
+        # received" now plus details later.
+        return
+    await send_payment_failed_email(user, payment)
 
 
 async def _handle_payment_callback(
