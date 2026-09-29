@@ -1610,6 +1610,11 @@ async def admin_extend_subscription(
     if not sub:
         raise HTTPException(status_code=404, detail="User has no subscription to adjust")
 
+    if sub.expires_at != body.expires_at:
+        # A new expiry date gets its own reminders (subscription_reminders
+        # rows are per expiry date, migration 050) — clear the legacy
+        # single-reminder flag so it doesn't claim the new date was notified.
+        sub.expiry_reminder_sent_at = None
     sub.expires_at = body.expires_at
     if sub.status == "expired" and body.expires_at > datetime.utcnow():
         sub.status = "active"

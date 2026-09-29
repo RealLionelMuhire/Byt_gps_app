@@ -183,9 +183,19 @@ async def handle_user_deleted(clerk_user_id: str, db: Session):
         # Delete vehicles belonging to this user
         db.query(Vehicle).filter(Vehicle.clerk_user_id == clerk_user_id).delete(synchronize_session=False)
 
-        # Delete subscriptions and payments
-        db.query(Subscription).filter(Subscription.clerk_user_id == clerk_user_id).delete(synchronize_session=False)
-        db.query(Payment).filter(Payment.clerk_user_id == clerk_user_id).delete(synchronize_session=False)
+        # Keep subscriptions and payments: they're the financial record of
+        # money actually received (and possibly refunded — disbursements
+        # reference payments.id, so deleting a refunded payment would fail
+        # the whole webhook). Both are keyed by clerk_user_id, not a users FK,
+        # so they survive the user row; the admin dashboard shows them as a
+        # deleted account. Only end the subscription.
+        db.query(Subscription).filter(
+            Subscription.clerk_user_id == clerk_user_id,
+            Subscription.status == "active",
+        ).update(
+            {Subscription.status: "cancelled", Subscription.updated_at: datetime.utcnow()},
+            synchronize_session=False,
+        )
 
         # Finally, delete the user
         db.delete(user)

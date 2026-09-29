@@ -107,6 +107,11 @@ class Payment(Base):
     amount = Column(Float, nullable=False)
     currency = Column(String(10), default="RWF")
     status = Column(String(20), nullable=False)
+    # When the payment was initiated (migration 049) — never updated.
+    # verified_at below is overwritten when the status is resolved, so it
+    # can't answer "how long has this been pending" or "which day was this
+    # paid".
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
     verified_at = Column(DateTime, default=datetime.utcnow)
     # Set once this payment has activated a subscription (migration 046) —
     # a consumed payment can never fund another one. Claimed atomically by
@@ -119,3 +124,26 @@ class Payment(Base):
     # fixed at payment time so activation can't cover more than was paid.
     purpose = Column(String(20), nullable=False, default="subscribe")
     vehicle_ids = Column(JSON, nullable=True)
+
+
+class SubscriptionReminder(Base):
+    """One expiry reminder sent for a subscription (migration 050) — see
+    app/services/expiry_reminders.py for the stages and scripts/cron_expiry.py
+    for the sender. `expires_at` is the expiry the reminder was about, so
+    extending a subscription makes its stages due again for the new date.
+
+    email_sent / push_sent: True = accepted by the provider, False = not
+    sent (skipped or rejected), None = unknown (backfilled rows)."""
+    __tablename__ = "subscription_reminders"
+    __table_args__ = (
+        UniqueConstraint("subscription_id", "stage", "expires_at", name="uq_subscription_reminders_stage"),
+    )
+
+    id = Column(Integer, primary_key=True, index=True)
+    subscription_id = Column(Integer, ForeignKey("subscriptions.id", ondelete="CASCADE"), nullable=False, index=True)
+    clerk_user_id = Column(String(255), nullable=False, index=True)
+    stage = Column(String(10), nullable=False)  # 14d | 7d | 3d | expired
+    expires_at = Column(DateTime, nullable=False)
+    sent_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    email_sent = Column(Boolean, nullable=True)
+    push_sent = Column(Boolean, nullable=True)

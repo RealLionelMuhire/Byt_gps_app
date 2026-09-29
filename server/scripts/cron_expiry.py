@@ -10,9 +10,10 @@ from sqlalchemy.orm import joinedload
 
 from app.core.config import settings
 from app.core.database import SessionLocal
-from app.models.subscription import Subscription, Payment, SubscriptionPlan
+from app.models.subscription import Subscription, Payment, SubscriptionPlan, SubscriptionReminder
 from app.models.disbursement import Disbursement
 from app.models.user import User
+from app.services.expiry_reminders import due_stage, REMINDER_STAGES, EXPIRED_STAGE
 from app.services.intouchpay import get_transaction_status, classify_status, IntouchPayError
 from app.services.push_notifications import send_push_notification
 from app.services.email import (
@@ -31,9 +32,24 @@ logger = logging.getLogger(__name__)
 PENDING_RECONCILE_AFTER_MINUTES = 15   # start checking stuck-pending rows after this long
 PENDING_HARD_FAIL_AFTER_MINUTES = 24 * 60  # give up and mark failed after this long
 
-# How many days before Subscription.expires_at the "expiring soon" push+email
-# fires (once — see Subscription.expiry_reminder_sent_at).
-EXPIRY_WARNING_DAYS = 3
+# The widest reminder window — a subscription further out than this can't be
+# due for anything yet. The stages themselves live in
+# app/services/expiry_reminders.py (shared with the admin dashboard).
+EXPIRY_WARNING_DAYS = max(days for _, days in REMINDER_STAGES)
+
+
+def _record_reminder(db, sub_id, clerk_user_id, stage, expires_at, email_sent, push_sent) -> None:
+    """Log one sent reminder (migration 050) — what the admin dashboard
+    reads to show who was reminded, when, and whether it actually went out."""
+    db.add(SubscriptionReminder(
+        subscription_id=sub_id,
+        clerk_user_id=clerk_user_id,
+        stage=stage,
+        expires_at=expires_at,
+        sent_at=datetime.utcnow(),
+        email_sent=bool(email_sent),
+        push_sent=bool(push_sent),
+    ))
 
 def _expiry_notification_copy(plan_id: str, plan_name: str) -> tuple:
     if plan_id == "trial":
@@ -47,41 +63,56 @@ def _expiry_notification_copy(plan_id: str, plan_name: str) -> tuple:
     )
 
 
-async def _notify_expired_users(clerk_user_ids_and_plans: list) -> None:
-    """Send the expiry push notification for each (clerk_user_id, plan_id) pair.
-    Runs after the DB commit so a slow/failing push never blocks or rolls back
-    the subscription-expiry update itself."""
-    if not clerk_user_ids_and_plans:
+async def _notify_expired_users(expired_targets: list) -> None:
+    """Send the expiry push + email for each (subscription_id,
+    clerk_user_id, plan_slug, expires_at) tuple, and log it as the
+    subscription's "expired" reminder. Runs after the DB commit so a
+    slow/failing push never blocks or rolls back the subscription-expiry
+    update itself."""
+    if not expired_targets:
         return
     db = SessionLocal()
     try:
         plans_by_slug = {p.slug.lower(): p for p in db.query(SubscriptionPlan).all()}
-        for clerk_user_id, plan_id in clerk_user_ids_and_plans:
+        for sub_id, clerk_user_id, plan_id, expires_at in expired_targets:
             user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
             if not user:
                 continue
             plan = plans_by_slug.get((plan_id or "").lower())
             plan_name = plan.name if plan else (plan_id or "").capitalize()
             title, body = _expiry_notification_copy(plan_id, plan_name)
-            await send_push_notification(
+            push_sent = await send_push_notification(
                 user,
                 title=title,
                 body=body,
                 data={"type": "subscription_expired", "screen": "plan_upgrade"},
             )
-            await send_subscription_expired_email(user, plan_name)
+            email_sent = await send_subscription_expired_email(user, plan_name)
+            already = db.query(SubscriptionReminder.id).filter(
+                SubscriptionReminder.subscription_id == sub_id,
+                SubscriptionReminder.stage == EXPIRED_STAGE,
+                SubscriptionReminder.expires_at == expires_at,
+            ).first()
+            if not already:
+                _record_reminder(db, sub_id, clerk_user_id, EXPIRED_STAGE, expires_at, email_sent, push_sent)
+                db.commit()
+    except Exception as e:
+        db.rollback()
+        logger.error(f"Error while notifying expired subscriptions: {e}")
     finally:
         db.close()
 
 
 async def _notify_expiring_subscriptions_async() -> None:
-    """Warn users EXPIRY_WARNING_DAYS before their active subscription
-    expires — push + email, sent exactly once per subscription (guarded by
-    expiry_reminder_sent_at). Unlike _notify_expired_users, this runs before
-    the DB is touched for expiry itself (the subscription is still active),
-    so the reminder flag is committed per-row as it's sent rather than in a
-    single batch — a crash partway through still leaves already-sent rows
-    correctly marked, instead of re-sending them next run."""
+    """Send the staged "expiring soon" reminders (14, 7 and 3 days before
+    Subscription.expires_at — see app/services/expiry_reminders.py for
+    exactly which stage is due when). Each (subscription, stage, expiry) is
+    sent at most once, guarded by its subscription_reminders row, which also
+    records whether the email and push were actually accepted. The row is
+    committed per subscription as it's sent — a crash partway through still
+    leaves already-sent ones correctly logged instead of re-sending them next
+    run. expiry_reminder_sent_at (migration 036) is kept up to date as "most
+    recent reminder" for older readers."""
     db = SessionLocal()
     try:
         now = datetime.utcnow()
@@ -91,18 +122,27 @@ async def _notify_expiring_subscriptions_async() -> None:
             .options(joinedload(Subscription.plan))
             .filter(
                 Subscription.status == "active",
-                Subscription.expires_at >= now,
+                Subscription.expires_at > now,
                 Subscription.expires_at <= window_end,
-                Subscription.expiry_reminder_sent_at.is_(None),
             )
             .all()
         )
 
         if not candidates:
-            logger.info("No subscriptions entering the expiry-warning window.")
+            logger.info("No subscriptions inside an expiry-warning window.")
             return
 
         for sub in candidates:
+            stage = due_stage(sub.status, sub.started_at, sub.expires_at, now)
+            if stage is None:
+                continue
+            already = db.query(SubscriptionReminder.id).filter(
+                SubscriptionReminder.subscription_id == sub.id,
+                SubscriptionReminder.stage == stage,
+                SubscriptionReminder.expires_at == sub.expires_at,
+            ).first()
+            if already:
+                continue
             user = db.query(User).filter(User.clerk_user_id == sub.clerk_user_id).first()
             if not user:
                 continue
@@ -111,19 +151,21 @@ async def _notify_expiring_subscriptions_async() -> None:
             plan_name = sub.plan.name if sub.plan else "Unknown"
             days_left = max(0, (sub.expires_at - now).days)
 
-            await send_push_notification(
+            push_sent = await send_push_notification(
                 user,
                 title="⏳ Your plan is about to expire",
                 body=f"Your {plan_name} plan expires in {days_left} day(s). Renew to keep tracking your vehicles.",
                 data={"type": "subscription_expiring", "screen": "billing"},
             )
-            await send_subscription_expiring_email(user, sub, plan_name, days_left)
+            email_sent = await send_subscription_expiring_email(user, sub, plan_name, days_left)
 
-            sub.expiry_reminder_sent_at = datetime.utcnow()
+            sent_at = datetime.utcnow()
+            _record_reminder(db, sub.id, sub.clerk_user_id, stage, sub.expires_at, email_sent, push_sent)
+            sub.expiry_reminder_sent_at = sent_at
             db.commit()
             logger.info(
-                "Sent expiring-soon reminder for user %s (plan=%s, days_left=%d)",
-                sub.clerk_user_id, plan_name, days_left,
+                "Sent %s expiry reminder for user %s (plan=%s, days_left=%d, email=%s, push=%s)",
+                stage, sub.clerk_user_id, plan_name, days_left, bool(email_sent), bool(push_sent),
             )
     except Exception as e:
         db.rollback()
@@ -165,7 +207,7 @@ def check_expired_subscriptions():
             logger.info(f"Expiring subscription for user {sub.clerk_user_id} (plan {plan_slug})")
             sub.status = "expired"
             sub.updated_at = datetime.utcnow()
-            notify_targets.append((sub.clerk_user_id, plan_slug))
+            notify_targets.append((sub.id, sub.clerk_user_id, plan_slug, sub.expires_at))
 
         db.commit()
         logger.info(f"Successfully expired {len(expired_subs)} subscriptions.")

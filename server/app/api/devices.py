@@ -121,8 +121,9 @@ class DeviceSubscriptionInfo(BaseModel):
 
     status:
       active   — the owner has an unexpired subscription for this scheme
-      expired  — a subscription exists but has lapsed (or was cancelled)
-      none     — no subscription record at all (trial pending or unpaid)
+      expired  — a subscription exists but has lapsed
+      cancelled — the most recent subscription was cancelled
+      none    — no subscription record at all (trial pending or unpaid)
 
     `plan_slug` / `plan_name` / `billing_type` describe the scheme the
     subscription was bought under (e.g. 'basic' / 'Basic' / 'recurrent');
@@ -292,8 +293,11 @@ def _subscription_info_from_sub(sub: Optional[Subscription]) -> DeviceSubscripti
     plan = sub.plan
     now = datetime.utcnow()
     active = sub.status == "active" and sub.expires_at and sub.expires_at > now
+    # A cancelled subscription is reported as such, not folded into
+    # "expired" — the admin portal filters and counts them separately.
+    status = "active" if active else ("cancelled" if sub.status == "cancelled" else "expired")
     return DeviceSubscriptionInfo(
-        status="active" if active else "expired",
+        status=status,
         plan_slug=plan.slug if plan else None,
         plan_name=plan.name if plan else None,
         billing_type=plan.billing_type if plan else None,

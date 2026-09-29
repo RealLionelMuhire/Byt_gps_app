@@ -20,6 +20,7 @@ from app.api import onboarding
 from app.api import subscriptions
 from app.api import entitlements
 from app.api import disbursements
+from app.api import admin_dashboard
 from app import dashboard
 
 # Configure logging
@@ -180,6 +181,7 @@ app.include_router(geofences.router,  prefix="/api/geofences", tags=["geofences"
 app.include_router(webhooks.router,   prefix="/api/webhooks", tags=["webhooks"])
 app.include_router(subscriptions.router, prefix="/api/subscription-plans", tags=["subscriptions"])
 app.include_router(disbursements.router, prefix="/api/admin/disbursements", tags=["disbursements"])
+app.include_router(admin_dashboard.router, prefix="/api/admin/dashboard", tags=["admin-dashboard"])
 app.include_router(entitlements.me_router, prefix="/api/me", tags=["entitlements"])
 app.include_router(entitlements.admin_router, prefix="/api/admin", tags=["entitlements"])
 app.include_router(contact_requests.router, prefix="/api/contact-requests", tags=["contact-requests"])
