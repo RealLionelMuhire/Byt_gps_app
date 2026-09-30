@@ -107,6 +107,16 @@ def _local_date(value: datetime) -> str:
     return f"{local:%b} {local.day}, {local.year}"
 
 
+# Where the app's renew button is (Flutter: Billing & Plan screen).
+_RENEW_PATH = "Billing & Plan, then tap Renew plan"
+
+
+def _days_left_text(days: int) -> str:
+    if days <= 0:
+        return "less than a day left"
+    return f"{days} day{'' if days == 1 else 's'} left"
+
+
 def _money(amount: float, currency: str) -> str:
     return f"{amount:,.0f} {currency}" if float(amount).is_integer() else f"{amount:,.2f} {currency}"
 
@@ -130,16 +140,25 @@ def receipt_details(
     paid_on = _local_date(payment.verified_at or datetime.utcnow())
     amount = _money(payment.amount, payment.currency)
     purchase = "Vehicles added to plan" if added_vehicles else "Plan purchase"
+    intro = (
+        f"We received your payment and added the vehicles below to your {plan_name} plan."
+        if added_vehicles
+        else f"Thank you. We received your payment and your {plan_name} plan is now active."
+    )
     lines = [
-        f"{purchase} — {plan_name}",
+        intro,
+        "",
+        f"Plan: {plan_name}",
         f"Vehicles: {vehicle_list}",
         f"Coverage: {coverage}",
         f"Amount paid: {amount} (Mobile Money)",
         f"Payment reference: {payment.tx_ref}",
-        f"Paid on: {paid_on}",
+        f"Date paid: {paid_on}",
+        "",
+        "Please keep this email as your receipt.",
     ]
     return {
-        "subject": f"Receipt — {plan_name} — Track IQ",
+        "subject": f"Track IQ payment receipt - {plan_name}",
         "plan_name": plan_name,
         "purchase": purchase,
         "vehicles": vehicle_list,
@@ -181,11 +200,18 @@ async def send_subscription_expiring_email(
         to_name=_user_display_name(user),
         template_id=settings.EMAILJS_TEMPLATE_ID_EXPIRING,
         template_params={
-            "subject": "Your Track IQ plan is about to expire",
+            "subject": f"Your Track IQ plan ends on {_local_date(subscription.expires_at)}",
             "plan_name": plan_name,
             "days_left": str(days_left),
             "expires_at": subscription.expires_at.isoformat(),
-            "message": f"Your {plan_name} plan expires in {days_left} day(s). Renew to keep tracking your vehicles.",
+            # Human-readable, in Rwanda time — what a template should show.
+            "expires_on": _local_date(subscription.expires_at),
+            "message": "\n".join([
+                f"Your {plan_name} plan ends on {_local_date(subscription.expires_at)} ({_days_left_text(days_left)}).",
+                "",
+                "To keep tracking your vehicles without a break, renew before that date:",
+                f"open the Track IQ app and go to {_RENEW_PATH}.",
+            ]),
         },
     )
 
@@ -197,9 +223,14 @@ async def send_subscription_expired_email(user: User, plan_name: str) -> bool:
         to_name=_user_display_name(user),
         template_id=settings.EMAILJS_TEMPLATE_ID_EXPIRED,
         template_params={
-            "subject": "Your Track IQ plan has expired",
+            "subject": "Your Track IQ plan has ended",
             "plan_name": plan_name,
-            "message": f"Your {plan_name} plan has expired. Renew to keep tracking your vehicles.",
+            "message": "\n".join([
+                f"Your {plan_name} plan has ended.",
+                "",
+                "To keep using live tracking, trip history and alerts for your vehicles,",
+                f"open the Track IQ app and go to {_RENEW_PATH}.",
+            ]),
         },
     )
 
@@ -212,10 +243,17 @@ async def send_payment_failed_email(user: User, payment: Payment) -> bool:
         to_name=_user_display_name(user),
         template_id=settings.EMAILJS_TEMPLATE_ID_PAYMENT_FAILED,
         template_params={
-            "subject": "Your Track IQ payment could not be completed",
+            "subject": "Your Track IQ payment did not go through",
             "amount": f"{payment.amount:.0f}",
             "currency": payment.currency,
             "tx_ref": payment.tx_ref,
-            "message": f"Your payment of {payment.amount:.0f} {payment.currency} could not be completed. Please try again.",
+            "message": "\n".join([
+                f"Your Mobile Money payment of {_money(payment.amount, payment.currency)} could not be completed.",
+                "",
+                "You can try again in the Track IQ app.",
+                f"If money was taken from your Mobile Money account, email {settings.SUPPORT_EMAIL}",
+                "and include this payment reference so we can fix it:",
+                f"Payment reference: {payment.tx_ref}",
+            ]),
         },
     )

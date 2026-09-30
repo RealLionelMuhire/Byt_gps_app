@@ -72,6 +72,9 @@ class Settings(BaseSettings):
     EMAILJS_TEMPLATE_ID_EXPIRING: Optional[str] = None
     EMAILJS_TEMPLATE_ID_EXPIRED: Optional[str] = None
     EMAILJS_TEMPLATE_ID_PAYMENT_FAILED: Optional[str] = None
+    # Shown in customer emails as the place to ask for help (payment
+    # problems, refunds). Track IQ is a Bythron product.
+    SUPPORT_EMAIL: str = "support@bythron.tech"
     # Customer-facing dates in emails are shown in this fixed UTC offset —
     # Rwanda (CAT, UTC+2, no daylight saving), where every customer pays.
     DISPLAY_UTC_OFFSET_HOURS: int = 2

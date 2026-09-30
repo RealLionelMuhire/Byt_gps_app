@@ -170,3 +170,4 @@ async def test_send_subscription_expiring_email_uses_expiring_template(monkeypat
     assert result is True
     assert posts[0]["json"]["template_id"] == "template_expiring"
     assert posts[0]["json"]["template_params"]["days_left"] == "3"
+    assert posts[0]["json"]["template_params"]["expires_on"] == email_module._local_date(sub.expires_at)
