@@ -51,5 +51,13 @@ def resolve_owner_plan(db: Session, owner: Optional[User]) -> ResolvedPlan:
         return ResolvedPlan(None, None, "none")
 
     now = datetime.utcnow()
-    active = sub.status == "active" and sub.expires_at and sub.expires_at > now
-    return ResolvedPlan(sub, sub.plan, "active" if active else "expired")
+    # A subscription is active only if its status is "active" AND
+    # (it's recurring — no expiry — OR it hasn't yet passed expires_at).
+    # One-time subscriptions that reach expires_at are flipped to
+    # "completed" by cron_expiry.py; recurring ones stay active forever.
+    if sub.status == "active":
+        if sub.is_recurring:
+            return ResolvedPlan(sub, sub.plan, "active")
+        if sub.expires_at and sub.expires_at > now:
+            return ResolvedPlan(sub, sub.plan, "active")
+    return ResolvedPlan(sub, sub.plan, "expired")

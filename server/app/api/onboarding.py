@@ -66,12 +66,16 @@ router = APIRouter()
 
 
 def _get_active_subscription(db: Session, clerk_user_id: str) -> Optional[Subscription]:
-    """The subscription that is genuinely active right now: status=="active"
-    AND not yet past expires_at.
+    """The subscription that is genuinely active right now.
+
+    A subscription is considered active if:
+    - status == "active" AND
+    - (is_recurring == True — no expiry, auto-renews) OR
+      (is_recurring == False AND expires_at > now — one-time, not yet lapsed)
 
     Checked inline rather than trusting the cached `status` column alone,
     because scripts/cron_expiry.py only flips a lapsed subscription's status
-    to "expired" every 15 minutes. Without the expires_at check here, a
+    to "completed" every 15 minutes. Without the expires_at check here, a
     request landing in that window would see a stale "active" row and either
     grant a vehicle slot it shouldn't, or let a renewal/upgrade silently
     no-op against an already-lapsed subscription instead of recording the
@@ -80,12 +84,19 @@ def _get_active_subscription(db: Session, clerk_user_id: str) -> Optional[Subscr
     gap for the enforcement points that gate/short-circuit on "is there a
     subscription actively covering this account right now."
     """
+    now = datetime.utcnow()
     return (
         db.query(Subscription)
         .filter(
             Subscription.clerk_user_id == clerk_user_id,
             Subscription.status == "active",
-            Subscription.expires_at > datetime.utcnow(),
+            # Recurring subscriptions have no effective expiry — they
+            # auto-renew and are never flipped by cron_expiry.py.  One-time
+            # subscriptions are only active if not yet past expires_at.
+            (
+                (Subscription.is_recurring == True)
+                | (Subscription.expires_at > now)
+            ),
         )
         .first()
     )
@@ -267,12 +278,13 @@ class QuoteVehicle(BaseModel):
 class BillingResponse(BaseModel):
     currentPlan: str
     expiresAt: Optional[UtcDateTime]
+    status: str = "none"          # active | expired | cancelled | completed | none
+    isRecurring: bool = False     # True = auto-renews, False = one-time
+    startedAt: Optional[UtcDateTime] = None
     payments: list[PaymentRecord]
     # Additive (older app versions ignore them): the plan's real display
-    # name, and when the current subscription started — so the app can show
-    # "Basic" instead of a slug-derived label, and an accurate time-used bar.
+    # name — so the app can show "Basic" instead of a slug-derived label.
     currentPlanName: Optional[str] = None
-    startedAt: Optional[UtcDateTime] = None
     # Per-vehicle coverage (migration 048): paid slots, and which vehicles
     # the current subscription covers.
     quantity: Optional[int] = None
@@ -862,6 +874,13 @@ async def create_subscription(
         raise HTTPException(status_code=400, detail=str(exc))
 
     expires_at = datetime.utcnow() + timedelta(days=cfg["days"])
+    # Recurrence is opt-in only (admin PUT with is_recurring=true). The
+    # purchase flow never renews or charges again, so marking a new
+    # subscription recurring would let it run past its term forever —
+    # and plan_config() deliberately does NOT expose the plan's
+    # billing_type for this expression: wiring it would flip every
+    # 'recurrent' plan (the portal/Flutter default) to non-expiring.
+    is_recurring = False
 
     try:
         subscription = Subscription(
@@ -872,6 +891,7 @@ async def create_subscription(
             started_at=datetime.utcnow(),
             expires_at=expires_at,
             quantity=quantity,
+            is_recurring=is_recurring,
         )
         db.add(subscription)
         db.flush()  # assigns subscription.id for the payment link below
@@ -1018,6 +1038,11 @@ async def upgrade_subscription(
 
         expires_at = datetime.utcnow() + timedelta(days=cfg["days"])
 
+        # Recurrence stays opt-in only — same reasoning as
+        # create_subscription: an upgrade is a fresh, single-funded
+        # subscription, so it starts one-time regardless of the old row.
+        is_recurring = False
+
         new_sub = Subscription(
             clerk_user_id=clerk_user_id,
             plan_id=plan.id,
@@ -1026,6 +1051,7 @@ async def upgrade_subscription(
             started_at=datetime.utcnow(),
             expires_at=expires_at,
             quantity=quantity,
+            is_recurring=is_recurring,
         )
         db.add(new_sub)
         db.flush()  # assigns new_sub.id for the payment link below
@@ -1045,10 +1071,10 @@ async def upgrade_subscription(
         db.refresh(new_sub)
 
         logger.info(
-            "Subscription upgraded: planId=%s price=%.2f%s user=%s expires=%s",
+            "Subscription upgraded: planId=%s price=%.2f%s user=%s expires=%s recurring=%s",
             body.planId, charge,
             " (postpaid — to be invoiced)" if is_postpaid else "",
-            clerk_user_id, expires_at.isoformat(),
+            clerk_user_id, expires_at.isoformat(), is_recurring,
         )
         _email_receipt(background_tasks, db, clerk_user_id, payment, plan.name, vehicles,
                        new_sub.started_at, expires_at, added_vehicles=False)
@@ -1110,6 +1136,20 @@ async def get_billing_history(
         .first()
     )
 
+    # Latest subscription of ANY status — status/isRecurring/startedAt are
+    # reported from this one so they can say "completed"/"cancelled" after
+    # the active row is gone. `sub` above keeps driving currentPlan /
+    # expiresAt / quantity / coveredVehicles: the mobile app treats a
+    # non-null expiresAt as "has an active plan" (BillingInfo's docstring),
+    # so those must stay scoped to a status=="active" row.
+    latest = (
+        db.query(Subscription)
+        .options(joinedload(Subscription.plan))
+        .filter(Subscription.clerk_user_id == clerk_user_id)
+        .order_by(Subscription.created_at.desc(), Subscription.id.desc())
+        .first()
+    )
+
     payments = (
         db.query(Payment)
         .options(joinedload(Payment.plan))
@@ -1134,12 +1174,33 @@ async def get_billing_history(
             currency=p.currency or "RWF",
         ))
 
+    # Resolve effective status from `latest`: recurring subscriptions are
+    # always active (they auto-renew), one-time subscriptions are active
+    # only if not past their expires_at.
+    effective_status = "none"
+    if latest:
+        if latest.status == "cancelled":
+            effective_status = "cancelled"
+        elif latest.status == "completed":
+            effective_status = "completed"
+        elif latest.status == "active":
+            if latest.is_recurring:
+                effective_status = "active"
+            elif latest.expires_at and latest.expires_at > datetime.utcnow():
+                effective_status = "active"
+            else:
+                effective_status = "expired"
+        else:
+            effective_status = "expired"
+
     return BillingResponse(
         currentPlan=sub.plan.slug if sub and sub.plan else "trial",
         expiresAt=sub.expires_at if sub else None,
         payments=payment_records,
+        status=effective_status,
+        isRecurring=latest.is_recurring if latest else False,
+        startedAt=latest.started_at if latest else None,
         currentPlanName=sub.plan.name if sub and sub.plan else None,
-        startedAt=sub.started_at if sub else None,
         quantity=sub.quantity if sub else None,
         coveredVehicles=_covered_vehicles(db, sub) if sub else [],
     )
@@ -1444,16 +1505,18 @@ class AdminSubscriptionResponse(BaseModel):
     clerk_user_id: str
     plan_id: Optional[str] = None    # slug
     plan_name: Optional[str] = None
-    status: str                       # active | expired | cancelled | none
+    status: str                       # active | expired | cancelled | completed | none
     price: Optional[float] = None
     started_at: Optional[UtcDateTime] = None
     expires_at: Optional[UtcDateTime] = None
+    is_recurring: bool = False        # True = auto-renews, False = one-time
 
 
 class AdminAssignPlanRequest(BaseModel):
     plan_id: str                              # slug — required
     expires_at: Optional[UtcDateTime] = None  # override the computed expiry
     price: Optional[float] = None             # override the computed/snapshot price (e.g. 0 for a comp)
+    is_recurring: Optional[bool] = None       # override recurrence flag (None = one-time, the default)
 
 
 class AdminExtendExpiryRequest(BaseModel):
@@ -1494,6 +1557,7 @@ def _admin_subscription_response(
         price=sub.price if sub else None,
         started_at=sub.started_at if sub else None,
         expires_at=sub.expires_at if sub else None,
+        is_recurring=sub.is_recurring if sub else False,
     )
 
 
@@ -1554,6 +1618,12 @@ async def admin_assign_subscription(
         # An admin assignment covers every vehicle the client has (with a
         # slot each) — the admin overrides, the client doesn't choose.
         vehicles = owner_vehicles(db, user.clerk_user_id)
+
+        # is_recurring: explicit admin override wins; otherwise one-time
+        # (False). There is no "follow the plan default" yet — plan_config
+        # doesn't expose billing_type on purpose (see create_subscription).
+        is_recurring = body.is_recurring if body.is_recurring is not None else False
+
         new_sub = Subscription(
             clerk_user_id=user.clerk_user_id,
             plan_id=plan.id,
@@ -1562,6 +1632,7 @@ async def admin_assign_subscription(
             started_at=datetime.utcnow(),
             expires_at=expires_at,
             quantity=max(1, len(vehicles)),
+            is_recurring=is_recurring,
         )
         db.add(new_sub)
         db.flush()
@@ -1574,9 +1645,9 @@ async def admin_assign_subscription(
         raise HTTPException(status_code=500, detail="Database error")
 
     logger.info(
-        "Admin %s assigned plan %s to user %s (id=%s), expires=%s, price=%.2f",
+        "Admin %s assigned plan %s to user %s (id=%s), expires=%s, price=%.2f, recurring=%s",
         admin.clerk_user_id, plan.slug, user.clerk_user_id, user.id,
-        expires_at.isoformat(), price,
+        expires_at.isoformat(), price, is_recurring,
     )
     return _admin_subscription_response(user, new_sub, db)
 
@@ -1616,7 +1687,10 @@ async def admin_extend_subscription(
         # single-reminder flag so it doesn't claim the new date was notified.
         sub.expiry_reminder_sent_at = None
     sub.expires_at = body.expires_at
-    if sub.status == "expired" and body.expires_at > datetime.utcnow():
+    # Re-activate expired or completed subscriptions when pushed into
+    # the future — cancelled ones are left alone (undoing a cancellation
+    # is a deliberate action, not a side effect of nudging a date).
+    if sub.status in ("expired", "completed") and body.expires_at > datetime.utcnow():
         sub.status = "active"
     sub.updated_at = datetime.utcnow()
     try:

@@ -120,14 +120,18 @@ class DeviceSubscriptionInfo(BaseModel):
     """A device's payment scheme / subscription mode.
 
     status:
-      active   — the owner has an unexpired subscription for this scheme
-      expired  — a subscription exists but has lapsed
-      cancelled — the most recent subscription was cancelled
-      none    — no subscription record at all (trial pending or unpaid)
+      active    — the owner has an unexpired subscription for this scheme
+      expired   — a one-time subscription that has lapsed
+      completed — a subscription that ran its full duration and naturally ended
+      cancelled — user or admin ended it before expiry
+      none      — no subscription record at all (trial pending or unpaid)
 
     `plan_slug` / `plan_name` / `billing_type` describe the scheme the
     subscription was bought under (e.g. 'basic' / 'Basic' / 'recurrent');
     they resolve to None when the plan was deleted or the slug is unknown.
+
+    `is_recurring` indicates whether the subscription auto-renews (True)
+    or expires after its duration (False, one-time).
     """
 
     status: str = "none"
@@ -136,6 +140,7 @@ class DeviceSubscriptionInfo(BaseModel):
     billing_type: Optional[str] = None
     started_at: Optional[UtcDateTime] = None
     expires_at: Optional[UtcDateTime] = None
+    is_recurring: bool = False  # True = auto-renews, False = one-time (expires after duration)
     price: Optional[float] = None  # Charge stored at purchase time (what is owed on renewal/invoice)
 
 
@@ -292,17 +297,33 @@ def _subscription_info_from_sub(sub: Optional[Subscription]) -> DeviceSubscripti
         return DeviceSubscriptionInfo(status="none")
     plan = sub.plan
     now = datetime.utcnow()
-    active = sub.status == "active" and sub.expires_at and sub.expires_at > now
-    # A cancelled subscription is reported as such, not folded into
-    # "expired" — the admin portal filters and counts them separately.
-    status = "active" if active else ("cancelled" if sub.status == "cancelled" else "expired")
+    # Resolve effective status: recurring subscriptions are always active
+    # (they auto-renew), one-time subscriptions are active only if not
+    # past their expires_at. A cancelled/completed subscription is reported
+    # as such, not folded into "expired" — the admin portal filters and
+    # counts them separately.
+    if sub.status == "cancelled":
+        effective_status = "cancelled"
+    elif sub.status == "completed":
+        effective_status = "completed"
+    elif sub.status == "active":
+        if sub.is_recurring:
+            effective_status = "active"
+        elif sub.expires_at and sub.expires_at > now:
+            effective_status = "active"
+        else:
+            effective_status = "expired"
+    else:
+        effective_status = "expired"
+
     return DeviceSubscriptionInfo(
-        status=status,
+        status=effective_status,
         plan_slug=plan.slug if plan else None,
         plan_name=plan.name if plan else None,
         billing_type=plan.billing_type if plan else None,
         started_at=sub.started_at,
         expires_at=sub.expires_at,
+        is_recurring=sub.is_recurring,
         price=sub.price,
     )
 

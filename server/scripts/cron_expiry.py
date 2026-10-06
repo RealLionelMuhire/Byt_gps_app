@@ -58,8 +58,8 @@ def _expiry_notification_copy(plan_id: str, plan_name: str) -> tuple:
             "Add a payment method to keep tracking your vehicles.",
         )
     return (
-        "⚠️ Your plan has expired",
-        f"Your {plan_name} plan has expired. Renew to keep tracking your vehicles.",
+        "✅ Your subscription has completed",
+        f"Your {plan_name} plan has completed its term. Renew to keep tracking your vehicles.",
     )
 
 
@@ -122,6 +122,7 @@ async def _notify_expiring_subscriptions_async() -> None:
             .options(joinedload(Subscription.plan))
             .filter(
                 Subscription.status == "active",
+                Subscription.is_recurring == False,
                 Subscription.expires_at > now,
                 Subscription.expires_at <= window_end,
             )
@@ -183,12 +184,18 @@ def check_expired_subscriptions():
     db = SessionLocal()
     try:
         now = datetime.utcnow()
+
+        # Only one-time (non-recurring) subscriptions expire after their
+        # duration. Recurring subscriptions auto-renew and are never flipped
+        # to expired/completed by this cron — they stay active until the
+        # user or admin explicitly cancels them.
         expired_subs = (
             db.query(Subscription)
             .options(joinedload(Subscription.plan))
             .filter(
                 Subscription.status == "active",
-                Subscription.expires_at < now
+                Subscription.is_recurring == False,
+                Subscription.expires_at < now,
             )
             .all()
         )
@@ -204,13 +211,19 @@ def check_expired_subscriptions():
             # _expiry_notification_copy's "trial" check and
             # _notify_expired_users' slug lookup below expect a slug string.
             plan_slug = sub.plan.slug if sub.plan else ""
-            logger.info(f"Expiring subscription for user {sub.clerk_user_id} (plan {plan_slug})")
-            sub.status = "expired"
+            logger.info(
+                f"Subscription for user {sub.clerk_user_id} (plan {plan_slug}) "
+                f"reached end of term — marking completed"
+            )
+            # "completed" = the subscription ran its full duration and
+            # naturally ended. "expired" is reserved for subscriptions that
+            # lapsed without fulfilling their term (admin override, etc.).
+            sub.status = "completed"
             sub.updated_at = datetime.utcnow()
             notify_targets.append((sub.id, sub.clerk_user_id, plan_slug, sub.expires_at))
 
         db.commit()
-        logger.info(f"Successfully expired {len(expired_subs)} subscriptions.")
+        logger.info(f"Successfully completed {len(expired_subs)} subscriptions.")
     except Exception as e:
         db.rollback()
         logger.error(f"Error while checking expired subscriptions: {e}")

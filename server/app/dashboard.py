@@ -20,7 +20,7 @@ from datetime import datetime
 
 logger = logging.getLogger(__name__)
 
-from fastapi import APIRouter, Request, Form, UploadFile, File
+from fastapi import APIRouter, HTTPException, Request, Form, UploadFile, File
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 from fastapi.templating import Jinja2Templates
 from sqlalchemy import or_
@@ -29,6 +29,7 @@ from fastapi import Depends
 import os
 import csv
 import io
+from typing import Optional
 from urllib.parse import quote
 
 from app.core.database import get_db
@@ -70,7 +71,7 @@ def _sign_session(clerk_user_id: str) -> str:
     return f"{clerk_user_id}:{sig}"
 
 
-def _verify_session(cookie_value: str) -> str | None:
+def _verify_session(cookie_value: str) -> Optional[str]:
     """
     Verify the session cookie and return the embedded clerk_user_id,
     or None if the cookie is missing or tampered.
@@ -89,7 +90,7 @@ def _verify_session(cookie_value: str) -> str | None:
     return clerk_user_id
 
 
-def _get_admin(request: Request) -> str | None:
+def _get_admin(request: Request) -> Optional[str]:
     """Return the Clerk user ID from the session cookie, or None."""
     return _verify_session(request.cookies.get(SESSION_COOKIE, ""))
 
@@ -203,6 +204,7 @@ def _render_admin_devices(
     assigned to a matching client.
     """
     all_plans = db.query(SubscriptionPlan).order_by(SubscriptionPlan.price.asc()).all()
+    devices = db.query(Device).all()
     device_data, plans_data = _build_device_data(devices, db, all_plans=all_plans)
 
     if owner_filter:
@@ -312,10 +314,20 @@ def _build_device_data(devices, db, all_plans=None):
         # app/services/plan_resolution.py. There is no more independent
         # per-device linked plan to disagree with it.
         sub = latest_sub_by_clerk.get(owner.clerk_user_id) if owner else None
-        if sub is not None and sub.status == "active" and sub.expires_at and sub.expires_at > now:
-            subscription_status = "active"
-        elif sub is not None:
-            subscription_status = "expired"
+        if sub is not None:
+            if sub.status == "active":
+                if sub.is_recurring:
+                    subscription_status = "active"
+                elif sub.expires_at and sub.expires_at > now:
+                    subscription_status = "active"
+                else:
+                    subscription_status = "expired"
+            elif sub.status == "cancelled":
+                subscription_status = "cancelled"
+            elif sub.status == "completed":
+                subscription_status = "completed"
+            else:
+                subscription_status = "expired"
         else:
             subscription_status = "none"
         plan = sub.plan if sub else None

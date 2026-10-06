@@ -57,10 +57,19 @@ class Subscription(Base):
     # relationship, never the raw id — see app/services/plan_resolution.py.
     plan_id = Column(Integer, ForeignKey("subscription_plans.id"), nullable=False, index=True)
     plan = relationship("SubscriptionPlan", foreign_keys=[plan_id])
+    # active | expired | cancelled | completed
+    # - active:     currently in effect (status == 'active' AND expires_at > now)
+    # - expired:    past its expires_at, not renewed (one-time plan that lapsed)
+    # - cancelled:  user or admin ended it before expiry
+    # - completed:  subscription ran its full duration and naturally ended
     status = Column(String(20), default="active")
     price = Column(Float, nullable=False, default=0.0)  # Stored at purchase time so admin edits don't affect existing subscribers
     started_at = Column(DateTime, default=datetime.utcnow)
     expires_at = Column(DateTime, nullable=False)
+    # False = one-time subscription that expires after its duration
+    # True  = recurring subscription that renews (no expiry after duration;
+    #         the cron only sends reminders, never flips status to expired)
+    is_recurring = Column(Boolean, default=False, nullable=False)
     # Set once the "expiring soon" push+email has been sent (see
     # scripts/cron_expiry.py's notify_expiring_subscriptions) so the
     # reminder fires exactly once per subscription, not on every cron run.

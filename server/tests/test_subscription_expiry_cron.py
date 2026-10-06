@@ -142,7 +142,7 @@ def test_check_expired_subscriptions_sends_push_and_email(cron_env, user, basic_
     cron_expiry_module.check_expired_subscriptions()
 
     db_session.refresh(sub)
-    assert sub.status == "expired"
+    assert sub.status == "completed"
     assert len(pushes) == 1
     assert pushes[0]["data"]["type"] == "subscription_expired"
     assert len([e for e in emails if e[0] == "expired"]) == 1

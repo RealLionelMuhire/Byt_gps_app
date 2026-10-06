@@ -111,6 +111,14 @@ def plan_add_vehicles(
     extra = max(0, len(vehicles) - free)
     period = (subscription.expires_at - subscription.started_at).total_seconds()
     remaining = (subscription.expires_at - now).total_seconds()
+    if remaining <= 0 and subscription.is_recurring and period > 0:
+        # A recurring subscription is never expired and its expires_at is
+        # never advanced, so once that first-period date is in the past
+        # there is no time left to prorate against. Price a full new period
+        # instead of 0 — 0 would quote "free" and make the add-vehicles flow
+        # unreachable (quote 400s "no payment needed" while activation 402s
+        # "payment required").
+        remaining = period
     if period <= 0 or remaining <= 0:
         unit = 0.0
     else:

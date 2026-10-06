@@ -128,8 +128,15 @@ def _effective_status(sub: Optional[Subscription], now: datetime) -> str:
         return "none"
     if sub.status == "cancelled":
         return "cancelled"
-    if sub.status == "active" and sub.expires_at and sub.expires_at > now:
-        return "active"
+    if sub.status == "active":
+        # Recurring subscriptions never lapse: expires_at is never advanced
+        # past the first period and cron_expiry.py never flips them, so the
+        # date alone must not be read as an expiry (same rule as
+        # plan_resolution, devices.py and dashboard.py).
+        if sub.is_recurring:
+            return "active"
+        if sub.expires_at and sub.expires_at > now:
+            return "active"
     return "expired"
 
 
@@ -279,9 +286,11 @@ def _reminder_summary(sub: Optional[Subscription], reminders: list[SubscriptionR
     )
     sent_stages = {r.stage for r in current}
     due = due_stage(sub.status, sub.started_at, sub.expires_at, now)
-    if due is None and sub.status == "active" and sub.expires_at <= now:
+    if due is None and sub.status == "active" and not sub.is_recurring and sub.expires_at <= now:
         # Lapsed but the 15-minute cron hasn't marked it (or sent the
-        # expiry notice) yet.
+        # expiry notice) yet. Recurring subs are excluded: they are never
+        # completed by the cron, so an "expiry due" flag would stick
+        # forever on a subscription that is meant to keep running.
         due = EXPIRED_STAGE
     last = current[-1] if current else None
     return {
@@ -363,7 +372,12 @@ def _client_rows(db: Session, now: datetime, only_user_id: Optional[int] = None)
     for u in users:
         sub = subs.get(u.clerk_user_id)
         status = _effective_status(sub, now)
-        days = _days_remaining(sub.expires_at, now) if sub and status in ("active", "expired") else None
+        # No countdown for recurring subs: their expires_at is a stale
+        # first-period date (never advanced), which would render as
+        # negative days and land them in the "expiring" buckets.
+        days = (_days_remaining(sub.expires_at, now)
+                if sub and status in ("active", "expired") and not sub.is_recurring
+                else None)
         p = pay.get(u.clerk_user_id)
         gross = float(p[1]) if p else 0.0
         refunded = float(refunds.get(u.clerk_user_id) or 0)
