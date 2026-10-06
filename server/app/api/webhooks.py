@@ -14,14 +14,13 @@ from svix.webhooks import Webhook, WebhookVerificationError
 from app.core.config import settings
 from app.core.database import get_db
 from app.models.user import User
-from app.models.device import Device
-from app.models.vehicle import Vehicle
-from app.models.subscription import Subscription, Payment
+from app.models.subscription import Payment
 from app.models.disbursement import Disbursement
 from app.models.trip import Trip
 from app.api.auth import claim_pending_client_user
 from app.services.intouchpay import get_transaction_status, classify_status, IntouchPayError
 from app.services.email import send_payment_failed_email
+from app.services.account_deletion import delete_user_data
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -157,8 +156,10 @@ async def handle_user_upsert(data: dict, db: Session):
 
 async def handle_user_deleted(clerk_user_id: str, db: Session):
     """
-    Handle the deletion of a user from Clerk.
-    Removes the user from the database and frees up their devices.
+    Handle the deletion of a user from Clerk — see
+    app/services/account_deletion.py for what's removed vs. kept. Also the
+    no-op tail of an in-app deletion (DELETE /api/auth/me), which already
+    removed the local row before Clerk sent this event.
     """
     user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
     if not user:
@@ -166,44 +167,9 @@ async def handle_user_deleted(clerk_user_id: str, db: Session):
         return
 
     logger.info(f"Deleting user {user.id} ({user.email}) due to Clerk webhook.")
-
     try:
-        # Free up the user's devices so they can be paired by someone else
-        devices = db.query(Device).filter(Device.user_id == user.id).all()
-        for device in devices:
-            device.user_id = None
-            # 'in_stock', not 'registered' — this device already proved TCP
-            # connectivity to get to 'sold' in the first place; only its
-            # ownership is being cleared. 'registered' would wrongly claim
-            # it has never connected (see Device model's transition table:
-            # sold -> in_stock on customer removal, never sold -> registered).
-            device.lifecycle = "in_stock"
-            logger.info(f"Freed device {device.imei} from deleted user {user.id}.")
-
-        # Delete vehicles belonging to this user
-        db.query(Vehicle).filter(Vehicle.clerk_user_id == clerk_user_id).delete(synchronize_session=False)
-
-        # Keep subscriptions and payments: they're the financial record of
-        # money actually received (and possibly refunded — disbursements
-        # reference payments.id, so deleting a refunded payment would fail
-        # the whole webhook). Both are keyed by clerk_user_id, not a users FK,
-        # so they survive the user row; the admin dashboard shows them as a
-        # deleted account. Only end the subscription.
-        db.query(Subscription).filter(
-            Subscription.clerk_user_id == clerk_user_id,
-            Subscription.status == "active",
-        ).update(
-            {Subscription.status: "cancelled", Subscription.updated_at: datetime.utcnow()},
-            synchronize_session=False,
-        )
-
-        # Finally, delete the user
-        db.delete(user)
-        db.commit()
-        logger.info(f"Successfully fully deleted user {clerk_user_id} and freed devices.")
-
+        delete_user_data(db, user)
     except Exception as e:
-        db.rollback()
         logger.error(f"Error while deleting user {clerk_user_id}: {e}")
         raise HTTPException(status_code=500, detail="Database error during deletion")
 

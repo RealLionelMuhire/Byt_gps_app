@@ -15,6 +15,7 @@ from app.core.database import get_db
 from app.core.config import settings
 from app.core.auth import require_auth, require_admin
 from app.models.user import User, Role
+from app.services.account_deletion import delete_user_data
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -614,3 +615,55 @@ async def update_push_token(
     logger.info("Push token updated for user %s", clerk_user_id)
     return {"ok": True}
 
+
+
+@router.delete("/me", status_code=204)
+async def delete_current_user(
+    clerk_user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    """
+    Permanently delete the authenticated user's account — the app's
+    "Delete account" button (required by App Store guideline 5.1.1(v) and
+    Google Play's account-deletion policy).
+
+    Clerk is deleted FIRST: if that fails, nothing local has changed and the
+    user can simply retry. Once Clerk succeeds the user can no longer sign
+    in, so a local failure after that point is only logged — Clerk's own
+    user.deleted webhook runs the same cleanup (handle_user_deleted) and
+    retries it on error. When the local cleanup here succeeds, that webhook
+    arrives to find no row and is a no-op.
+    """
+    user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
+
+    if user is not None and user.role == Role.SUPER_ADMIN:
+        super_admins = db.query(func.count(User.id)).filter(User.role == Role.SUPER_ADMIN).scalar()
+        if super_admins <= 1:
+            raise HTTPException(
+                status_code=409,
+                detail="The only super admin account can't be deleted. Promote another super admin first.",
+            )
+
+    if not settings.CLERK_SECRET_KEY:
+        logger.warning("CLERK_SECRET_KEY not set — skipping Clerk deletion for %s (dev mode)", clerk_user_id)
+    else:
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.delete(
+                    f"https://api.clerk.com/v1/users/{clerk_user_id}",
+                    headers={"Authorization": f"Bearer {settings.CLERK_SECRET_KEY}"},
+                    timeout=10.0,
+                )
+        except httpx.RequestError as e:
+            logger.error("Clerk delete request failed for %s: %s", clerk_user_id, e)
+            raise HTTPException(status_code=502, detail="Could not reach the authentication service. Please try again.")
+        # 404: already gone from Clerk (e.g. a retry after a local failure).
+        if response.status_code not in (200, 404):
+            logger.error("Clerk delete failed for %s: %s %s", clerk_user_id, response.status_code, response.text)
+            raise HTTPException(status_code=502, detail="Could not delete the account. Please try again.")
+
+    if user is not None:
+        try:
+            delete_user_data(db, user)
+        except Exception as e:
+            logger.error("Local cleanup failed for deleted Clerk user %s (webhook will retry): %s", clerk_user_id, e)
