@@ -19,11 +19,49 @@ logger = logging.getLogger(__name__)
 GEOCODING_TIMEOUT_SECONDS = 15
 
 
+def trip_arrival_time(trip: Trip, stop_speed_threshold_kmh: float, db: Session) -> datetime:
+    """When an active trip actually ended: the first quality fix after its
+    last moving one (speed >= stop_speed_threshold_kmh) — i.e. the moment
+    the vehicle arrived and parked.
+
+    Deliberately not simply the device's latest fix: the stale checker only
+    closes a still-pinging trip after the owner's
+    stop_splits_trip_after_minutes of parking, and ending it at "now" would
+    fold that whole wait into the trip's duration (inflating it, deflating
+    average speed, and letting a short repositioning move pass the
+    minimum-duration filter on parking time alone). Falls back to the latest
+    fix when the trip never recorded a moving point, and to now when there
+    are no fixes at all.
+    """
+    quality = location_quality_filters(trip.device_id)
+    last_moving = (
+        db.query(Location)
+        .filter(
+            *quality,
+            Location.timestamp >= trip.start_time,
+            Location.speed >= stop_speed_threshold_kmh,
+        )
+        .order_by(Location.timestamp.desc())
+        .first()
+    )
+    if last_moving is not None:
+        arrival = (
+            db.query(Location)
+            .filter(*quality, Location.timestamp > last_moving.timestamp)
+            .order_by(Location.timestamp.asc())
+            .first()
+        )
+        return (arrival or last_moving).timestamp
+
+    last_loc = db.query(Location).filter(*quality).order_by(Location.timestamp.desc()).first()
+    return last_loc.timestamp if last_loc else datetime.utcnow()
+
+
 def end_active_trips_for_device(device_id: int, db: Session, discard_if_short: bool = True) -> int:
     """
     End all active trips (end_time=null) for a device.
     Called when device disconnects or stops sending.
-    Sets end_time to last location timestamp, computes distance, geocodes
+    Sets end_time to the trip's arrival time (see trip_arrival_time), computes distance, geocodes
     display_name — unless discard_if_short and the resulting duration is
     under the owner's minimum_trip_duration_minutes, in which case the trip
     is discarded entirely (deleted) rather than kept as a real trip.
@@ -45,20 +83,11 @@ def end_active_trips_for_device(device_id: int, db: Session, discard_if_short: b
     if not active:
         return 0
 
-    # Get last GPS-valid location for this device
-    last_loc = (
-        db.query(Location)
-        .filter(*location_quality_filters(device_id))
-        .order_by(Location.timestamp.desc())
-        .first()
-    )
-
-    end_time = last_loc.timestamp if last_loc else datetime.utcnow()
-
     ended = 0
     discarded = 0
     for trip in active:
         trip_settings = get_or_create_trip_settings(trip.user_id, db)
+        end_time = trip_arrival_time(trip, trip_settings.stop_speed_threshold_kmh, db)
         min_duration = timedelta(minutes=trip_settings.minimum_trip_duration_minutes)
         if discard_if_short and (end_time - trip.start_time) < min_duration:
             logger.info(
@@ -74,29 +103,39 @@ def end_active_trips_for_device(device_id: int, db: Session, discard_if_short: b
             total_distance, locations = compute_distance_for_device_time_range(
                 device_id, trip.start_time, end_time, db
             )
-            trip.end_time = end_time
-            trip.total_distance_km = total_distance
-            if locations:
-                trip.end_location_id = locations[-1].id
-                # Geocode display_name (sync, avoid blocking TCP handler too long)
-                try:
-                    display_name = build_trip_display_name(
-                        locations[0].latitude,
-                        locations[0].longitude,
-                        locations[-1].latitude,
-                        locations[-1].longitude,
-                    )
-                    trip.display_name = display_name
-                except Exception as e:
-                    logger.warning("Geocoding failed for trip %s: %s", trip.id, e)
-                    trip.display_name = (
-                        f"{locations[0].latitude:.4f}, {locations[0].longitude:.4f} → "
-                        f"{locations[-1].latitude:.4f}, {locations[-1].longitude:.4f}"
-                    )
         except Exception as e:
-            logger.error("Error ending trip %s: %s", trip.id, e)
-            trip.end_time = end_time
-            trip.total_distance_km = 0.0
+            # Don't close the trip with a placeholder 0.0 km — once end_time
+            # is set nothing ever recomputes it, so the trip would read
+            # "0.0 km" forever. Roll back this whole pass (including any
+            # short-trip discards above, which are re-derived identically)
+            # and leave the trip active: the stale checker retries every
+            # 60s, and reads compute an active trip's distance live.
+            logger.error(
+                "Error computing distance while ending trip %s for device %s; leaving it active for retry: %s",
+                trip.id, device_id, e, exc_info=True,
+            )
+            db.rollback()
+            return 0
+
+        trip.end_time = end_time
+        trip.total_distance_km = total_distance
+        if locations:
+            trip.end_location_id = locations[-1].id
+            # Geocode display_name (sync, avoid blocking TCP handler too long)
+            try:
+                display_name = build_trip_display_name(
+                    locations[0].latitude,
+                    locations[0].longitude,
+                    locations[-1].latitude,
+                    locations[-1].longitude,
+                )
+                trip.display_name = display_name
+            except Exception as e:
+                logger.warning("Geocoding failed for trip %s: %s", trip.id, e)
+                trip.display_name = (
+                    f"{locations[0].latitude:.4f}, {locations[0].longitude:.4f} → "
+                    f"{locations[-1].latitude:.4f}, {locations[-1].longitude:.4f}"
+                )
         ended += 1
 
     db.commit()

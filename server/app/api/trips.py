@@ -149,6 +149,43 @@ class TripDetailResponse(TripResponse):
     offline_seconds: float = 0.0
 
 
+# --- Active-trip distance ---
+# An active trip's stored total_distance_km is a 0.0 placeholder until
+# end_active_trips_for_device closes it (stale checker, disconnect, or a
+# manual end) — which, with the default stop_splits_trip_after_minutes, can
+# be up to an hour after the vehicle has actually parked. Reads compute it
+# live instead, so the newest trip doesn't show "0.0 km" while the vehicle
+# is visibly moving. Never written back: the close path stays the single
+# place that persists a final distance.
+
+
+def _active_trip_end_time(trip: Trip, db: Session) -> datetime:
+    """Latest quality-filtered fix for the trip's device, or now if none."""
+    from app.models.location import Location
+    from app.api.locations import location_quality_filters
+    last_loc = (
+        db.query(Location)
+        .filter(*location_quality_filters(trip.device_id))
+        .order_by(Location.timestamp.desc())
+        .first()
+    )
+    return last_loc.timestamp if last_loc else datetime.utcnow()
+
+
+def _live_distance_km(trip: Trip, end_time: datetime, db: Session) -> float:
+    total_distance, _ = compute_distance_for_device_time_range(
+        trip.device_id, trip.start_time, end_time, db
+    )
+    return total_distance
+
+
+def _trip_response(trip: Trip, db: Session) -> TripResponse:
+    response = TripResponse.model_validate(trip)
+    if trip.end_time is None:
+        response.total_distance_km = _live_distance_km(trip, _active_trip_end_time(trip, db), db)
+    return response
+
+
 # --- Endpoints ---
 # Note: /settings and /suggested must be defined before /{trip_id}
 
@@ -350,7 +387,7 @@ async def list_trips(
         .order_by(Trip.created_at.desc())
         .all()
     )
-    return trips
+    return [_trip_response(trip, db) for trip in trips]
 
 
 @router.get("/{trip_id}", response_model=TripDetailResponse, dependencies=[require_feature("history.trips")])
@@ -369,22 +406,14 @@ async def get_trip(
     if not trip:
         raise HTTPException(status_code=404, detail="Trip not found")
 
-    end_time = trip.end_time
-    if end_time is None:
-        # Active trip: use last location or now
-        from app.models.location import Location
-        from app.api.locations import location_quality_filters
-        last_loc = (
-            db.query(Location)
-            .filter(*location_quality_filters(trip.device_id))
-            .order_by(Location.timestamp.desc())
-            .first()
-        )
-        end_time = last_loc.timestamp if last_loc else datetime.utcnow()
+    end_time = trip.end_time if trip.end_time is not None else _active_trip_end_time(trip, db)
 
     route = fetch_route_line_for_range(
         trip.device_id, trip.start_time, end_time, db
     )
+    total_distance_km = trip.total_distance_km
+    if trip.end_time is None:
+        total_distance_km = _live_distance_km(trip, end_time, db)
     route["properties"]["device_id"] = trip.device.id
     route["properties"]["device_name"] = trip.device.name
     route["properties"]["device_imei"] = trip.device.imei
@@ -397,7 +426,7 @@ async def get_trip(
         display_name=trip.display_name,
         start_time=trip.start_time,
         end_time=trip.end_time,
-        total_distance_km=trip.total_distance_km,
+        total_distance_km=total_distance_km,
         created_at=trip.created_at,
         device_name=trip.device.name,
         device_imei=trip.device.imei,
@@ -429,6 +458,10 @@ async def end_trip_manually(
     # (stale checker, disconnect). See end_active_trips_for_device.
     end_active_trips_for_device(device_id, db, discard_if_short=False)
     db.refresh(trip)
+    if trip.end_time is None:
+        # end_active_trips_for_device leaves the trip open (rather than
+        # saving a bogus 0.0 km) when its distance computation fails.
+        raise HTTPException(status_code=503, detail="Could not end trip right now, please try again")
     return trip
 
 
