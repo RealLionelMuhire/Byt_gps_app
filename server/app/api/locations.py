@@ -338,20 +338,6 @@ def _downsample_uniform(points: List["Location"], max_points: int) -> List["Loca
     return [points[i] for i in indices]
 
 
-def _make_driving_or_stopped_leftover(
-    points: List["Location"], simplify: bool, epsilon_deg: float
-) -> Optional[dict]:
-    """Build the segment for a run of points that fell between stop-runs
-    (i.e. wasn't classified "stopped"). A lone point can't form a driving
-    segment (no distance/duration to show), so it's reported as a
-    zero-duration "stopped" segment instead of being silently dropped."""
-    if not points:
-        return None
-    if len(points) == 1:
-        return _make_stopped_segment(points)
-    return _make_driving_segment(points, simplify, epsilon_deg)
-
-
 def _make_driving_segment(points: List["Location"], simplify: bool, epsilon_deg: float) -> dict:
     distance_km = 0.0
     for i in range(1, len(points)):
@@ -419,6 +405,56 @@ def _make_offline_segment(gap: dict, last_known: "Location", next_known: "Locati
     }
 
 
+def classify_period_spans(
+    locations: List["Location"],
+    stop_speed_threshold_kmh: float,
+    min_stop_seconds: float,
+) -> List[Tuple[str, List["Location"]]]:
+    """
+    Classify a chronologically-ordered, quality-filtered location list into
+    an ordered list of ("driving" | "stopped" | "offline", points) spans —
+    the one classification both the period-route timeline
+    (build_period_segments) and the Reports aggregation
+    (app/services/reports.py) are built from, so a report's totals can never
+    drift from what period playback draws.
+
+      - "offline": a gap over TIME_GAP_SEGMENT_BREAK_SECONDS (see
+        segment_locations_by_gap); its points are [last_before, first_after]
+      - "stopped": a find_low_speed_runs run lasting at least
+        min_stop_seconds, so brief dips (e.g. a red light) don't fragment
+        "driving" into noise
+      - "driving": whatever's left between stops/gaps. A lone leftover
+        point can't form a driving span (no distance/duration), so it's
+        classified as a zero-duration "stopped" span instead of being
+        silently dropped.
+    """
+    spans: List[Tuple[str, List["Location"]]] = []
+    if not locations:
+        return spans
+
+    def _add_leftover(points: List["Location"]) -> None:
+        if points:
+            spans.append(("stopped" if len(points) == 1 else "driving", points))
+
+    gap_segments = segment_locations_by_gap(locations)
+    for idx, seg in enumerate(gap_segments):
+        stop_runs = [
+            (s, e) for (s, e) in find_low_speed_runs(seg, stop_speed_threshold_kmh)
+            if (seg[e - 1].timestamp - seg[s].timestamp).total_seconds() >= min_stop_seconds
+        ]
+        cursor = 0
+        for s, e in stop_runs:
+            _add_leftover(seg[cursor:s])
+            spans.append(("stopped", seg[s:e]))
+            cursor = e
+        _add_leftover(seg[cursor:])
+
+        if idx < len(gap_segments) - 1:
+            spans.append(("offline", [seg[-1], gap_segments[idx + 1][0]]))
+
+    return spans
+
+
 def build_period_segments(
     locations: List["Location"],
     stop_speed_threshold_kmh: float,
@@ -432,47 +468,31 @@ def build_period_segments(
     Historical Routes period-route view.
 
     Reuses the same primitives single-trip routes and auto-segmentation
-    already use, so this view never drifts from the location-quality work
-    done elsewhere:
-      - "offline": segment_locations_by_gap / compute_offline_gaps
-        (TIME_GAP_SEGMENT_BREAK_SECONDS — the teleport-fix threshold)
-      - "stopped": find_low_speed_runs (stop_speed_threshold_kmh — the same
-        setting trip auto-segmentation uses), filtered to runs lasting at
-        least min_stop_seconds so brief dips (e.g. a red light) don't
-        fragment "driving" into noise
-      - "driving": whatever's left between stops/gaps, optionally
-        Douglas-Peucker simplified per segment (never across a boundary)
+    already use (via classify_period_spans), so this view never drifts from
+    the location-quality work done elsewhere: offline gaps use
+    TIME_GAP_SEGMENT_BREAK_SECONDS (the teleport-fix threshold), stops use
+    stop_speed_threshold_kmh (the same setting trip auto-segmentation uses)
+    plus min_stop_seconds, and driving segments are optionally
+    Douglas-Peucker simplified per segment (never across a boundary).
 
     Caller is responsible for pre-filtering to quality-passing, in-range,
     chronologically-ordered locations (see location_quality_filters).
     """
-    if not locations:
-        return []
-
     epsilon_deg = tolerance_meters / METERS_PER_DEGREE
-    gap_segments = segment_locations_by_gap(locations)
-    offline_gaps = compute_offline_gaps(locations)
-
     result: List[dict] = []
-    for idx, seg in enumerate(gap_segments):
-        stop_runs = [
-            (s, e) for (s, e) in find_low_speed_runs(seg, stop_speed_threshold_kmh)
-            if (seg[e - 1].timestamp - seg[s].timestamp).total_seconds() >= min_stop_seconds
-        ]
-        cursor = 0
-        for s, e in stop_runs:
-            leftover = _make_driving_or_stopped_leftover(seg[cursor:s], simplify, epsilon_deg)
-            if leftover:
-                result.append(leftover)
-            result.append(_make_stopped_segment(seg[s:e]))
-            cursor = e
-        leftover = _make_driving_or_stopped_leftover(seg[cursor:], simplify, epsilon_deg)
-        if leftover:
-            result.append(leftover)
-
-        if idx < len(offline_gaps):
-            result.append(_make_offline_segment(offline_gaps[idx], seg[-1], gap_segments[idx + 1][0]))
-
+    for kind, points in classify_period_spans(locations, stop_speed_threshold_kmh, min_stop_seconds):
+        if kind == "driving":
+            result.append(_make_driving_segment(points, simplify, epsilon_deg))
+        elif kind == "stopped":
+            result.append(_make_stopped_segment(points))
+        else:
+            last_known, next_known = points
+            gap = {
+                "gap_start": last_known.timestamp,
+                "gap_end": next_known.timestamp,
+                "gap_seconds": (next_known.timestamp - last_known.timestamp).total_seconds(),
+            }
+            result.append(_make_offline_segment(gap, last_known, next_known))
     return result
 
 
