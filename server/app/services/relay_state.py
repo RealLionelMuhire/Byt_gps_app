@@ -9,6 +9,7 @@ command was sent (a command can time out, be refused, or the relay may not
 be wired).
 """
 
+import re
 from datetime import datetime
 from typing import Optional
 
@@ -37,3 +38,22 @@ def relay_state_payload(device: Device) -> dict:
         "relay_cut": device.relay_cut,
         "relay_state_at": at.isoformat() if at else None,
     }
+
+
+# Real G900LS replies seen 2026-10-16: RELAY# -> "RELAY:0";
+# RELAY,1# -> "Stop engine succeed RELAY 1 OK". The digit after RELAY is
+# the relay output state (1 = cut), in both the query and the command reply.
+_RELAY_REPLY_RE = re.compile(r"\bRELAY\s*[:=,]?\s*([01])\b", re.IGNORECASE)
+_FAILURE_WORDS = ("fail", "error", "invalid", "not support", "unsupport", "denied")
+
+
+def parse_relay_reply(text: Optional[str]) -> Optional[bool]:
+    """The relay state a tracker reply states, or None when it doesn't
+    state one (or reports a failure — never infer success from those)."""
+    if not text:
+        return None
+    lowered = text.lower()
+    if any(word in lowered for word in _FAILURE_WORDS):
+        return None
+    match = _RELAY_REPLY_RE.search(text)
+    return None if match is None else match.group(1) == "1"

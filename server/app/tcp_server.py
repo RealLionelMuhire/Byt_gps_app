@@ -6,6 +6,8 @@ Handles binary protocol communication
 
 import asyncio
 import logging
+import secrets
+from collections import OrderedDict
 from typing import Dict, List, Optional, Set
 from datetime import datetime, timedelta
 import struct
@@ -21,7 +23,8 @@ from app.api.locations import classify_outlier, compute_quality_log_fields, loca
 from app.services.geofencing import evaluate_geofences, GeofenceTransition
 from app.services.speed_limit import evaluate_speed_limit
 from app.services.live_position import resolve_live_position
-from app.services.relay_state import apply_relay_report, relay_state_payload
+from app.services.relay_state import apply_relay_report, parse_relay_reply, relay_state_payload
+from app.models.command_log import CommandLog
 from app.services.geocoding import reverse_geocode, format_fallback_location
 from app.core.config import settings
 from app.services.trip_settings_service import DEFAULT_STOP_SPEED_KMH, get_or_create_trip_settings
@@ -277,6 +280,16 @@ class GPSTrackerConnection:
         # succeeding, and/or the wrong reply gets attributed to the wrong
         # caller. Serializing means a second caller just waits its turn.
         self._command_lock = asyncio.Lock()
+        # GT06 0x15 replies echo the 4-byte server flag of the 0x80 command
+        # they answer. Every command used to go out with flag 1, so replies
+        # could not be matched: a reply landing after the 10s wait was lost,
+        # or attributed to the NEXT command. Each command now gets a unique
+        # flag; recent ones are remembered (flag -> (command_log id,
+        # command)) so a late reply is still logged against the right
+        # command — and never shown as another command's answer.
+        self._pending_flag: Optional[int] = None
+        self._pending_log_id: Optional[int] = None
+        self._recent_flags: "OrderedDict[int, tuple]" = OrderedDict()
 
         logger.info(f"New connection from {address}")
     
@@ -747,9 +760,27 @@ class GPSTrackerConnection:
         committed (see parse_where_reply's caller below for why satellites/
         gps_valid are synthesized rather than taken from the reply)."""
         content = data.get('content', '')
-        logger.info(f"Command response from {self.device_imei}: {content}")
+        reply_flag = data.get('server_flag')
+        logger.info(f"Command response from {self.device_imei} (flag {reply_flag}): {content}")
 
-        if self._pending_command == "WHERE#":
+        # Which command does this reply answer? See _recent_flags' doc.
+        if reply_flag in self._recent_flags:
+            log_id, command = self._recent_flags[reply_flag]
+            is_current = reply_flag == self._pending_flag
+            outcome = "replied" if is_current else "late_reply"
+        elif self._pending_command is not None:
+            # Firmware that doesn't echo the flag: fall back to the old
+            # "next reply belongs to the in-flight command" behavior, but
+            # record that the match is unverified.
+            log_id, command, is_current, outcome = self._pending_log_id, self._pending_command, True, "replied_unverified"
+        else:
+            log_id, command, is_current, outcome = None, None, False, "unmatched"
+        if outcome != "replied":
+            logger.warning(f"Reply from {self.device_imei} recorded as {outcome} (flag {reply_flag}): {content}")
+        self._log_command_reply(log_id, content, reply_flag, outcome)
+        await self._apply_relay_from_reply(content)
+
+        if is_current and command == "WHERE#":
             parsed = self.parser.parse_where_reply(content)
             if parsed:
                 if self.authenticated and self.device_imei:
@@ -780,10 +811,99 @@ class GPSTrackerConnection:
                         f"WHERE# reply parsed but connection not authenticated for {self.device_imei} — skipping location write"
                     )
 
-        if self._pending_response and not self._pending_response.done():
+        if is_current and self._pending_response and not self._pending_response.done():
             self._pending_response.set_result(data)
 
-    async def send_command(self, command: str, timeout: float = 10.0) -> Dict:
+    # ── Command correlation + audit log (migration 053) ──────────────────
+
+    _RECENT_FLAGS_KEPT = 20
+
+    @staticmethod
+    def _new_server_flag() -> int:
+        # Never 0/1: 1 was the old fixed flag, and a firmware that doesn't
+        # echo the flag most likely returns 0 or 1 — those must never be
+        # mistaken for a match.
+        return secrets.randbelow(0xFFFFFF00) + 0x100
+
+    def _log_command_sent(self, command: str, server_flag: int, user_id: Optional[int]) -> Optional[int]:
+        db = SessionLocal()
+        try:
+            device = db.query(Device).filter(Device.imei == self.device_imei).first()
+            row = CommandLog(
+                device_id=device.id if device else None,
+                imei=self.device_imei or "",
+                command=command,
+                server_flag=server_flag,
+                sent_by_user_id=user_id,
+                sent_at=datetime.utcnow(),
+                outcome="pending",
+            )
+            db.add(row)
+            db.commit()
+            return row.id
+        except Exception as e:
+            logger.error(f"Could not log command for {self.device_imei}: {e}")
+            return None
+        finally:
+            db.close()
+
+    def _log_command_reply(self, log_id: Optional[int], content: str, reply_flag: Optional[int], outcome: str) -> None:
+        db = SessionLocal()
+        try:
+            row = db.query(CommandLog).filter(CommandLog.id == log_id).first() if log_id else None
+            if row is None:
+                device = db.query(Device).filter(Device.imei == self.device_imei).first()
+                row = CommandLog(device_id=device.id if device else None, imei=self.device_imei or "")
+                db.add(row)
+            row.reply = content
+            row.reply_server_flag = reply_flag
+            row.reply_at = datetime.utcnow()
+            row.outcome = outcome
+            db.commit()
+        except Exception as e:
+            logger.error(f"Could not log command reply for {self.device_imei}: {e}")
+        finally:
+            db.close()
+
+    def _log_command_timeout(self, log_id: Optional[int]) -> None:
+        if not log_id:
+            return
+        db = SessionLocal()
+        try:
+            row = db.query(CommandLog).filter(CommandLog.id == log_id).first()
+            if row is not None and row.outcome == "pending":
+                row.outcome = "timeout"
+                db.commit()
+        except Exception as e:
+            # Logging must never break the command itself (e.g. code
+            # deployed before migration 053 ran).
+            logger.error(f"Could not log command timeout for {self.device_imei}: {e}")
+        finally:
+            db.close()
+
+    async def _apply_relay_from_reply(self, content: str) -> None:
+        """A reply that states the relay state ("RELAY:0", "Stop engine
+        succeed RELAY 1 OK") is the tracker's own report — apply it now
+        instead of waiting up to a heartbeat (~5 min) for bit 7."""
+        cut = parse_relay_reply(content)
+        if cut is None or not self.device_imei:
+            return
+        db = SessionLocal()
+        try:
+            device = db.query(Device).filter(Device.imei == self.device_imei).first()
+            if device is None:
+                return
+            changed = apply_relay_report(device, cut)
+            db.commit()
+            payload = relay_state_payload(device)
+            device_id = device.id
+        finally:
+            db.close()
+        if changed:
+            logger.info(f"Relay state for {self.device_imei} from reply: {'CUT' if cut else 'connected'}")
+            await self.server.broadcast_device_status(device_id, payload)
+
+    async def send_command(self, command: str, timeout: float = 10.0, user_id: Optional[int] = None) -> Dict:
         """Send an ASCII command to the device (Protocol 0x80) and wait for the 0x15 response.
 
         Serialized per-connection via _command_lock — see its doc in
@@ -791,16 +911,24 @@ class GPSTrackerConnection:
         correlated to a specific in-flight request)."""
         async with self._command_lock:
             self._command_serial = (self._command_serial + 1) & 0xFFFF
-            packet = self.parser.create_command_packet(command, self._command_serial)
+            server_flag = self._new_server_flag()
+            packet = self.parser.create_command_packet(command, self._command_serial, server_flag=server_flag)
             if not packet:
                 return {"success": False, "error": "Failed to build command packet"}
+
+            log_id = self._log_command_sent(command, server_flag, user_id)
+            self._recent_flags[server_flag] = (log_id, command)
+            while len(self._recent_flags) > self._RECENT_FLAGS_KEPT:
+                self._recent_flags.popitem(last=False)
 
             loop = asyncio.get_event_loop()
             self._pending_response = loop.create_future()
             self._pending_command = command
+            self._pending_flag = server_flag
+            self._pending_log_id = log_id
 
             await self.send_data(packet)
-            logger.info(f"Sent command to {self.device_imei}: {command}")
+            logger.info(f"Sent command to {self.device_imei} (flag {server_flag}): {command}")
 
             try:
                 result = await asyncio.wait_for(self._pending_response, timeout=timeout)
@@ -811,10 +939,13 @@ class GPSTrackerConnection:
                 }
             except asyncio.TimeoutError:
                 logger.warning(f"Command timed out for {self.device_imei}: {command}")
+                self._log_command_timeout(log_id)
                 return {"success": True, "response": None, "note": "Command sent but device did not reply within timeout. It may still take effect."}
             finally:
                 self._pending_response = None
                 self._pending_command = None
+                self._pending_flag = None
+                self._pending_log_id = None
     
     async def send_data(self, data: bytes):
         """Send data to GPS tracker"""
@@ -976,12 +1107,12 @@ class TCPServer:
         # Also send a push notification to the device owner (works when app is backgrounded)
         await self._send_push_notification(device_id, data, location_id=location_id)
     
-    async def send_command_to_device(self, imei: str, command: str, timeout: float = 10.0) -> Dict:
+    async def send_command_to_device(self, imei: str, command: str, timeout: float = 10.0, user_id: Optional[int] = None) -> Dict:
         """Send an ASCII command to a connected device and return the response."""
         connection = self.device_connections.get(imei)
         if not connection:
             return {"success": False, "error": "Device not connected"}
-        return await connection.send_command(command, timeout=timeout)
+        return await connection.send_command(command, timeout=timeout, user_id=user_id)
 
     async def _send_push_notification(self, device_id: int, data: Dict, location_id: Optional[int] = None) -> None:
         """

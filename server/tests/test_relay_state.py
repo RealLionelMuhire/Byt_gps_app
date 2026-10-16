@@ -111,7 +111,7 @@ class _FakeTcp:
         self.reply = reply
         self.sent = []
 
-    async def send_command_to_device(self, imei, command):
+    async def send_command_to_device(self, imei, command, user_id=None):
         self.sent.append(command)
         return {"success": True, "response": self.reply}
 

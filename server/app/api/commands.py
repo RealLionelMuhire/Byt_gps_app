@@ -11,6 +11,7 @@ import logging
 
 from app.core.database import get_db
 from app.core.auth import get_current_user, require_device_access
+from app.models.command_log import CommandLog
 from app.models.command_settings import CommandSettings
 from app.models.device import Device
 from app.models.user import User
@@ -231,7 +232,7 @@ async def send_raw_command(
     _enforce_command_policy(db, device, user, body.command)
 
     tcp = _get_tcp_server(request)
-    result = await tcp.send_command_to_device(device.imei, body.command)
+    result = await tcp.send_command_to_device(device.imei, body.command, user_id=user.id)
 
     if not result.get("success"):
         raise HTTPException(status_code=409, detail=result.get("error", "Command failed"))
@@ -420,6 +421,45 @@ async def query_status(
     return await _send(device_id, "STATUS#", "query status", request, db, user)
 
 
+@router.get("/{device_id}/command_log")
+async def get_command_log(
+    device_id: int,
+    limit: int = 50,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Recent commands sent to this tracker and its replies, newest first —
+    the exact reply text, when it arrived, and whether it was matched to
+    its command by the GT06 server flag (see migration 053). Answers "did
+    the tracker really say that, and to which command?"."""
+    device = db.query(Device).filter(Device.id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    require_device_access(device, user)
+    rows = (
+        db.query(CommandLog)
+        .filter(CommandLog.device_id == device_id)
+        .order_by(CommandLog.id.desc())
+        .limit(max(1, min(limit, 200)))
+        .all()
+    )
+    iso = lambda dt: dt.isoformat() if dt else None  # noqa: E731
+    return [
+        {
+            "id": r.id,
+            "command": r.command,
+            "sent_at": iso(r.sent_at),
+            "sent_by_user_id": r.sent_by_user_id,
+            "reply": r.reply,
+            "reply_at": iso(r.reply_at),
+            "outcome": r.outcome,
+            "server_flag": r.server_flag,
+            "reply_server_flag": r.reply_server_flag,
+        }
+        for r in rows
+    ]
+
+
 # ── Helper ─────────────────────────────────────────────────────────────────
 
 
@@ -438,7 +478,7 @@ async def _send(
     _enforce_command_policy(db, device, user, command)
 
     tcp = _get_tcp_server(request)
-    result = await tcp.send_command_to_device(device.imei, command)
+    result = await tcp.send_command_to_device(device.imei, command, user_id=user.id)
 
     if not result.get("success"):
         raise HTTPException(status_code=409, detail=result.get("error", f"Failed to send {label}"))
