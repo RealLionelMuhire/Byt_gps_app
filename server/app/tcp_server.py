@@ -21,6 +21,7 @@ from app.api.locations import classify_outlier, compute_quality_log_fields, loca
 from app.services.geofencing import evaluate_geofences, GeofenceTransition
 from app.services.speed_limit import evaluate_speed_limit
 from app.services.live_position import resolve_live_position
+from app.services.relay_state import apply_relay_report, relay_state_payload
 from app.services.geocoding import reverse_geocode, format_fallback_location
 from app.core.config import settings
 from app.services.trip_settings_service import DEFAULT_STOP_SPEED_KMH, get_or_create_trip_settings
@@ -630,7 +631,12 @@ class GPSTrackerConnection:
                     device.gsm_signal = data['gsm_signal']
                     device.status = 'online'
                     device.last_update = datetime.utcnow()
+                    relay_changed = apply_relay_report(device, data.get('oil_elec_disconnected'))
                     db.commit()
+                    if relay_changed:
+                        logger.info(f"Relay state for {self.device_imei}: "
+                                    f"{'CUT' if device.relay_cut else 'connected'}")
+                        await self.server.broadcast_device_status(device.id, relay_state_payload(device))
             
             finally:
                 db.close()
@@ -714,9 +720,12 @@ class GPSTrackerConnection:
                     # fix, so a genuine server-side transition is recorded on
                     # it exactly as handle_location would.
                     geofence_transitions = _apply_geofence_transitions(db, device, location)
+                    relay_changed = apply_relay_report(device, data.get('oil_elec_disconnected'))
 
                     db.commit()
 
+                    if relay_changed:
+                        await self.server.broadcast_device_status(device.id, relay_state_payload(device))
                     # Broadcast alarm to WebSocket clients
                     if is_real_alarm:
                         await self.server.broadcast_alarm(device.id, data, location_id=location.id)
@@ -929,6 +938,16 @@ class TCPServer:
             "position_confirmed_at": confirmed_at.isoformat() if hasattr(confirmed_at, "isoformat") else None,
         }
         await self.ws_manager.broadcast(device_id, payload)
+
+    async def broadcast_device_status(self, device_id: int, relay_state: Dict):
+        """Broadcast a tracker-reported fuel/relay state change —
+        {"type": "device_status", "device_id", "relay_cut", "relay_state_at"}.
+        Sent only when the state changes (see apply_relay_report). Older
+        clients drop unknown message types, so this is backward-compatible.
+        """
+        if self.ws_manager is None:
+            return
+        await self.ws_manager.broadcast(device_id, {"type": "device_status", "device_id": device_id, **relay_state})
 
     async def broadcast_alarm(self, device_id: int, data: Dict, location_id: Optional[int] = None):
         """Broadcast alarm event to all WebSocket subscribers of this device.

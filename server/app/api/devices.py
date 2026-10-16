@@ -165,6 +165,11 @@ class DeviceResponse(DeviceBase):
     position_confirmed_at: Optional[datetime] = None
     battery_level: Optional[int]
     gsm_signal: Optional[int]
+    # Tracker-reported fuel/relay state (migration 052, see
+    # app/services/relay_state.py): True = cut, False = connected, None =
+    # never reported. relay_state_at = when the tracker last reported it.
+    relay_cut: Optional[bool] = None
+    relay_state_at: Optional[datetime] = None
     created_at: datetime
     marker_icon: str  # arrow (default) | sedan | truck_small | truck_big | bus | animal | motorcycle
     # Aggregate fields against the trips table — only populated by

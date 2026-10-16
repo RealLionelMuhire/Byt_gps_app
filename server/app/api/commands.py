@@ -15,6 +15,7 @@ from app.models.command_settings import CommandSettings
 from app.models.device import Device
 from app.models.user import User
 from app.services.entitlements import require_feature
+from app.services.relay_state import relay_state_payload
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -381,6 +382,22 @@ async def restore_fuel(
     return await _send(device_id, "RELAY,0#", "restore fuel", request, db, user)
 
 
+@router.post("/{device_id}/query/relay", dependencies=[require_feature("commands.fuel_cut")])
+async def query_relay(
+    device_id: int,
+    request: Request,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """Ask the tracker for its fuel/relay status via RELAY# (G900LS command
+    list: "Query the oil and electricity control status"). Read-only. The
+    response's relay_cut/relay_state_at are the last state the tracker
+    itself reported (heartbeat bit 7 — see app/services/relay_state.py).
+    Same feature gate as cut/restore: anyone allowed to cut fuel must be
+    able to check whether it's cut."""
+    return await _send(device_id, "RELAY#", "query relay", request, db, user)
+
+
 @router.post("/{device_id}/query/location", dependencies=[require_feature("commands.query")])
 async def query_location(
     device_id: int,
@@ -426,7 +443,7 @@ async def _send(
     if not result.get("success"):
         raise HTTPException(status_code=409, detail=result.get("error", f"Failed to send {label}"))
 
-    return {
+    response = {
         "device_id": device.id,
         "imei": device.imei,
         "action": label,
@@ -434,3 +451,11 @@ async def _send(
         "device_response": result.get("response"),
         "note": result.get("note"),
     }
+    if command.upper().startswith("RELAY"):
+        # The tracker's own last-reported relay state, re-read after the
+        # command (a heartbeat may have landed while we waited). Clients
+        # confirm a cut/restore against THIS, never against the command
+        # having been sent.
+        db.refresh(device)
+        response.update(relay_state_payload(device))
+    return response

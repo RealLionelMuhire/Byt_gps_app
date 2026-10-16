@@ -107,6 +107,13 @@ class Device(Base):
     # app/services/speed_limit.py; never exposed via the API.
     is_overspeeding = Column(Boolean, nullable=False, default=False)
 
+    # The tracker's own report of its fuel/relay output (migration 052) —
+    # GT06 terminal-info bit 7, carried by every heartbeat/alarm packet.
+    # NULL until the first report. Updated by app/services/relay_state.py;
+    # this, not the last command sent, is what clients show as fuel state.
+    relay_cut = Column(Boolean, nullable=True)
+    relay_state_at = Column(DateTime, nullable=True)
+
     # Metadata
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

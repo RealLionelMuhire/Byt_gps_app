@@ -309,6 +309,7 @@ class ProtocolParser:
                 'acc_status': acc_status,
                 'charging': charging_status,
                 'alarm_status': alarm_status,
+                'oil_elec_disconnected': oil_elec_disconnected,
                 'serial_number': serial_number
             }
         
@@ -365,6 +366,8 @@ class ProtocolParser:
                         terminal_info = packet[status_offset]
                         location_data['acc_status'] = bool(terminal_info & 0x02)
                         location_data['gps_tracking'] = bool(terminal_info & 0x40)
+                        # Bit 7: fuel/relay cut — see app/services/relay_state.py
+                        location_data['oil_elec_disconnected'] = bool(terminal_info & 0x80)
                         
                         voltage_level = packet[status_offset + 1]
                         battery_info = self.BATTERY_LEVELS.get(voltage_level, {"level": "Unknown", "percent": 50})
