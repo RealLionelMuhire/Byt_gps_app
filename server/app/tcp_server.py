@@ -23,7 +23,7 @@ from app.api.locations import classify_outlier, compute_quality_log_fields, loca
 from app.services.geofencing import evaluate_geofences, GeofenceTransition
 from app.services.speed_limit import evaluate_speed_limit
 from app.services.live_position import resolve_live_position
-from app.services.relay_state import apply_relay_report, parse_relay_reply, relay_state_payload
+from app.services.relay_state import apply_relay_report, is_deferred_relay_reply, parse_relay_reply, relay_state_payload
 from app.models.command_log import CommandLog
 from app.services.geocoding import reverse_geocode, format_fallback_location
 from app.core.config import settings
@@ -248,6 +248,16 @@ async def _resolve_overspeed_road_name(location: Location) -> str:
     return name or format_fallback_location(location.latitude, location.longitude)
 
 
+def _relay_target(command: Optional[str]) -> Optional[bool]:
+    """True for a cut (RELAY,1#), False for a restore (RELAY,0#), else None."""
+    normalized = (command or "").replace(" ", "").upper()
+    if normalized.startswith("RELAY,1"):
+        return True
+    if normalized.startswith("RELAY,0"):
+        return False
+    return None
+
+
 class GPSTrackerConnection:
     """Represents a single GPS tracker connection"""
     
@@ -290,6 +300,9 @@ class GPSTrackerConnection:
         self._pending_flag: Optional[int] = None
         self._pending_log_id: Optional[int] = None
         self._recent_flags: "OrderedDict[int, tuple]" = OrderedDict()
+        # Follow-up RELAY# polling while a deferred cut/restore is pending —
+        # see _confirm_relay_change.
+        self._relay_confirm_task: Optional[asyncio.Task] = None
 
         logger.info(f"New connection from {address}")
     
@@ -779,6 +792,9 @@ class GPSTrackerConnection:
             logger.warning(f"Reply from {self.device_imei} recorded as {outcome} (flag {reply_flag}): {content}")
         self._log_command_reply(log_id, content, reply_flag, outcome)
         await self._apply_relay_from_reply(content)
+        target = _relay_target(command)
+        if target is not None and parse_relay_reply(content) is None and is_deferred_relay_reply(content):
+            self._start_relay_confirmation(target)
 
         if is_current and command == "WHERE#":
             parsed = self.parser.parse_where_reply(content)
@@ -903,12 +919,58 @@ class GPSTrackerConnection:
             logger.info(f"Relay state for {self.device_imei} from reply: {'CUT' if cut else 'connected'}")
             await self.server.broadcast_device_status(device_id, payload)
 
+    # How often / how long to ask RELAY# while a deferred cut is pending.
+    # The firmware waits for a GPS speed reading < 20 km/h (seen: 2.5-3.5
+    # min on a bench unit), so 20 s keeps the app within ~20 s of the real
+    # switch instead of the ~5 min heartbeat.
+    RELAY_CONFIRM_INTERVAL_S = 20.0
+    RELAY_CONFIRM_MAX_CHECKS = 30  # 10 minutes
+
+    def _start_relay_confirmation(self, target_cut: bool) -> None:
+        if self._relay_confirm_task is not None and not self._relay_confirm_task.done():
+            self._relay_confirm_task.cancel()
+        self._relay_confirm_task = asyncio.create_task(self._confirm_relay_change(target_cut))
+
+    def _current_relay_cut(self) -> Optional[bool]:
+        db = SessionLocal()
+        try:
+            device = db.query(Device).filter(Device.imei == self.device_imei).first()
+            return device.relay_cut if device else None
+        finally:
+            db.close()
+
+    async def _confirm_relay_change(self, target_cut: bool) -> None:
+        """Ask the tracker RELAY# periodically until it reports
+        `target_cut` (each reply updates Device.relay_cut and is pushed to
+        the apps via _apply_relay_from_reply), or give up after
+        RELAY_CONFIRM_MAX_CHECKS. Logged in command_log with no user."""
+        try:
+            for _ in range(self.RELAY_CONFIRM_MAX_CHECKS):
+                await asyncio.sleep(self.RELAY_CONFIRM_INTERVAL_S)
+                if self._current_relay_cut() == target_cut:
+                    return
+                result = await self.send_command("RELAY#", timeout=10.0)
+                if not result.get("success"):
+                    return
+                if parse_relay_reply(result.get("response")) == target_cut:
+                    return
+            logger.warning(f"{self.device_imei}: relay still not {'cut' if target_cut else 'restored'} after follow-up checks")
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            logger.error(f"Relay confirmation polling failed for {self.device_imei}: {e}")
+
     async def send_command(self, command: str, timeout: float = 10.0, user_id: Optional[int] = None) -> Dict:
         """Send an ASCII command to the device (Protocol 0x80) and wait for the 0x15 response.
 
         Serialized per-connection via _command_lock — see its doc in
         __init__ for why (GT06 command responses can't be reliably
         correlated to a specific in-flight request)."""
+        if _relay_target(command) is not None and self._relay_confirm_task is not None:
+            # A new cut/restore supersedes any follow-up for the old one.
+            current = asyncio.current_task()
+            if self._relay_confirm_task is not current and not self._relay_confirm_task.done():
+                self._relay_confirm_task.cancel()
         async with self._command_lock:
             self._command_serial = (self._command_serial + 1) & 0xFFFF
             server_flag = self._new_server_flag()
@@ -958,6 +1020,8 @@ class GPSTrackerConnection:
     
     async def close(self):
         """Close connection"""
+        if self._relay_confirm_task is not None and not self._relay_confirm_task.done():
+            self._relay_confirm_task.cancel()
         try:
             if self.device_imei:
                 self.server.unregister_device(self.device_imei)

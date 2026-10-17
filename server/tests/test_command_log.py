@@ -18,7 +18,7 @@ import app.tcp_server as tcp_server_module
 from app.models.command_log import CommandLog
 from app.models.device import Device
 from app.models.user import Role, User
-from app.services.relay_state import parse_relay_reply
+from app.services.relay_state import is_deferred_relay_reply, parse_relay_reply
 from app.tcp_server import GPSTrackerConnection
 
 pytestmark = pytest.mark.anyio
@@ -31,10 +31,20 @@ def anyio_backend():
 
 
 def test_parse_relay_reply_real_samples():
+    # Verbatim G900LS replies from the production command_log, 2026-10-16/17.
     assert parse_relay_reply("RELAY:0") is False
     assert parse_relay_reply("RELAY:1") is True
     assert parse_relay_reply("Stop engine succeed RELAY 1 OK") is True
-    assert parse_relay_reply("Stop engine fail, RELAY 1") is None  # never infer success from a failure
+    assert parse_relay_reply("Resume engine Succeed\nRELAY 0 OK") is False
+    # Accepted but NOT executed yet — must never read as "cut" (regression:
+    # the first parser did, and the app said "Fuel supply cut" minutes early).
+    deferred = "it will be executed after speed less than 20KM/H\nRELAY 1 OK"
+    pending = "The state of power cut, no longer execute!\nRELAY 1 OK"
+    assert parse_relay_reply(deferred) is None
+    assert parse_relay_reply(pending) is None
+    assert is_deferred_relay_reply(deferred) and is_deferred_relay_reply(pending)
+    assert parse_relay_reply("RELAY 1 OK") is None  # bare acceptance
+    assert parse_relay_reply("Stop engine fail, RELAY 1") is None
     assert parse_relay_reply("LastPosition! Lati:S1.94,E30.09,Course:11,Speed:0.00") is None
     assert parse_relay_reply(None) is None
 
@@ -163,3 +173,49 @@ def test_command_log_endpoint(client, db_session, current_clerk_id):
     res = client.get(f"/api/devices/{device.id}/command_log")
     assert res.status_code == 200, res.text
     assert res.json()[0]["reply"] == "Stop engine succeed RELAY 1 OK"
+
+
+async def test_deferred_cut_is_not_reported_as_cut_and_is_confirmed_by_follow_up_checks(env, db_session, monkeypatch):
+    conn, writer, device = env
+    monkeypatch.setattr(GPSTrackerConnection, "RELAY_CONFIRM_INTERVAL_S", 0.01)
+
+    # A fake tracker: answers each RELAY# with RELAY:0 twice, then RELAY:1
+    # (the firmware finally saw speed < 20 km/h and cut).
+    answers = iter(["RELAY:0", "RELAY:0", "RELAY:1"])
+    answered = 0
+
+    async def tracker():
+        nonlocal answered
+        while True:
+            await asyncio.sleep(0.002)
+            while answered < len(writer.packets) - 1:
+                answered += 1
+                packet = writer.packets[answered]
+                flag = struct.unpack(">I", packet[5:9])[0]
+                await conn.handle_command_response({"content": next(answers), "server_flag": flag})
+
+    task = asyncio.create_task(conn.send_command("RELAY,1#", timeout=2))
+    await _until_sent(writer, 1)
+    await conn.handle_command_response(
+        {"content": "it will be executed after speed less than 20KM/H\nRELAY 1 OK", "server_flag": writer.last_flag()}
+    )
+    result = await task
+    db_session.refresh(device)
+    assert device.relay_cut is False, "deferred: the fuel is NOT cut yet"
+    assert result["response"].startswith("it will be executed")
+
+    fake = asyncio.create_task(tracker())
+    try:
+        for _ in range(500):
+            await asyncio.sleep(0.01)
+            db_session.expire_all()
+            if db_session.get(Device, device.id).relay_cut:
+                break
+        assert db_session.get(Device, device.id).relay_cut is True, "follow-up RELAY# must catch the real cut"
+        await asyncio.wait_for(conn._relay_confirm_task, timeout=2)  # stops once confirmed
+        checks = db_session.query(CommandLog).filter(CommandLog.command == "RELAY#").count()
+        assert checks == 3
+        assert conn.server.statuses[-1][1]["relay_cut"] is True, "pushed live to the apps"
+    finally:
+        fake.cancel()
+
