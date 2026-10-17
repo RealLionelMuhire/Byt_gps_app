@@ -36,5 +36,7 @@ CREATE INDEX IF NOT EXISTS ix_command_log_device_sent ON command_log (device_id,
 CREATE INDEX IF NOT EXISTS ix_command_log_server_flag ON command_log (server_flag);
 
 COMMENT ON TABLE command_log IS 'Every tracker command and reply (see migration 053).';
+-- Not exposed through Supabase's REST API (see migration 054).
+ALTER TABLE command_log ENABLE ROW LEVEL SECURITY;
 
 COMMIT;
