@@ -23,6 +23,7 @@ from app.models.geofence_device_state import GeofenceDeviceState
 from app.models.geofence_version import GeofenceVersion
 from app.models.location import Location
 from app.models.location_quality_log import LocationQualityLog
+from app.models.overspeed_episode import OverspeedEpisode
 from app.models.subscription import Subscription
 from app.models.trip import Trip
 from app.models.trip_settings import TripSettings
@@ -60,6 +61,10 @@ def delete_user_data(db: Session, user: User) -> None:
         if device_ids:
             db.query(LocationQualityLog).filter(
                 LocationQualityLog.device_id.in_(device_ids)
+            ).delete(synchronize_session=False)
+            # Before Location: episodes reference location rows.
+            db.query(OverspeedEpisode).filter(
+                OverspeedEpisode.device_id.in_(device_ids)
             ).delete(synchronize_session=False)
             db.query(Location).filter(
                 Location.device_id.in_(device_ids)
