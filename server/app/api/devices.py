@@ -27,6 +27,7 @@ from app.core.config import settings
 from app.models.user import User, Role
 from app.services.plan_resolution import resolve_owner_plan
 from app.services.entitlements import require_feature
+from app.services.speed_limit import close_open_episode
 from pydantic import BaseModel, field_validator, model_validator
 
 logger = logging.getLogger(__name__)
@@ -1348,16 +1349,20 @@ async def update_speed_limit(
     user: User = Depends(get_current_user),
 ):
     """Set (or clear, with a null body) this device's owner-configured
-    speed threshold. Takes effect on the next incoming location fix —
-    there's no need to reset any in-progress overspeed state here:
-    Device.is_overspeeding is just edge-detection bookkeeping for
-    app/services/speed_limit.py, and naturally resolves itself against
-    whatever the new threshold is on that next fix."""
+    speed threshold. Takes effect on the next incoming location fix.
+
+    A real change made mid-episode closes the open OverspeedEpisode
+    ("limit_changed") and disarms the device (see
+    app/services/speed_limit.py's close_open_episode): an episode is
+    always judged against the one threshold it opened with, so the red
+    route segment keeps matching the alert that fired for it."""
     device = db.query(Device).filter(Device.id == device_id).first()
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
     require_device_access(device, user)
 
+    if body.speed_limit_kmh != device.speed_limit_kmh and device.is_overspeeding:
+        close_open_episode(db, device, reason="limit_changed")
     device.speed_limit_kmh = body.speed_limit_kmh
     device.updated_at = datetime.utcnow()
 

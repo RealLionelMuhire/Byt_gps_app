@@ -214,10 +214,18 @@ def build_activity(
     return {"summary": summary, "daily": daily, "drives": drives, "stops": stops, "offline_periods": offline}
 
 
-def build_overspeed_episodes(alarms: list, locations: list, speed_limit_kmh: Optional[float]) -> List[dict]:
+def build_overspeed_episodes(
+    alarms: list, locations: list, speed_limit_kmh: Optional[float], stored: Optional[dict] = None,
+) -> List[dict]:
     """One row per "Over speed" alarm (each is already exactly one
     edge-triggered episode — see app/services/speed_limit.py), enriched
     with the episode's peak speed and how long it lasted.
+
+    `stored` maps alarm location id -> its OverspeedEpisode (migration
+    055). When an alarm has one, its recorded peak and duration are used
+    as-is — the same record the alert and the history route's red segment
+    come from, judged against the limit in force at the time. Only alarms
+    from before that table existed fall back to the reconstruction below.
 
     The episode is read forward from the alarm's own fix through the
     quality-filtered locations for as long as speed stays above the same
@@ -231,12 +239,17 @@ def build_overspeed_episodes(alarms: list, locations: list, speed_limit_kmh: Opt
     timestamps = [loc.timestamp for loc in locations]
     floor = (speed_limit_kmh - HYSTERESIS_KMH) if speed_limit_kmh is not None else None
 
+    stored = stored or {}
     for idx, alarm in enumerate(speeding):
         alarm_speed = alarm.speed or 0.0
         max_speed = alarm_speed
         end_time = alarm.timestamp
         duration: Optional[float] = None
-        if floor is not None:
+        episode = stored.get(getattr(alarm, "id", None))
+        if episode is not None:
+            max_speed = max(max_speed, episode.max_speed_kmh)
+            duration = ((episode.ended_at or episode.last_fix_at) - episode.started_at).total_seconds()
+        elif floor is not None:
             next_alarm_at = speeding[idx + 1].timestamp if idx + 1 < len(speeding) else None
             j = bisect_left(timestamps, alarm.timestamp)
             prev_ts = alarm.timestamp

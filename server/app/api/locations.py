@@ -17,6 +17,7 @@ from app.services.entitlements import require_feature
 from app.models.location import Location
 from app.models.location_quality_log import LocationQualityLog
 from app.models.device import Device
+from app.models.overspeed_episode import OverspeedEpisode
 from app.models.user import User, Role
 from app.services.trip_settings_service import get_or_create_trip_settings
 from app.services.geocoding import (
@@ -328,26 +329,55 @@ SINCE_LAST_STOP_LOOKBACK_HOURS = 48
 MAX_POINTS_PER_DRIVING_SEGMENT = 2000
 
 
-def _downsample_uniform(points: List["Location"], max_points: int) -> List["Location"]:
+def douglas_peucker_pinned(
+    points: List["Location"], epsilon: float, pins: frozenset = frozenset(),
+) -> List["Location"]:
+    """douglas_peucker, but every point whose timestamp is in `pins` is
+    always kept: the track is split at each pinned point and each piece is
+    simplified on its own (DP keeps every piece's endpoints) — the same
+    "never simplify across a boundary" rule segment breaks already follow.
+    Used for overspeed episode boundaries (see overspeed_pin_times), so the
+    exact first-over and first-back-under fixes survive simplification and
+    the app's red segment starts and ends on them."""
+    if not pins or len(points) < 3:
+        return douglas_peucker(points, epsilon)
+    result: List["Location"] = []
+    start = 0
+    for i in range(1, len(points)):
+        if i == len(points) - 1 or points[i].timestamp in pins:
+            piece = douglas_peucker(points[start:i + 1], epsilon)
+            result.extend(piece if not result else piece[1:])
+            start = i
+    return result
+
+
+def _downsample_uniform(
+    points: List["Location"], max_points: int, pins: frozenset = frozenset(),
+) -> List["Location"]:
     """Uniformly stride through points down to at most max_points, always
-    keeping the first and last point."""
+    keeping the first and last point — and any point whose timestamp is in
+    `pins` (so the result can exceed max_points by the number of pins)."""
     if len(points) <= max_points:
         return points
     step = (len(points) - 1) / (max_points - 1)
-    indices = sorted({round(i * step) for i in range(max_points)})
-    return [points[i] for i in indices]
+    indices = {round(i * step) for i in range(max_points)}
+    if pins:
+        indices.update(i for i, p in enumerate(points) if p.timestamp in pins)
+    return [points[i] for i in sorted(indices)]
 
 
-def _make_driving_segment(points: List["Location"], simplify: bool, epsilon_deg: float) -> dict:
+def _make_driving_segment(
+    points: List["Location"], simplify: bool, epsilon_deg: float, pins: frozenset = frozenset(),
+) -> dict:
     distance_km = 0.0
     for i in range(1, len(points)):
         distance_km += haversine_km(
             points[i - 1].longitude, points[i - 1].latitude,
             points[i].longitude, points[i].latitude,
         )
-    display_points = douglas_peucker(points, epsilon_deg) if (simplify and len(points) > 2) else points
+    display_points = douglas_peucker_pinned(points, epsilon_deg, pins) if (simplify and len(points) > 2) else points
     if len(display_points) > MAX_POINTS_PER_DRIVING_SEGMENT:
-        display_points = _downsample_uniform(display_points, MAX_POINTS_PER_DRIVING_SEGMENT)
+        display_points = _downsample_uniform(display_points, MAX_POINTS_PER_DRIVING_SEGMENT, pins)
     return {
         "type": "driving",
         "start_time": points[0].timestamp.isoformat(),
@@ -461,6 +491,7 @@ def build_period_segments(
     min_stop_seconds: float,
     simplify: bool = True,
     tolerance_meters: float = 20.0,
+    pins: frozenset = frozenset(),
 ) -> List[dict]:
     """
     Build an ordered, typed timeline of "driving" / "stopped" / "offline"
@@ -477,12 +508,13 @@ def build_period_segments(
 
     Caller is responsible for pre-filtering to quality-passing, in-range,
     chronologically-ordered locations (see location_quality_filters).
+    `pins`: timestamps simplification must keep (see douglas_peucker_pinned).
     """
     epsilon_deg = tolerance_meters / METERS_PER_DEGREE
     result: List[dict] = []
     for kind, points in classify_period_spans(locations, stop_speed_threshold_kmh, min_stop_seconds):
         if kind == "driving":
-            result.append(_make_driving_segment(points, simplify, epsilon_deg))
+            result.append(_make_driving_segment(points, simplify, epsilon_deg, pins))
         elif kind == "stopped":
             result.append(_make_stopped_segment(points))
         else:
@@ -587,6 +619,79 @@ def _attach_driving_place_names(segments: List[dict], places: Dict[Tuple[float, 
         s["display_name"] = f"{start_place} → {end_place}"
 
 
+def fetch_overspeed_episodes(
+    db: Session, device_id: int, start: datetime, end: datetime,
+) -> List[OverspeedEpisode]:
+    """Every OverspeedEpisode (migration 055) overlapping [start, end],
+    oldest first — an open episode overlaps up to its last fix so far."""
+    return (
+        db.query(OverspeedEpisode)
+        .filter(
+            OverspeedEpisode.device_id == device_id,
+            OverspeedEpisode.started_at <= end,
+            OverspeedEpisode.last_fix_at >= start,
+        )
+        .order_by(OverspeedEpisode.started_at.asc())
+        .all()
+    )
+
+
+def overspeed_pin_times(episodes: List[OverspeedEpisode]) -> frozenset:
+    """The fixes each episode starts and ends on (its last fix so far,
+    while still open) — kept through simplification so the app can color
+    exactly [started_at, ended_at]. Each is a real quality-passing fix:
+    app/services/speed_limit.py ignores invalid/outlier fixes entirely."""
+    pins = set()
+    for e in episodes:
+        pins.add(e.started_at)
+        pins.add(e.ended_at or e.last_fix_at)
+    return frozenset(pins)
+
+
+class OverspeedEpisodeResponse(BaseModel):
+    """One overspeed episode — the shared definition the alert and the
+    red route segment both come from (see app/services/speed_limit.py).
+    The app colors from the first route point at/after started_at through
+    the first at/after `ended_at` (or `last_fix_at` while in progress)."""
+    id: int
+    alarm_location_id: Optional[int]
+    started_at: datetime
+    ended_at: Optional[datetime]
+    last_fix_at: datetime
+    in_progress: bool
+    threshold_kmh: float
+    hysteresis_kmh: float
+    max_speed_kmh: float
+    start_latitude: float
+    start_longitude: float
+    end_latitude: Optional[float]
+    end_longitude: Optional[float]
+    end_reason: Optional[str]
+
+    @classmethod
+    def from_episode(cls, e: OverspeedEpisode) -> "OverspeedEpisodeResponse":
+        return cls(
+            id=e.id,
+            alarm_location_id=e.alarm_location_id,
+            started_at=e.started_at,
+            ended_at=e.ended_at,
+            last_fix_at=e.last_fix_at,
+            in_progress=e.ended_at is None,
+            threshold_kmh=e.threshold_kmh,
+            hysteresis_kmh=e.hysteresis_kmh,
+            max_speed_kmh=e.max_speed_kmh,
+            start_latitude=e.start_latitude,
+            start_longitude=e.start_longitude,
+            end_latitude=e.end_latitude,
+            end_longitude=e.end_longitude,
+            end_reason=e.end_reason,
+        )
+
+
+def serialize_overspeed_episodes(episodes: List[OverspeedEpisode]) -> List[dict]:
+    return [OverspeedEpisodeResponse.from_episode(e).model_dump(mode="json") for e in episodes]
+
+
 def verify_device_access(device_id: int, user: User, db: Session) -> Device:
     """Verify device exists and the caller owns it (or is admin)."""
     device = db.query(Device).filter(Device.id == device_id).first()
@@ -689,9 +794,33 @@ class LocationResponse(BaseModel):
     acknowledged_at: Optional[datetime]
     timestamp: datetime
     received_at: datetime
+    # Only on an "Over speed" alarm the server synthesized from
+    # Device.speed_limit_kmh after migration 055 — null for every other
+    # alarm, for older overspeed alarms, and for the tracker's own firmware
+    # "Over speed" alarm (no known threshold). Not an ORM attribute: filled
+    # in by _with_overspeed for the alarm endpoints.
+    overspeed: Optional[OverspeedEpisodeResponse] = None
     
     class Config:
         from_attributes = True
+
+
+def _with_overspeed(db: Session, alarms: List[Location]) -> List[LocationResponse]:
+    """LocationResponse for each alarm row, with its OverspeedEpisode (if
+    any) attached — one query for the whole list, not one per row."""
+    ids = [a.id for a in alarms if a.alarm_type == "Over speed"]
+    episodes = {}
+    if ids:
+        for e in db.query(OverspeedEpisode).filter(OverspeedEpisode.alarm_location_id.in_(ids)):
+            episodes[e.alarm_location_id] = e
+    result = []
+    for a in alarms:
+        response = LocationResponse.model_validate(a)
+        episode = episodes.get(a.id)
+        if episode is not None:
+            response.overspeed = OverspeedEpisodeResponse.from_episode(episode)
+        result.append(response)
+    return result
 
 
 class LocationHistoryResponse(BaseModel):
@@ -866,10 +995,13 @@ def _build_route_response(
     end_time: datetime,
     simplify: bool,
     tolerance_meters: float,
+    episodes: Optional[List[OverspeedEpisode]] = None,
 ) -> dict:
     """
     Build the simplified-route FeatureCollection shared by /route and
-    /since-last-stop: segment by gap, then (optionally) Douglas-Peucker
+    /since-last-stop. `episodes` (overspeed, see fetch_overspeed_episodes)
+    are returned as-is and their boundary fixes are pinned through
+    simplification: segment by gap, then (optionally) Douglas-Peucker
     simplify within each segment — never blending simplification across a
     segment break. Caller is responsible for pre-filtering to
     quality-passing, in-range, chronologically-ordered locations (see
@@ -877,6 +1009,8 @@ def _build_route_response(
     """
     original_point_count = len(locations)
     epsilon_deg = tolerance_meters / METERS_PER_DEGREE
+    episodes = episodes or []
+    pins = overspeed_pin_times(episodes)
 
     # Segment first, then simplify (if requested) within each segment — never
     # let simplification blend points across a segment break.
@@ -893,7 +1027,7 @@ def _build_route_response(
     features = []
     segments_meta = []
     for seg_id, seg in enumerate(location_segments):
-        seg_locations = douglas_peucker(seg, epsilon_deg) if (simplify and len(seg) > 2) else seg
+        seg_locations = douglas_peucker_pinned(seg, epsilon_deg, pins) if (simplify and len(seg) > 2) else seg
         for loc in seg_locations:
             features.append({
                 "type": "Feature",
@@ -921,6 +1055,7 @@ def _build_route_response(
         "features": features,
         "segments": segments_meta,
         "gaps": gaps,
+        "overspeed_episodes": serialize_overspeed_episodes(episodes),
         "properties": {
             "device_id": device.id,
             "device_name": device.name,
@@ -963,9 +1098,11 @@ async def get_device_route(
         query = query.filter(Location.timestamp <= end_time)
 
     locations = query.order_by(Location.timestamp.asc()).all()
+    end_time = end_time or datetime.utcnow()
+    episodes = fetch_overspeed_episodes(db, device_id, start_time, end_time)
 
     return _build_route_response(
-        device, locations, start_time, end_time or datetime.utcnow(), simplify, tolerance_meters
+        device, locations, start_time, end_time, simplify, tolerance_meters, episodes
     )
 
 
@@ -1073,6 +1210,7 @@ async def get_period_route(
     query = db.query(Location).filter(*location_quality_filters(device_id))
     query = query.filter(Location.timestamp >= start, Location.timestamp <= end)
     locations = query.order_by(Location.timestamp.asc()).all()
+    episodes = fetch_overspeed_episodes(db, device_id, start, end)
 
     segments = build_period_segments(
         locations,
@@ -1080,6 +1218,7 @@ async def get_period_route(
         min_stop_seconds=settings.min_stop_segment_minutes * 60,
         simplify=simplify,
         tolerance_meters=tolerance_meters,
+        pins=overspeed_pin_times(episodes),
     )
 
     coords = _driving_segment_endpoints(segments)
@@ -1110,6 +1249,7 @@ async def get_period_route(
         "start_time": start.isoformat(),
         "end_time": end.isoformat(),
         "segments": segments,
+        "overspeed_episodes": serialize_overspeed_episodes(episodes),
         "properties": {
             "point_count_raw": len(locations),
             "segment_count": len(segments),
@@ -1209,7 +1349,7 @@ async def get_device_alarms(
     
     alarms = query.order_by(Location.timestamp.desc()).limit(limit).all()
 
-    return alarms
+    return _with_overspeed(db, alarms)
 
 
 @router.post("/{location_id}/acknowledge", response_model=LocationResponse, dependencies=[require_feature("alerts.history")])
@@ -1242,7 +1382,7 @@ async def acknowledge_alarm(
         db.commit()
         db.refresh(location)
 
-    return location
+    return _with_overspeed(db, [location])[0]
 
 
 class RecentAlarmResponse(BaseModel):

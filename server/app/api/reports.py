@@ -17,6 +17,7 @@ from app.core.database import get_db
 from app.core.auth import get_current_user
 from app.models.device import Device
 from app.models.location import Location
+from app.models.overspeed_episode import OverspeedEpisode
 from app.models.user import User
 from app.services.entitlements import require_feature
 from app.services.geocoding import (
@@ -75,10 +76,20 @@ def _load_locations(db: Session, device_id: int, start: datetime, end: datetime)
     )
 
 
+def _load_stored_episodes(db: Session, alarms: list) -> Dict[int, OverspeedEpisode]:
+    """Recorded OverspeedEpisode per "Over speed" alarm id (migration 055),
+    for build_overspeed_episodes."""
+    ids = [a.id for a in alarms if a.alarm_type == "Over speed"]
+    if not ids:
+        return {}
+    rows = db.query(OverspeedEpisode).filter(OverspeedEpisode.alarm_location_id.in_(ids)).all()
+    return {e.alarm_location_id: e for e in rows}
+
+
 def _load_alarms(db: Session, device_id: int, start: datetime, end: datetime) -> list:
     return (
         db.query(
-            Location.timestamp, Location.alarm_type, Location.geofence_name, Location.road_name,
+            Location.id, Location.timestamp, Location.alarm_type, Location.geofence_name, Location.road_name,
             Location.speed, Location.latitude, Location.longitude,
         )
         .filter(Location.device_id == device_id, Location.is_alarm == True)  # noqa: E712
@@ -177,7 +188,9 @@ async def get_device_report(
         min_stop_seconds=settings.min_stop_segment_minutes * 60,
         period_start=start, period_end=end, offset=offset,
     )
-    overspeed = build_overspeed_episodes(alarms, locations, device.speed_limit_kmh)
+    overspeed = build_overspeed_episodes(
+        alarms, locations, device.speed_limit_kmh, _load_stored_episodes(db, alarms)
+    )
     visits = build_geofence_visits(alarms, start, end)
     alarm_counts = count_alarms(alarms)
 

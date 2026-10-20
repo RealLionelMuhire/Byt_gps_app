@@ -134,7 +134,9 @@ def test_apply_speed_limit_check_claims_the_alarm_slot_on_a_fresh_location(db_se
     db_session.commit()
 
     location = _location(device)
-    fired = _apply_speed_limit_check(device, location, speed_kmh=100, gps_valid=True)
+    db_session.add(location)
+    db_session.flush()
+    fired = _apply_speed_limit_check(db_session, device, location, speed_kmh=100, gps_valid=True)
 
     assert fired is True
     assert location.is_alarm is True
@@ -151,7 +153,9 @@ def test_apply_speed_limit_check_does_not_override_an_existing_alarm(db_session)
     db_session.commit()
 
     location = _location(device, is_alarm=True, alarm_type="Shock")
-    fired = _apply_speed_limit_check(device, location, speed_kmh=100, gps_valid=True)
+    db_session.add(location)
+    db_session.flush()
+    fired = _apply_speed_limit_check(db_session, device, location, speed_kmh=100, gps_valid=True)
 
     assert fired is False
     assert location.alarm_type == "Shock"

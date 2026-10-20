@@ -21,7 +21,7 @@ from app.models.location import Location
 from app.models.location_quality_log import LocationQualityLog
 from app.api.locations import classify_outlier, compute_quality_log_fields, location_quality_filters
 from app.services.geofencing import evaluate_geofences, GeofenceTransition
-from app.services.speed_limit import evaluate_speed_limit
+from app.services.speed_limit import evaluate_speed_limit, is_evaluable_fix, track_overspeed_episode
 from app.services.live_position import resolve_live_position
 from app.services.relay_state import apply_relay_report, is_deferred_relay_reply, parse_relay_reply, relay_state_payload
 from app.models.command_log import CommandLog
@@ -176,7 +176,9 @@ async def _broadcast_geofence_transitions(
         await server.broadcast_alarm(device_id, alarm_data, location_id=location_id)
 
 
-def _apply_speed_limit_check(device: Device, location: Location, speed_kmh: float, gps_valid: bool) -> bool:
+def _apply_speed_limit_check(
+    db, device: Device, location: Location, speed_kmh: float, gps_valid: bool, is_outlier: bool = False,
+) -> bool:
     """
     Evaluate device.speed_limit_kmh against this fix (see
     app/services/speed_limit.py) and, if it just crossed into overspeed,
@@ -189,9 +191,11 @@ def _apply_speed_limit_check(device: Device, location: Location, speed_kmh: floa
     updates correctly for the *next* fix regardless).
 
     Must be called after `location` has been added to `db` and before
-    `db.commit()` — evaluate_speed_limit mutates `device.is_overspeeding`
-    on the same session. Returns whether to broadcast a new "Over speed"
-    alarm for this fix.
+    `db.commit()`, with `location` already flushed (the episode row links
+    its id) — evaluate_speed_limit mutates `device.is_overspeeding` and
+    track_overspeed_episode opens/extends/closes this device's
+    OverspeedEpisode on the same session. Returns whether to broadcast a
+    new "Over speed" alarm for this fix.
 
     Deliberately only wired into handle_location, not handle_alarm — a
     hardware-alarm packet's own speed field could in principle also cross
@@ -201,12 +205,22 @@ def _apply_speed_limit_check(device: Device, location: Location, speed_kmh: floa
     threading this through handle_alarm too isn't worth it for that
     narrow a gap.
     """
-    crossed = evaluate_speed_limit(device, speed_kmh, gps_valid)
-    if crossed and not location.is_alarm:
+    was_overspeeding = device.is_overspeeding
+    crossed = evaluate_speed_limit(device, speed_kmh, gps_valid, is_outlier)
+    claimed = crossed and not location.is_alarm
+    if claimed:
         location.is_alarm = True
         location.alarm_type = "Over speed"
-        return True
-    return False
+    # The episode is tracked whether or not this fix won the alarm slot —
+    # the vehicle really is over the limit either way.
+    track_overspeed_episode(
+        db, device, location, speed_kmh,
+        evaluable=is_evaluable_fix(speed_kmh, gps_valid, is_outlier),
+        was_overspeeding=was_overspeeding,
+        crossed=crossed,
+        alarm_location_id=location.id if claimed else None,
+    )
+    return claimed
 
 
 # A cache-only lookup (see app/api/locations.py's period-route endpoint)
@@ -520,7 +534,7 @@ class GPSTrackerConnection:
 
                     geofence_transitions = _apply_geofence_transitions(db, device, location)
                     speed_limit_fired = _apply_speed_limit_check(
-                        device, location, data['speed'], data['gps_valid']
+                        db, device, location, data['speed'], data['gps_valid'], is_outlier
                     )
 
                     db.commit()
@@ -1165,6 +1179,9 @@ class TCPServer:
             "timestamp": ts.isoformat() if hasattr(ts, "isoformat") else str(ts),
             "geofence_name": data.get("geofence_name"),
             "road_name": data.get("road_name"),
+            # The alarm's own `locations` row id — lets the app open this
+            # exact alert (GET .../alarms, POST /{location_id}/acknowledge).
+            "location_id": location_id,
         }
         await self.ws_manager.broadcast(device_id, payload)
 
@@ -1300,6 +1317,10 @@ class TCPServer:
                 push_data["geofence_name"] = data["geofence_name"]
             if data.get("road_name"):
                 push_data["road_name"] = data["road_name"]
+            # Lets a notification tap open this exact alert rather than just
+            # the device (see the app's core/messaging/fcm_navigation.dart).
+            if location_id is not None:
+                push_data["location_id"] = location_id
 
             await send_push_notification(
                 user,
