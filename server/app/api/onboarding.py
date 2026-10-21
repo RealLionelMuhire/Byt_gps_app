@@ -49,11 +49,13 @@ from app.services.email import _user_display_name as _email_display_name, receip
 from app.services.subscription_billing import (
     SelectionError, check_slot_cap, cover_vehicles, covered_vehicle_ids, monthly_price,
     owner_vehicles, paid_slots, plan_add_vehicles, resolve_selection, subscribe_amount,
-    vehicles_for_payment,
+    vehicles_for_payment, claim_payment, activate_payment_subscription,
 )
 from app.services.intouchpay import (
     request_payment as intouch_request_payment,
     get_balance as intouch_get_balance,
+    get_transaction_status,
+    classify_status,
     IntouchPayError,
 )
 
@@ -219,6 +221,33 @@ class PaymentInitiateResponse(BaseModel):
     txRef:  str
     status: str   # "pending" | "failed"
     message: Optional[str] = None
+
+
+class PublicPaymentInitiateRequest(BaseModel):
+    email: str
+    phone: str
+    planId: str
+    vehicleIds: Optional[List[int]] = None
+    purpose: Literal["subscribe", "add_vehicles"] = "subscribe"
+
+
+class PublicPaymentInitiateResponse(BaseModel):
+    txRef: str
+    status: str
+    message: Optional[str] = None
+    amount: float
+    currency: str = "RWF"
+    planName: str
+
+
+class PublicPaymentStatusResponse(BaseModel):
+    txRef: str
+    status: str
+    amount: float
+    currency: str = "RWF"
+    planSlug: str
+    planName: str
+    verifiedAt: Optional[UtcDateTime] = None
 
 
 class SubscriptionRequest(BaseModel):
@@ -745,6 +774,142 @@ def _email_receipt(
         )
     except Exception as exc:  # noqa: BLE001 — see docstring
         logger.warning("Could not queue receipt email for payment %s: %s", getattr(payment, "tx_ref", "?"), exc)
+
+
+@router.post("/payments/public/initiate", response_model=PublicPaymentInitiateResponse)
+async def public_initiate_payment(
+    body: PublicPaymentInitiateRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Public / external payment initiation from an email link.
+    Does not require a Clerk session. Matches user by email.
+    """
+    email = body.email.strip().lower()
+    if not email:
+        raise HTTPException(status_code=400, detail="email is required")
+    phone = body.phone.strip()
+    if not phone:
+        raise HTTPException(status_code=400, detail="phone is required")
+
+    user = db.query(User).filter(func.lower(User.email) == email).first()
+    if not user:
+        raise HTTPException(status_code=404, detail="No Track IQ account found for this email address.")
+
+    plan = get_plan_by_slug(db, body.planId, include_inactive=True)
+    if plan is None:
+        raise HTTPException(status_code=400, detail="Selected plan is not available.")
+
+    cfg = plan_config(db, plan.slug)
+    if cfg.get("billing_model") == "postpaid":
+        raise HTTPException(status_code=400, detail="This plan is postpaid — no upfront payment is required.")
+
+    if body.vehicleIds:
+        try:
+            vehicles = resolve_selection(db, user.clerk_user_id, body.vehicleIds)
+        except SelectionError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+    else:
+        vehicles = db.query(Vehicle).filter(Vehicle.clerk_user_id == user.clerk_user_id).all()
+        if cfg.get("max_devices") and len(vehicles) > cfg["max_devices"]:
+            vehicles = vehicles[: cfg["max_devices"]]
+
+    amount = subscribe_amount(cfg, max(1, len(vehicles)))
+    tx_ref = f"IP{uuid.uuid4().hex}"
+
+    try:
+        resp = await intouch_request_payment(
+            amount=amount,
+            phone=phone,
+            transaction_id=tx_ref,
+        )
+    except IntouchPayError as exc:
+        logger.error("IntouchPay error for public initiate email=%s: %s", email, exc)
+        raise HTTPException(status_code=502, detail="Could not reach IntouchPay. Retry later.")
+
+    accepted = bool(resp.get("success")) and resp.get("responsecode") == "1000"
+    status = "pending" if accepted else "failed"
+
+    try:
+        payment = Payment(
+            clerk_user_id=user.clerk_user_id,
+            tx_ref=tx_ref,
+            plan_id=plan.id,
+            amount=amount,
+            currency=cfg.get("currency") or "RWF",
+            status=status,
+            purpose=body.purpose,
+            vehicle_ids=[v.id for v in vehicles],
+            verified_at=datetime.utcnow(),
+        )
+        db.add(payment)
+        db.commit()
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error("DB error saving public payment tx_ref=%s: %s", tx_ref, exc)
+        raise HTTPException(status_code=500, detail="Database error")
+
+    return PublicPaymentInitiateResponse(
+        txRef=tx_ref,
+        status=status,
+        message=resp.get("message") or ("Approve the payment on your phone to continue." if accepted else "Payment request was rejected."),
+        amount=amount,
+        currency=cfg.get("currency") or "RWF",
+        planName=plan.name,
+    )
+
+
+@router.get("/payments/public/status/{tx_ref}", response_model=PublicPaymentStatusResponse)
+async def public_payment_status(
+    tx_ref: str,
+    background_tasks: BackgroundTasks,
+    db: Session = Depends(get_db),
+):
+    """
+    Public status polling for an external payment. Auto-activates the subscription
+    as soon as payment is confirmed successful so user is fully activated upon sign-in.
+    """
+    payment = (
+        db.query(Payment)
+        .options(joinedload(Payment.plan))
+        .filter(Payment.tx_ref == tx_ref)
+        .first()
+    )
+    if not payment:
+        raise HTTPException(status_code=404, detail="Payment not found")
+
+    if payment.status == "pending":
+        try:
+            status_resp = await get_transaction_status(tx_ref)
+            classification = classify_status(status_resp)
+            if classification == "successful":
+                payment.status = "successful"
+                payment.verified_at = datetime.utcnow()
+                db.commit()
+            elif classification == "unknown" and status_resp.get("status") in ("failed", "timeout"):
+                payment.status = "failed"
+                db.commit()
+        except Exception as exc:
+            logger.warning("Public status check error for tx_ref=%s: %s", tx_ref, exc)
+
+    if payment.status == "successful" and payment.consumed_at is None:
+        sub = activate_payment_subscription(db, payment)
+        if sub and payment.plan:
+            vehicles = vehicles_for_payment(db, payment)
+            _email_receipt(
+                background_tasks, db, payment.clerk_user_id, payment, payment.plan.name,
+                vehicles, sub.started_at, sub.expires_at, added_vehicles=False
+            )
+
+    return PublicPaymentStatusResponse(
+        txRef=payment.tx_ref,
+        status=payment.status,
+        amount=payment.amount,
+        currency=payment.currency or "RWF",
+        planSlug=payment.plan.slug if payment.plan else "",
+        planName=payment.plan.name if payment.plan else "",
+        verifiedAt=payment.verified_at,
+    )
 
 
 def _activation_selection(db, clerk_user_id, plan, cfg, payment, requested_ids):

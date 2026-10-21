@@ -13,7 +13,7 @@ amount quoted, the amount charged, and what activation covers can't drift.
 
 import math
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Iterable, List, Optional
 
 from sqlalchemy.orm import Session
@@ -165,3 +165,58 @@ def paid_slots(payment: Payment, vehicle_count: int) -> int:
     if payment.vehicle_ids is not None:
         return max(1, len(payment.vehicle_ids))
     return max(1, vehicle_count)
+
+
+def claim_payment(db: Session, payment: Payment, subscription: Subscription) -> bool:
+    """Atomically mark `payment` as consumed by `subscription` (migration 046)."""
+    claimed = (
+        db.query(Payment)
+        .filter(Payment.id == payment.id, Payment.consumed_at.is_(None))
+        .update(
+            {Payment.consumed_at: datetime.utcnow(), Payment.subscription_id: subscription.id},
+            synchronize_session=False,
+        )
+    )
+    return claimed == 1
+
+
+def activate_payment_subscription(db: Session, payment: Payment) -> Optional[Subscription]:
+    """Auto-activate an active subscription for a successful unconsumed payment."""
+    if payment.status != "successful" or payment.consumed_at is not None:
+        return None
+    plan = payment.plan
+    if plan is None:
+        return None
+    from app.api.subscriptions import plan_config
+    cfg = plan_config(db, plan.slug)
+    vehicles = vehicles_for_payment(db, payment)
+    quantity = paid_slots(payment, len(vehicles))
+    days = cfg.get("days", 30)
+    expires_at = datetime.utcnow() + timedelta(days=days)
+
+    sub = Subscription(
+        clerk_user_id=payment.clerk_user_id,
+        plan_id=plan.id,
+        status="active",
+        price=payment.amount,
+        started_at=datetime.utcnow(),
+        expires_at=expires_at,
+        quantity=quantity,
+        is_recurring=False,
+    )
+    db.add(sub)
+    db.flush()
+    if not claim_payment(db, payment, sub):
+        db.rollback()
+        return None
+    cover_vehicles(db, sub, vehicles, payment)
+    from app.models.user import User
+    user = db.query(User).filter(User.clerk_user_id == payment.clerk_user_id).first()
+    if user:
+        user.onboarding_step = 9
+        user.onboarding_complete = True
+        user.updated_at = datetime.utcnow()
+    db.commit()
+    db.refresh(sub)
+    return sub
+

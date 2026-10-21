@@ -21,6 +21,7 @@ from app.api.auth import claim_pending_client_user
 from app.services.intouchpay import get_transaction_status, classify_status, IntouchPayError
 from app.services.email import send_payment_failed_email
 from app.services.account_deletion import delete_user_data
+from app.services.subscription_billing import activate_payment_subscription
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -223,6 +224,8 @@ async def _handle_payment_callback(
         payment.verified_at = datetime.utcnow()
         db.commit()
         logger.info("IntouchPay payment confirmed successful: tx_ref=%s", tx_ref)
+        if payment.consumed_at is None:
+            activate_payment_subscription(db, payment)
         await _send_payment_result_email(db, payment, succeeded=True)
     elif classification == "unknown" and callback_status in ("failed", "timeout"):
         # Reconciliation could not independently confirm success (see the

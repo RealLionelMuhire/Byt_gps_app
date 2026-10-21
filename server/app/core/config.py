@@ -72,6 +72,8 @@ class Settings(BaseSettings):
     EMAILJS_TEMPLATE_ID_EXPIRING: Optional[str] = None
     EMAILJS_TEMPLATE_ID_EXPIRED: Optional[str] = None
     EMAILJS_TEMPLATE_ID_PAYMENT_FAILED: Optional[str] = None
+    # Customer-facing web app URL (for links in billing/renewal emails)
+    WEB_APP_URL: str = "http://localhost:3000"
     # Shown in customer emails as the place to ask for help (payment
     # problems, refunds). Track IQ is a Bythron product.
     SUPPORT_EMAIL: str = "support@bythron.tech"

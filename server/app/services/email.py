@@ -18,6 +18,7 @@ by whoever authors the template, not by this code.
 import logging
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional
+from urllib.parse import quote_plus
 
 import httpx
 
@@ -191,10 +192,18 @@ async def send_payment_receipt_email(
     )
 
 
+def _pay_url(user: User, plan_slug: str = "basic") -> str:
+    email = quote_plus(user.email or "")
+    phone = quote_plus(user.phone_number or "")
+    return f"{settings.WEB_APP_URL}/pay?plan={plan_slug}&email={email}&phone={phone}"
+
+
 async def send_subscription_expiring_email(
     user: User, subscription: Subscription, plan_name: str, days_left: int
 ) -> bool:
     """Sent once, a few days before Subscription.expires_at, alongside the equivalent push."""
+    plan_slug = getattr(subscription.plan, "slug", "basic") if getattr(subscription, "plan", None) else "basic"
+    pay_url = _pay_url(user, plan_slug)
     return await send_email(
         to_email=user.email,
         to_name=_user_display_name(user),
@@ -206,11 +215,13 @@ async def send_subscription_expiring_email(
             "expires_at": subscription.expires_at.isoformat(),
             # Human-readable, in Rwanda time — what a template should show.
             "expires_on": _local_date(subscription.expires_at),
+            "pay_url": pay_url,
             "message": "\n".join([
                 f"Your {plan_name} plan ends on {_local_date(subscription.expires_at)} ({_days_left_text(days_left)}).",
                 "",
                 "To keep tracking your vehicles without a break, renew before that date:",
-                f"open the Track IQ app and go to {_RENEW_PATH}.",
+                f"Pay online with Mobile Money: {pay_url}",
+                f"Or open the Track IQ app and go to {_RENEW_PATH}.",
             ]),
         },
     )
@@ -218,6 +229,7 @@ async def send_subscription_expiring_email(
 
 async def send_subscription_expired_email(user: User, plan_name: str) -> bool:
     """Sent when a subscription has just been marked expired, alongside the equivalent push."""
+    pay_url = _pay_url(user, "basic")
     return await send_email(
         to_email=user.email,
         to_name=_user_display_name(user),
@@ -225,11 +237,13 @@ async def send_subscription_expired_email(user: User, plan_name: str) -> bool:
         template_params={
             "subject": "Your Track IQ plan has ended",
             "plan_name": plan_name,
+            "pay_url": pay_url,
             "message": "\n".join([
                 f"Your {plan_name} plan has ended.",
                 "",
                 "To keep using live tracking, trip history and alerts for your vehicles,",
-                f"open the Track IQ app and go to {_RENEW_PATH}.",
+                f"Renew online with Mobile Money: {pay_url}",
+                f"Or open the Track IQ app and go to {_RENEW_PATH}.",
             ]),
         },
     )
@@ -238,6 +252,8 @@ async def send_subscription_expired_email(user: User, plan_name: str) -> bool:
 async def send_payment_failed_email(user: User, payment: Payment) -> bool:
     """Sent when a payment is confirmed failed (webhook) or given up on after the
     reconciliation cron's hard-fail timeout."""
+    plan_slug = getattr(payment.plan, "slug", "basic") if getattr(payment, "plan", None) else "basic"
+    pay_url = _pay_url(user, plan_slug)
     return await send_email(
         to_email=user.email,
         to_name=_user_display_name(user),
@@ -247,10 +263,12 @@ async def send_payment_failed_email(user: User, payment: Payment) -> bool:
             "amount": f"{payment.amount:.0f}",
             "currency": payment.currency,
             "tx_ref": payment.tx_ref,
+            "pay_url": pay_url,
             "message": "\n".join([
                 f"Your Mobile Money payment of {_money(payment.amount, payment.currency)} could not be completed.",
                 "",
-                "You can try again in the Track IQ app.",
+                f"You can try again online: {pay_url}",
+                "Or in the Track IQ app.",
                 f"If money was taken from your Mobile Money account, email {settings.SUPPORT_EMAIL}",
                 "and include this payment reference so we can fix it:",
                 f"Payment reference: {payment.tx_ref}",
