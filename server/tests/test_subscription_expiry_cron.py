@@ -33,7 +33,7 @@ def cron_env(db_session, monkeypatch):
         emails.append(("expiring", user.id, plan_name, days_left))
         return True
 
-    async def fake_send_subscription_expired_email(user, plan_name):
+    async def fake_send_subscription_expired_email(user, plan_name, plan_slug=None):
         emails.append(("expired", user.id, plan_name))
         return True
 

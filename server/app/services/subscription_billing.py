@@ -11,6 +11,7 @@ Used by app/api/onboarding.py's payment/quote/activation endpoints so the
 amount quoted, the amount charged, and what activation covers can't drift.
 """
 
+import logging
 import math
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -20,6 +21,8 @@ from sqlalchemy.orm import Session
 
 from app.models.subscription import Payment, Subscription, SubscriptionVehicle
 from app.models.vehicle import Vehicle
+
+logger = logging.getLogger(__name__)
 
 
 class SelectionError(ValueError):
@@ -71,6 +74,32 @@ def subscribe_amount(cfg: dict, vehicle_count: int) -> float:
     """What a new subscription costs: the per-vehicle price times the
     vehicles chosen (at least one — a subscription always has a slot)."""
     return round(float(cfg.get("price", 0.0)) * max(1, vehicle_count), 2)
+
+
+def renewal_blocker(subscription: Subscription, cfg: dict, plan_name: str, purchasable: bool,
+                    now: Optional[datetime] = None) -> Optional[str]:
+    """Why the active `subscription` can't be renewed early right now, or
+    None. An early renewal adds one period to expires_at; it's refused once
+    a renewal is already queued (more than one period left), so a customer
+    can't pay months ahead by accident."""
+    now = now or datetime.utcnow()
+    if subscription.is_recurring:
+        return "Your plan renews automatically — there's nothing to pay early."
+    if cfg.get("billing_model") == "postpaid":
+        return "This plan is postpaid — you will be invoiced after the period."
+    if not purchasable:
+        return (f"{plan_name} is no longer offered, so it can't be renewed. "
+                "Choose another plan to keep tracking after it ends.")
+    if subscription.expires_at - now > timedelta(days=cfg.get("days", 30)):
+        return (f"Already renewed until {subscription.expires_at:%b %d, %Y}. "
+                "You can renew again closer to that date.")
+    return None
+
+
+def renewal_amount(cfg: dict, subscription: Subscription) -> float:
+    """A renewal buys another period of the vehicle slots the subscription
+    already has (Subscription.quantity), at the plan's current price."""
+    return subscribe_amount(cfg, subscription.quantity or 1)
 
 
 def covered_vehicle_ids(db: Session, subscription: Subscription) -> set:
@@ -180,28 +209,103 @@ def claim_payment(db: Session, payment: Payment, subscription: Subscription) -> 
     return claimed == 1
 
 
-def activate_payment_subscription(db: Session, payment: Payment) -> Optional[Subscription]:
-    """Auto-activate an active subscription for a successful unconsumed payment."""
+@dataclass
+class Fulfilment:
+    """What fulfil_payment did with a payment — enough for the receipt."""
+    subscription: Subscription
+    vehicles: List[Vehicle]
+    period_start: Optional[datetime]
+    period_end: datetime
+    added_vehicles: bool
+
+
+def fulfil_payment(db: Session, payment: Payment) -> Optional[Fulfilment]:
+    """Apply a successful, unconsumed payment exactly as the client's own
+    activation call would have — so it doesn't matter whether the webhook,
+    the cron reconciliation, the public pay page's status poll, or the
+    signed-in app/web finishes the purchase first:
+
+    - purpose "add_vehicles": extra slots + coverage on the CURRENT
+      subscription (what POST /api/subscriptions/vehicles does);
+    - purpose "renew": one more period added to the CURRENT subscription's
+      expires_at (what POST /api/subscriptions/renew does) — or, if it
+      lapsed while the payment was pending, a fresh period from now;
+    - purpose "subscribe" with another plan active: that plan is cancelled
+      and replaced (what POST /api/subscriptions/upgrade does);
+    - purpose "subscribe" with nothing active: a new subscription (what
+      POST /api/subscriptions does).
+
+    Those endpoints treat a payment consumed here as a retry of a completed
+    activation and return its result. Anything that can't be applied
+    safely — the same plan already active, an add_vehicles payment whose
+    plan is no longer the active one, vehicles already covered — is left
+    unconsumed and logged rather than guessed at, so no second active
+    subscription is ever created behind the customer's back.
+
+    Commits on success; returns None (and changes nothing) otherwise."""
     if payment.status != "successful" or payment.consumed_at is not None:
         return None
     plan = payment.plan
     if plan is None:
         return None
+    # Lazy imports: app.api.onboarding imports this module.
+    from app.api.onboarding import _get_active_subscription
     from app.api.subscriptions import plan_config
+    from app.models.user import User
+
     cfg = plan_config(db, plan.slug)
     vehicles = vehicles_for_payment(db, payment)
-    quantity = paid_slots(payment, len(vehicles))
-    days = cfg.get("days", 30)
-    expires_at = datetime.utcnow() + timedelta(days=days)
+    active = _get_active_subscription(db, payment.clerk_user_id)
+    now = datetime.utcnow()
 
+    if payment.purpose == "add_vehicles":
+        if active is None or active.plan_id != payment.plan_id:
+            logger.warning("Payment %s adds vehicles to a plan that is no longer active — left for manual handling",
+                           payment.tx_ref)
+            return None
+        try:
+            add = plan_add_vehicles(db, active, cfg, plan.name, vehicles, now=now)
+        except SelectionError as exc:
+            logger.warning("Payment %s can't add its vehicles (%s) — left for manual handling", payment.tx_ref, exc)
+            return None
+        if not claim_payment(db, payment, active):
+            db.rollback()
+            return None
+        active.quantity = (active.quantity or 0) + add.extra_slots
+        cover_vehicles(db, active, vehicles, payment)
+        db.commit()
+        return Fulfilment(active, vehicles, None, active.expires_at, added_vehicles=True)
+
+    if payment.purpose == "renew" and active is not None:
+        if active.plan_id != plan.id:
+            logger.warning("Payment %s renews a plan that is no longer active — left for manual handling",
+                           payment.tx_ref)
+            return None
+        if not claim_payment(db, payment, active):
+            db.rollback()
+            return None
+        previous_end = active.expires_at
+        active.expires_at = previous_end + timedelta(days=cfg.get("days", 30))
+        active.updated_at = now
+        db.commit()
+        return Fulfilment(active, vehicles, previous_end, active.expires_at, added_vehicles=False)
+
+    if payment.purpose != "renew" and active is not None and active.plan_id == plan.id:
+        logger.warning("Payment %s is for the plan already active for %s — left for manual handling",
+                       payment.tx_ref, payment.clerk_user_id)
+        return None
+
+    if active is not None:
+        active.status = "cancelled"
+        active.updated_at = now
     sub = Subscription(
         clerk_user_id=payment.clerk_user_id,
         plan_id=plan.id,
         status="active",
-        price=payment.amount,
-        started_at=datetime.utcnow(),
-        expires_at=expires_at,
-        quantity=quantity,
+        price=float(payment.amount),
+        started_at=now,
+        expires_at=now + timedelta(days=cfg.get("days", 30)),
+        quantity=paid_slots(payment, len(vehicles)),
         is_recurring=False,
     )
     db.add(sub)
@@ -210,13 +314,11 @@ def activate_payment_subscription(db: Session, payment: Payment) -> Optional[Sub
         db.rollback()
         return None
     cover_vehicles(db, sub, vehicles, payment)
-    from app.models.user import User
     user = db.query(User).filter(User.clerk_user_id == payment.clerk_user_id).first()
     if user:
         user.onboarding_step = 9
         user.onboarding_complete = True
-        user.updated_at = datetime.utcnow()
+        user.updated_at = now
     db.commit()
     db.refresh(sub)
-    return sub
-
+    return Fulfilment(sub, vehicles, sub.started_at, sub.expires_at, added_vehicles=False)

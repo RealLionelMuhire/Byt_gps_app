@@ -241,15 +241,19 @@ def _deny(db: Session, *, owner: User, actor: Optional[User], key: str, reason: 
 
 
 def _denial_message(name: str, reason: str, limit: Optional[int]) -> str:
+    # Shown inside the mobile apps, so it states the fact only — no
+    # "upgrade"/"renew" call to action: the apps don't sell plans, and store
+    # rules forbid pointing to paying elsewhere (see the Flutter app's
+    # CurrentPlanCard doc).
     if reason == "no_subscription":
-        return f"{name} needs an active plan. Choose a plan to continue."
+        return f"{name} needs an active plan."
     if reason == "subscription_expired":
-        return f"Your plan has expired. Renew it to use {name}."
+        return f"Your plan has expired, so {name} is paused."
     if reason == "over_limit":
-        return f"Your plan allows up to {limit} for {name}. Upgrade to add more."
+        return f"Your plan allows up to {limit} for {name}."
     if reason == "vehicle_not_covered":
-        return f"This vehicle isn't on your plan yet. Add it to your plan to use {name}."
-    return f"{name} isn't included in your plan. Upgrade to use it."
+        return f"This vehicle isn't on your plan, so {name} isn't available for it."
+    return f"{name} isn't included in your plan."
 
 
 def _safe_resolve(db: Session, owner: User) -> Optional[Entitlements]:

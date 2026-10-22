@@ -16,7 +16,9 @@ from app.models.user import User
 from app.services.expiry_reminders import due_stage, REMINDER_STAGES, EXPIRED_STAGE
 from app.services.intouchpay import get_transaction_status, classify_status, IntouchPayError
 from app.services.push_notifications import send_push_notification
+from app.services.subscription_billing import fulfil_payment
 from app.services.email import (
+    send_fulfilment_receipt,
     send_subscription_expiring_email,
     send_subscription_expired_email,
     send_payment_failed_email,
@@ -52,14 +54,17 @@ def _record_reminder(db, sub_id, clerk_user_id, stage, expires_at, email_sent, p
     ))
 
 def _expiry_notification_copy(plan_id: str, plan_name: str) -> tuple:
+    # Pushes are shown through the mobile app, so — like the app itself
+    # (store rules: no in-app pointer to paying outside the app store) —
+    # they only state what happened. How to renew is in the matching email.
     if plan_id == "trial":
         return (
             "⏳ Your free trial has ended",
-            "Add a payment method to keep tracking your vehicles.",
+            "Live tracking, trip history and alerts are now paused for your vehicles.",
         )
     return (
-        "✅ Your subscription has completed",
-        f"Your {plan_name} plan has completed its term. Renew to keep tracking your vehicles.",
+        "Your plan has ended",
+        f"Your {plan_name} plan has ended. Live tracking, trip history and alerts are now paused.",
     )
 
 
@@ -85,9 +90,9 @@ async def _notify_expired_users(expired_targets: list) -> None:
                 user,
                 title=title,
                 body=body,
-                data={"type": "subscription_expired", "screen": "plan_upgrade"},
+                data={"type": "subscription_expired", "screen": "billing"},
             )
-            email_sent = await send_subscription_expired_email(user, plan_name)
+            email_sent = await send_subscription_expired_email(user, plan_name, plan_slug=plan.slug if plan else None)
             already = db.query(SubscriptionReminder.id).filter(
                 SubscriptionReminder.subscription_id == sub_id,
                 SubscriptionReminder.stage == EXPIRED_STAGE,
@@ -155,7 +160,7 @@ async def _notify_expiring_subscriptions_async() -> None:
             push_sent = await send_push_notification(
                 user,
                 title="⏳ Your plan is about to expire",
-                body=f"Your {plan_name} plan expires in {days_left} day(s). Renew to keep tracking your vehicles.",
+                body=f"Your {plan_name} plan ends in {days_left} day(s). Tracking and alerts pause after that date.",
                 data={"type": "subscription_expiring", "screen": "billing"},
             )
             email_sent = await send_subscription_expiring_email(user, sub, plan_name, days_left)
@@ -251,6 +256,7 @@ async def _reconcile_pending_intouchpay_payments_async():
             return
 
         hard_failed_payments = []
+        reconciled_successful = []
         for payment in stuck:
             try:
                 status_resp = await get_transaction_status(payment.tx_ref)
@@ -263,6 +269,7 @@ async def _reconcile_pending_intouchpay_payments_async():
                 payment.status = "successful"
                 payment.verified_at = datetime.utcnow()
                 logger.info(f"Reconciled stuck-pending payment tx_ref={payment.tx_ref} -> successful")
+                reconciled_successful.append(payment.id)
             elif classification == "unknown" and payment.verified_at < hard_fail_cutoff:
                 # Never confirmed successful within a generous window — give up
                 # rather than retry forever. Do NOT treat a bare "unknown" as
@@ -278,6 +285,19 @@ async def _reconcile_pending_intouchpay_payments_async():
 
         db.commit()
         logger.info(f"Reconciliation pass complete for {len(stuck)} stuck-pending payment(s).")
+
+        # Same as the webhook: a confirmed payment is activated now, not left
+        # waiting for a client that may never call back (see fulfil_payment).
+        for payment_id in reconciled_successful:
+            payment = db.query(Payment).filter(Payment.id == payment_id).first()
+            try:
+                fulfilment = fulfil_payment(db, payment)
+            except Exception as exc:
+                db.rollback()
+                logger.error(f"Could not fulfil reconciled payment tx_ref={payment.tx_ref}: {exc}")
+                continue
+            if fulfilment is not None:
+                await send_fulfilment_receipt(db, payment, fulfilment)
     except Exception as e:
         db.rollback()
         logger.error(f"Error while reconciling pending IntouchPay payments: {e}")

@@ -8,6 +8,7 @@ import logging
 from datetime import datetime
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Request, Header
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from svix.webhooks import Webhook, WebhookVerificationError
 
@@ -19,9 +20,9 @@ from app.models.disbursement import Disbursement
 from app.models.trip import Trip
 from app.api.auth import claim_pending_client_user
 from app.services.intouchpay import get_transaction_status, classify_status, IntouchPayError
-from app.services.email import send_payment_failed_email
+from app.services.email import send_fulfilment_receipt, send_payment_failed_email
 from app.services.account_deletion import delete_user_data
-from app.services.subscription_billing import activate_payment_subscription
+from app.services.subscription_billing import fulfil_payment
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -224,8 +225,17 @@ async def _handle_payment_callback(
         payment.verified_at = datetime.utcnow()
         db.commit()
         logger.info("IntouchPay payment confirmed successful: tx_ref=%s", tx_ref)
-        if payment.consumed_at is None:
-            activate_payment_subscription(db, payment)
+        # Complete the purchase now, in case the customer never comes back
+        # to it (the web pay page's tab closed, the app killed). Their own
+        # activation call, if it does come, then returns this result.
+        try:
+            fulfilment = fulfil_payment(db, payment)
+        except SQLAlchemyError as exc:
+            db.rollback()
+            logger.error("Could not fulfil payment tx_ref=%s: %s", tx_ref, exc)
+            fulfilment = None
+        if fulfilment is not None:
+            await send_fulfilment_receipt(db, payment, fulfilment)
         await _send_payment_result_email(db, payment, succeeded=True)
     elif classification == "unknown" and callback_status in ("failed", "timeout"):
         # Reconciliation could not independently confirm success (see the
