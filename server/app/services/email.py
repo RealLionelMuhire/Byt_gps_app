@@ -25,6 +25,7 @@ import httpx
 from app.core.config import settings
 from app.models.user import User
 from app.models.subscription import Payment, Subscription
+from app.services.pay_links import make_pay_token
 
 logger = logging.getLogger(__name__)
 
@@ -108,8 +109,10 @@ def _local_date(value: datetime) -> str:
     return f"{local:%b} {local.day}, {local.year}"
 
 
-# Where the app's renew button is (Flutter: Billing & Plan screen).
-_RENEW_PATH = "Billing & Plan, then tap Renew plan"
+# Billing is web-only (the mobile apps don't take payments), so emails point
+# at the web app's Billing page, never at the app.
+def _billing_url() -> str:
+    return f"{settings.WEB_APP_URL.rstrip('/')}/billing/"
 
 
 def _days_left_text(days: int) -> str:
@@ -192,18 +195,22 @@ async def send_payment_receipt_email(
     )
 
 
-def _pay_url(user: User, plan_slug: str = "basic") -> str:
-    email = quote_plus(user.email or "")
-    phone = quote_plus(user.phone_number or "")
-    return f"{settings.WEB_APP_URL}/pay?plan={plan_slug}&email={email}&phone={phone}"
+def _pay_url(user: User, plan_slug: Optional[str] = None) -> str:
+    """The web /pay page for this account. Carries a signed token, never the
+    email or phone — those would sit in mail logs, browser history and
+    referrers, and an email alone must not be enough to pay for an account
+    (see app/services/pay_links.py)."""
+    # Trailing slash: the web app is a static export with trailingSlash, so
+    # /pay is served from /pay/ — not every host redirects with the query.
+    url = f"{settings.WEB_APP_URL.rstrip('/')}/pay/?token={quote_plus(make_pay_token(user.clerk_user_id))}"
+    return f"{url}&plan={quote_plus(plan_slug)}" if plan_slug else url
 
 
 async def send_subscription_expiring_email(
     user: User, subscription: Subscription, plan_name: str, days_left: int
 ) -> bool:
     """Sent once, a few days before Subscription.expires_at, alongside the equivalent push."""
-    plan_slug = getattr(subscription.plan, "slug", "basic") if getattr(subscription, "plan", None) else "basic"
-    pay_url = _pay_url(user, plan_slug)
+    pay_url = _pay_url(user, getattr(getattr(subscription, "plan", None), "slug", None))
     return await send_email(
         to_email=user.email,
         to_name=_user_display_name(user),
@@ -221,15 +228,15 @@ async def send_subscription_expiring_email(
                 "",
                 "To keep tracking your vehicles without a break, renew before that date:",
                 f"Pay online with Mobile Money: {pay_url}",
-                f"Or open the Track IQ app and go to {_RENEW_PATH}.",
+                f"Or sign in on the web: {_billing_url()}",
             ]),
         },
     )
 
 
-async def send_subscription_expired_email(user: User, plan_name: str) -> bool:
+async def send_subscription_expired_email(user: User, plan_name: str, plan_slug: Optional[str] = None) -> bool:
     """Sent when a subscription has just been marked expired, alongside the equivalent push."""
-    pay_url = _pay_url(user, "basic")
+    pay_url = _pay_url(user, plan_slug)
     return await send_email(
         to_email=user.email,
         to_name=_user_display_name(user),
@@ -243,7 +250,7 @@ async def send_subscription_expired_email(user: User, plan_name: str) -> bool:
                 "",
                 "To keep using live tracking, trip history and alerts for your vehicles,",
                 f"Renew online with Mobile Money: {pay_url}",
-                f"Or open the Track IQ app and go to {_RENEW_PATH}.",
+                f"Or sign in on the web: {_billing_url()}",
             ]),
         },
     )
@@ -252,8 +259,7 @@ async def send_subscription_expired_email(user: User, plan_name: str) -> bool:
 async def send_payment_failed_email(user: User, payment: Payment) -> bool:
     """Sent when a payment is confirmed failed (webhook) or given up on after the
     reconciliation cron's hard-fail timeout."""
-    plan_slug = getattr(payment.plan, "slug", "basic") if getattr(payment, "plan", None) else "basic"
-    pay_url = _pay_url(user, plan_slug)
+    pay_url = _pay_url(user, getattr(getattr(payment, "plan", None), "slug", None))
     return await send_email(
         to_email=user.email,
         to_name=_user_display_name(user),
@@ -268,10 +274,29 @@ async def send_payment_failed_email(user: User, payment: Payment) -> bool:
                 f"Your Mobile Money payment of {_money(payment.amount, payment.currency)} could not be completed.",
                 "",
                 f"You can try again online: {pay_url}",
-                "Or in the Track IQ app.",
+                f"Or sign in on the web: {_billing_url()}",
                 f"If money was taken from your Mobile Money account, email {settings.SUPPORT_EMAIL}",
                 "and include this payment reference so we can fix it:",
                 f"Payment reference: {payment.tx_ref}",
             ]),
         },
     )
+
+
+async def send_fulfilment_receipt(db, payment: Payment, fulfilment) -> bool:
+    """The receipt for a purchase completed by
+    app/services/subscription_billing.py's fulfil_payment (webhook, cron or
+    the public pay page) rather than by the customer's own activation call.
+    Never raises — the activation has already committed."""
+    try:
+        user = db.query(User).filter(User.clerk_user_id == payment.clerk_user_id).first()
+        if user is None or not user.email or payment.plan is None:
+            return False
+        return await send_payment_receipt_email(
+            user, payment, payment.plan.name, vehicles=fulfilment.vehicles,
+            period_start=fulfilment.period_start, period_end=fulfilment.period_end,
+            added_vehicles=fulfilment.added_vehicles,
+        )
+    except Exception as exc:  # noqa: BLE001 — see docstring
+        logger.warning("Could not send receipt for payment %s: %s", getattr(payment, "tx_ref", "?"), exc)
+        return False

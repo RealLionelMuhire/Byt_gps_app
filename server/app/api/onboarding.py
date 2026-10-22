@@ -17,6 +17,7 @@ All routes require a valid Clerk Bearer token (via require_auth dependency).
 """
 
 import logging
+import time
 import uuid
 from datetime import datetime, timedelta
 from typing import List, Literal, Optional
@@ -46,10 +47,11 @@ from app.api.auth import claim_pending_client_user
 from app.api.subscriptions import plan_config, plan_purchasable, get_plan_by_slug
 from app.core.config import settings
 from app.services.email import _user_display_name as _email_display_name, receipt_details, send_email
+from app.services.pay_links import verify_pay_token
 from app.services.subscription_billing import (
     SelectionError, check_slot_cap, cover_vehicles, covered_vehicle_ids, monthly_price,
-    owner_vehicles, paid_slots, plan_add_vehicles, resolve_selection, subscribe_amount,
-    vehicles_for_payment, claim_payment, activate_payment_subscription,
+    owner_vehicles, paid_slots, plan_add_vehicles, renewal_amount, renewal_blocker, resolve_selection,
+    subscribe_amount, vehicles_for_payment, fulfil_payment,
 )
 from app.services.intouchpay import (
     request_payment as intouch_request_payment,
@@ -214,7 +216,7 @@ class PaymentInitiateRequest(BaseModel):
     vehicleIds: Optional[List[int]] = None
     # "subscribe" (new subscription or plan switch) or "add_vehicles"
     # (extra slots on the current subscription, prorated).
-    purpose: Literal["subscribe", "add_vehicles"] = "subscribe"
+    purpose: Literal["subscribe", "add_vehicles", "renew"] = "subscribe"
 
 
 class PaymentInitiateResponse(BaseModel):
@@ -224,11 +226,13 @@ class PaymentInitiateResponse(BaseModel):
 
 
 class PublicPaymentInitiateRequest(BaseModel):
-    email: str
+    # Signed link token from a billing email (app/services/pay_links.py) —
+    # the only thing that identifies the account here.
+    token: str
     phone: str
     planId: str
     vehicleIds: Optional[List[int]] = None
-    purpose: Literal["subscribe", "add_vehicles"] = "subscribe"
+    purpose: Literal["subscribe", "add_vehicles", "renew"] = "subscribe"
 
 
 class PublicPaymentInitiateResponse(BaseModel):
@@ -238,6 +242,16 @@ class PublicPaymentInitiateResponse(BaseModel):
     amount: float
     currency: str = "RWF"
     planName: str
+
+
+class PublicPayAccountResponse(BaseModel):
+    maskedEmail: str
+    phone: Optional[str] = None
+    vehicleCount: int
+    activePlanSlug: Optional[str] = None
+    activePlanName: Optional[str] = None
+    activeExpiresAt: Optional[UtcDateTime] = None
+    activeQuantity: Optional[int] = None
 
 
 class PublicPaymentStatusResponse(BaseModel):
@@ -266,6 +280,10 @@ class SubscriptionUpgradeRequest(BaseModel):
     planId: str
     txRef: str
     vehicleIds: Optional[List[int]] = None  # postpaid switches only
+
+
+class SubscriptionRenewRequest(BaseModel):
+    txRef: str
 
 
 class AddVehiclesRequest(BaseModel):
@@ -603,6 +621,109 @@ async def create_vehicle(
         raise HTTPException(status_code=500, detail="Database error")
 
 
+def _price_purchase(
+    db: Session, clerk_user_id: str, plan_id: str, purpose: str, vehicle_ids: Optional[List[int]],
+    *, cap_unselected: bool = False,
+):
+    """(plan, cfg, vehicles, amount) for a purchase about to be charged —
+    every refusal happens here, before any money moves. Shared by the
+    signed-in initiate_payment and the public pay page's
+    public_initiate_payment so both charge the same amount under the same
+    rules. `cap_unselected`: with no selection, cover the first vehicles up
+    to the plan's cap instead of refusing (the public page has no picker)."""
+    if purpose == "renew":
+        # Another period of the CURRENT subscription, for the slots it has —
+        # the selection is ignored; the payment records what it covers now.
+        active_sub = _get_active_subscription(db, clerk_user_id)
+        if active_sub is None or active_sub.plan is None:
+            raise HTTPException(status_code=409, detail="You don't have an active plan to renew.")
+        plan = active_sub.plan
+        if plan.slug != plan_id:
+            raise HTTPException(status_code=400, detail="Only your current plan can be renewed.")
+        cfg = plan_config(db, plan.slug)
+        blocked = renewal_blocker(active_sub, cfg, plan.name, plan_purchasable(db, plan.slug))
+        if blocked:
+            raise HTTPException(status_code=409, detail=blocked)
+        covered = covered_vehicle_ids(db, active_sub)
+        vehicles = [v for v in owner_vehicles(db, clerk_user_id) if v.id in covered]
+        amount = renewal_amount(cfg, active_sub)
+        if amount <= 0:
+            raise HTTPException(status_code=400, detail="This plan doesn't need a payment.")
+    elif purpose == "add_vehicles":
+        # Extra slots on the CURRENT subscription — its plan is used even if
+        # since deactivated (grandfathered), so plan_purchasable isn't asked.
+        active_sub = _get_active_subscription(db, clerk_user_id)
+        if active_sub is None or active_sub.plan is None:
+            raise HTTPException(status_code=409, detail="You don't have an active plan to add vehicles to.")
+        plan = active_sub.plan
+        if plan.slug != plan_id:
+            raise HTTPException(status_code=400, detail="Vehicles can only be added to your current plan.")
+        cfg = plan_config(db, plan.slug)
+        try:
+            vehicles = resolve_selection(db, clerk_user_id, vehicle_ids or [])
+            add = plan_add_vehicles(db, active_sub, cfg, plan.name, vehicles)
+        except SelectionError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        if add.amount <= 0:
+            raise HTTPException(
+                status_code=400,
+                detail="No payment needed — these vehicles fit in your plan's free slots.",
+            )
+        amount = add.amount
+    else:
+        if not plan_purchasable(db, plan_id):
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid or unavailable planId — choose an active plan from the pricing screen.",
+            )
+
+        # Payment.plan_id is a real FK (migrations 041/042) — a missing row
+        # here means those migrations haven't been run (defensive 500).
+        plan = get_plan_by_slug(db, plan_id, include_inactive=True)
+        if plan is None:
+            logger.error("No subscription_plans row for purchasable planId=%s — has migration 041 run?", plan_id)
+            raise HTTPException(status_code=500, detail="This plan isn't fully set up yet. Please try again later.")
+
+        # Activation refuses a paid switch to the plan the user is already
+        # actively on ("Already on this plan"), so charging for it here would
+        # take the customer's money for nothing. Refuse before any money moves.
+        active_sub = _get_active_subscription(db, clerk_user_id)
+        if active_sub and active_sub.plan_id == plan.id:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"You're already on this plan until {active_sub.expires_at:%b %d, %Y}. "
+                    "You can renew it early to extend it, add vehicles to it, or choose a different plan."
+                ),
+            )
+
+        cfg = plan_config(db, plan_id)
+
+        # Postpaid plans are invoiced AFTER the period — there is nothing to
+        # collect up-front, so reject the mobile-money flow rather than
+        # charging the customer the wrong amount.
+        if cfg.get("billing_model") == "postpaid":
+            raise HTTPException(
+                status_code=400,
+                detail="This plan is postpaid — you will be invoiced after the period; no upfront payment is required.",
+            )
+
+        try:
+            vehicles = resolve_selection(db, clerk_user_id, vehicle_ids)
+            if vehicle_ids is None and cap_unselected and cfg.get("max_devices"):
+                vehicles = vehicles[: cfg["max_devices"]]
+            check_slot_cap(cfg, plan.name, len(vehicles))
+        except SelectionError as exc:
+            raise HTTPException(status_code=400, detail=str(exc))
+        # Per-vehicle price × the vehicles chosen.
+        amount = subscribe_amount(cfg, len(vehicles))
+        if amount <= 0:
+            # The free trial (or a zero-priced plan) is activated directly by
+            # POST /api/subscriptions — there is nothing to collect.
+            raise HTTPException(status_code=400, detail="This plan doesn't need a payment.")
+    return plan, cfg, vehicles, amount
+
+
 # ── Endpoint 5: POST /api/payments/initiate  (Step 8, paid plans, IntouchPay) ──
 
 @router.post("/payments/initiate", response_model=PaymentInitiateResponse)
@@ -627,72 +748,7 @@ async def initiate_payment(
     if not phone:
         raise HTTPException(status_code=400, detail="phone is required")
 
-    if body.purpose == "add_vehicles":
-        # Extra slots on the CURRENT subscription — its plan is used even if
-        # since deactivated (grandfathered), so plan_purchasable isn't asked.
-        active_sub = _get_active_subscription(db, clerk_user_id)
-        if active_sub is None or active_sub.plan is None:
-            raise HTTPException(status_code=409, detail="You don't have an active plan to add vehicles to.")
-        plan = active_sub.plan
-        if plan.slug != body.planId:
-            raise HTTPException(status_code=400, detail="Vehicles can only be added to your current plan.")
-        cfg = plan_config(db, plan.slug)
-        try:
-            vehicles = resolve_selection(db, clerk_user_id, body.vehicleIds or [])
-            add = plan_add_vehicles(db, active_sub, cfg, plan.name, vehicles)
-        except SelectionError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-        if add.amount <= 0:
-            raise HTTPException(
-                status_code=400,
-                detail="No payment needed — these vehicles fit in your plan's free slots.",
-            )
-        amount = add.amount
-    else:
-        if not plan_purchasable(db, body.planId):
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid or unavailable planId — choose an active plan from the pricing screen.",
-            )
-
-        # Payment.plan_id is a real FK (migrations 041/042) — a missing row
-        # here means those migrations haven't been run (defensive 500).
-        plan = get_plan_by_slug(db, body.planId, include_inactive=True)
-        if plan is None:
-            logger.error("No subscription_plans row for purchasable planId=%s — has migration 041 run?", body.planId)
-            raise HTTPException(status_code=500, detail="This plan isn't fully set up yet. Please try again later.")
-
-        # Activation refuses a paid switch to the plan the user is already
-        # actively on ("Already on this plan"), so charging for it here would
-        # take the customer's money for nothing. Refuse before any money moves.
-        active_sub = _get_active_subscription(db, clerk_user_id)
-        if active_sub and active_sub.plan_id == plan.id:
-            raise HTTPException(
-                status_code=409,
-                detail=(
-                    f"You're already on this plan until {active_sub.expires_at:%b %d, %Y}. "
-                    "You can renew it once it expires, add vehicles to it, or choose a different plan."
-                ),
-            )
-
-        cfg = plan_config(db, body.planId)
-
-        # Postpaid plans are invoiced AFTER the period — there is nothing to
-        # collect up-front, so reject the mobile-money flow rather than
-        # charging the customer the wrong amount.
-        if cfg.get("billing_model") == "postpaid":
-            raise HTTPException(
-                status_code=400,
-                detail="This plan is postpaid — you will be invoiced after the period; no upfront payment is required.",
-            )
-
-        try:
-            vehicles = resolve_selection(db, clerk_user_id, body.vehicleIds)
-            check_slot_cap(cfg, plan.name, len(vehicles))
-        except SelectionError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-        # Per-vehicle price × the vehicles chosen.
-        amount = subscribe_amount(cfg, len(vehicles))
+    plan, cfg, vehicles, amount = _price_purchase(db, clerk_user_id, body.planId, body.purpose, body.vehicleIds)
 
     # Our own reference — IntouchPay requires this to be globally unique
     # across every request ever sent to them.
@@ -776,45 +832,80 @@ def _email_receipt(
         logger.warning("Could not queue receipt email for payment %s: %s", getattr(payment, "tx_ref", "?"), exc)
 
 
+# Public (no Clerk session) payment from a billing email's link: at most
+# this many Mobile Money prompts per account per window, so a leaked link
+# can't be used to flood phones with payment requests.
+_PUBLIC_PAY_WINDOW_SECONDS = 15 * 60
+_PUBLIC_PAY_MAX_ATTEMPTS = 5
+_public_pay_attempts: dict = {}
+
+
+def _check_public_pay_rate_limit(clerk_user_id: str) -> None:
+    now = time.monotonic()
+    recent = [t for t in _public_pay_attempts.get(clerk_user_id, []) if t > now - _PUBLIC_PAY_WINDOW_SECONDS]
+    if len(recent) >= _PUBLIC_PAY_MAX_ATTEMPTS:
+        _public_pay_attempts[clerk_user_id] = recent
+        raise HTTPException(status_code=429, detail="Too many payment attempts. Please wait a few minutes and try again.")
+    recent.append(now)
+    _public_pay_attempts[clerk_user_id] = recent
+
+
+def _pay_link_user(db: Session, token: str) -> User:
+    clerk_user_id = verify_pay_token(token)
+    user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first() if clerk_user_id else None
+    if user is None:
+        raise HTTPException(
+            status_code=401,
+            detail="This payment link is invalid or has expired. Sign in to Track IQ on the web to pay.",
+        )
+    return user
+
+
+def _mask_email(email: Optional[str]) -> str:
+    local, _, domain = (email or "").partition("@")
+    if not domain:
+        return ""
+    return f"{local[:2]}{'*' * max(1, len(local) - 2)}@{domain}"
+
+
+@router.get("/payments/public/account", response_model=PublicPayAccountResponse)
+async def public_pay_account(token: str, db: Session = Depends(get_db)):
+    """Who a pay link is for, for the web /pay page to show before paying —
+    a masked email (never the full one), the phone to prefill, and the
+    current plan so the page can explain a same-plan refusal up front."""
+    user = _pay_link_user(db, token)
+    active = _get_active_subscription(db, user.clerk_user_id)
+    return PublicPayAccountResponse(
+        maskedEmail=_mask_email(user.email),
+        phone=user.phone_number,
+        vehicleCount=len(owner_vehicles(db, user.clerk_user_id)),
+        activePlanSlug=active.plan.slug if active and active.plan else None,
+        activePlanName=active.plan.name if active and active.plan else None,
+        activeExpiresAt=active.expires_at if active else None,
+        activeQuantity=(active.quantity or 1) if active else None,
+    )
+
+
 @router.post("/payments/public/initiate", response_model=PublicPaymentInitiateResponse)
 async def public_initiate_payment(
     body: PublicPaymentInitiateRequest,
     db: Session = Depends(get_db),
 ):
     """
-    Public / external payment initiation from an email link.
-    Does not require a Clerk session. Matches user by email.
+    Payment from the web /pay page, opened from a billing email's signed
+    link — no Clerk session. Same pricing and refusals as the signed-in
+    initiate_payment (_price_purchase); the payment is completed by
+    fulfil_payment once IntouchPay confirms it.
     """
-    email = body.email.strip().lower()
-    if not email:
-        raise HTTPException(status_code=400, detail="email is required")
+    user = _pay_link_user(db, body.token)
     phone = body.phone.strip()
     if not phone:
         raise HTTPException(status_code=400, detail="phone is required")
+    _check_public_pay_rate_limit(user.clerk_user_id)
 
-    user = db.query(User).filter(func.lower(User.email) == email).first()
-    if not user:
-        raise HTTPException(status_code=404, detail="No Track IQ account found for this email address.")
-
-    plan = get_plan_by_slug(db, body.planId, include_inactive=True)
-    if plan is None:
-        raise HTTPException(status_code=400, detail="Selected plan is not available.")
-
-    cfg = plan_config(db, plan.slug)
-    if cfg.get("billing_model") == "postpaid":
-        raise HTTPException(status_code=400, detail="This plan is postpaid — no upfront payment is required.")
-
-    if body.vehicleIds:
-        try:
-            vehicles = resolve_selection(db, user.clerk_user_id, body.vehicleIds)
-        except SelectionError as exc:
-            raise HTTPException(status_code=400, detail=str(exc))
-    else:
-        vehicles = db.query(Vehicle).filter(Vehicle.clerk_user_id == user.clerk_user_id).all()
-        if cfg.get("max_devices") and len(vehicles) > cfg["max_devices"]:
-            vehicles = vehicles[: cfg["max_devices"]]
-
-    amount = subscribe_amount(cfg, max(1, len(vehicles)))
+    plan, cfg, vehicles, amount = _price_purchase(
+        db, user.clerk_user_id, body.planId, body.purpose, body.vehicleIds, cap_unselected=True,
+    )
     tx_ref = f"IP{uuid.uuid4().hex}"
 
     try:
@@ -824,7 +915,7 @@ async def public_initiate_payment(
             transaction_id=tx_ref,
         )
     except IntouchPayError as exc:
-        logger.error("IntouchPay error for public initiate email=%s: %s", email, exc)
+        logger.error("IntouchPay error for public initiate user=%s: %s", user.clerk_user_id, exc)
         raise HTTPException(status_code=502, detail="Could not reach IntouchPay. Retry later.")
 
     accepted = bool(resp.get("success")) and resp.get("responsecode") == "1000"
@@ -836,10 +927,11 @@ async def public_initiate_payment(
             tx_ref=tx_ref,
             plan_id=plan.id,
             amount=amount,
-            currency=cfg.get("currency") or "RWF",
+            currency=cfg["currency"],
             status=status,
             purpose=body.purpose,
             vehicle_ids=[v.id for v in vehicles],
+            # Initiation time until confirmed — see initiate_payment.
             verified_at=datetime.utcnow(),
         )
         db.add(payment)
@@ -849,12 +941,14 @@ async def public_initiate_payment(
         logger.error("DB error saving public payment tx_ref=%s: %s", tx_ref, exc)
         raise HTTPException(status_code=500, detail="Database error")
 
+    logger.info("Public payment initiated: tx_ref=%s planId=%s purpose=%s vehicles=%d amount=%.2f user=%s",
+                tx_ref, plan.slug, body.purpose, len(vehicles), amount, user.clerk_user_id)
     return PublicPaymentInitiateResponse(
         txRef=tx_ref,
         status=status,
         message=resp.get("message") or ("Approve the payment on your phone to continue." if accepted else "Payment request was rejected."),
         amount=amount,
-        currency=cfg.get("currency") or "RWF",
+        currency=cfg["currency"],
         planName=plan.name,
     )
 
@@ -866,8 +960,9 @@ async def public_payment_status(
     db: Session = Depends(get_db),
 ):
     """
-    Public status polling for an external payment. Auto-activates the subscription
-    as soon as payment is confirmed successful so user is fully activated upon sign-in.
+    Status polling for a public payment (tx_ref is an unguessable uuid).
+    Completes the purchase as soon as it's confirmed, so the customer is
+    covered by the time they sign in.
     """
     payment = (
         db.query(Payment)
@@ -893,13 +988,16 @@ async def public_payment_status(
             logger.warning("Public status check error for tx_ref=%s: %s", tx_ref, exc)
 
     if payment.status == "successful" and payment.consumed_at is None:
-        sub = activate_payment_subscription(db, payment)
-        if sub and payment.plan:
-            vehicles = vehicles_for_payment(db, payment)
-            _email_receipt(
-                background_tasks, db, payment.clerk_user_id, payment, payment.plan.name,
-                vehicles, sub.started_at, sub.expires_at, added_vehicles=False
-            )
+        try:
+            fulfilment = fulfil_payment(db, payment)
+        except SQLAlchemyError as exc:
+            db.rollback()
+            logger.error("Could not fulfil payment tx_ref=%s: %s", tx_ref, exc)
+            fulfilment = None
+        if fulfilment is not None:
+            _email_receipt(background_tasks, db, payment.clerk_user_id, payment, payment.plan.name,
+                           fulfilment.vehicles, fulfilment.period_start, fulfilment.period_end,
+                           added_vehicles=fulfilment.added_vehicles)
 
     return PublicPaymentStatusResponse(
         txRef=payment.tx_ref,
@@ -1379,11 +1477,47 @@ def _covered_vehicles(db: Session, sub: Subscription) -> list:
     ]
 
 
+def _renewal_quote(db: Session, active: Subscription) -> PaymentQuoteResponse:
+    """The invoice for renewing `active` early: one more period for the
+    slots it has, starting when the current period ends. Same rules as
+    _price_purchase's renew branch."""
+    plan = active.plan
+    cfg = plan_config(db, plan.slug)
+    unit_price = float(cfg.get("price", 0.0))
+    slots = active.quantity or 1
+    amount = renewal_amount(cfg, active)
+    covered = covered_vehicle_ids(db, active)
+    vehicles = [v for v in owner_vehicles(db, active.clerk_user_id) if v.id in covered]
+    period = f"{plan.duration_value} {plan.duration_unit}{'' if plan.duration_value == 1 else 's'}"
+    return PaymentQuoteResponse(
+        planId=plan.slug,
+        planName=plan.name,
+        purpose="renew",
+        amount=amount,
+        currency=cfg["currency"],
+        chargeScope=cfg.get("charge_scope", "per_device"),
+        unitPrice=unit_price,
+        monthlyPerVehicle=monthly_price(unit_price, cfg["days"]),
+        vehicles=[QuoteVehicle(id=v.id, nickname=v.nickname, plate=v.plate) for v in vehicles],
+        billableVehicles=slots,
+        lineItems=[QuoteLineItem(
+            description=f"{plan.name} — renewal, per vehicle slot, {period}",
+            quantity=slots, unitAmount=unit_price, amount=amount,
+        )],
+        durationDays=cfg["days"],
+        startsAt=active.expires_at,
+        expiresAt=active.expires_at + timedelta(days=cfg["days"]),
+        requiresPayment=amount > 0,
+        replaces=None,
+        blockedReason=renewal_blocker(active, cfg, plan.name, plan_purchasable(db, plan.slug)),
+    )
+
+
 @router.get("/payments/quote", response_model=PaymentQuoteResponse)
 async def get_payment_quote(
     planId: str,
     vehicleIds: Optional[str] = Query(None, description="Comma-separated vehicle ids; omitted = all the account's vehicles"),
-    purpose: Literal["subscribe", "add_vehicles"] = Query("subscribe"),
+    purpose: Literal["subscribe", "add_vehicles", "renew"] = Query("subscribe"),
     clerk_user_id: str = Depends(require_auth),
     db: Session = Depends(get_db),
 ):
@@ -1402,6 +1536,11 @@ async def get_payment_quote(
 
     now = datetime.utcnow()
     active = _get_active_subscription(db, clerk_user_id)
+
+    if purpose == "renew":
+        if active is None or active.plan is None or active.plan.slug != planId:
+            raise HTTPException(status_code=400, detail="Only your current, active plan can be renewed.")
+        return _renewal_quote(db, active)
 
     if purpose == "add_vehicles":
         if active is None or active.plan is None or active.plan.slug != planId:
@@ -1466,7 +1605,7 @@ async def get_payment_quote(
         if active and active.plan_id == plan.id:
             blocked = (
                 f"You're already on this plan until {active.expires_at:%b %d, %Y}. "
-                "You can renew it once it expires, add vehicles to it, or choose a different plan."
+                "You can renew it early to extend it, add vehicles to it, or choose a different plan."
             )
         elif is_trial and db.query(Subscription).filter(Subscription.clerk_user_id == clerk_user_id).first():
             blocked = "Free trial already used. Please choose a paid plan."
@@ -1496,6 +1635,61 @@ async def get_payment_quote(
         replaces=replaces,
         blockedReason=blocked,
     )
+
+
+@router.post("/subscriptions/renew", response_model=SubscriptionResponse)
+async def renew_subscription(
+    body: SubscriptionRenewRequest,
+    background_tasks: BackgroundTasks,
+    clerk_user_id: str = Depends(require_auth),
+    db: Session = Depends(get_db),
+):
+    """
+    Apply a successful "renew" payment (see initiate_payment): one more
+    period on the current subscription, from its current expires_at. 402
+    while the payment is still pending, same polling contract as POST
+    /api/subscriptions. Retrying after success — including after the
+    webhook already applied it (fulfil_payment) — returns the same result.
+    """
+    payment = db.query(Payment).filter(
+        Payment.tx_ref == body.txRef,
+        Payment.clerk_user_id == clerk_user_id,
+        Payment.status == "successful",
+    ).first()
+    if payment is None:
+        raise HTTPException(status_code=402, detail="Payment not verified or not found")
+    if payment.purpose != "renew":
+        raise HTTPException(status_code=409, detail="This payment wasn't for renewing your plan.")
+
+    if payment.consumed_at is not None:
+        funded = (
+            db.query(Subscription)
+            .filter(Subscription.id == payment.subscription_id, Subscription.clerk_user_id == clerk_user_id)
+            .first()
+            if payment.subscription_id is not None
+            else None
+        )
+        if funded is None:
+            raise HTTPException(status_code=409, detail=PAYMENT_ALREADY_USED)
+        return SubscriptionResponse(subscriptionId=funded.id, expiresAt=funded.expires_at)
+
+    try:
+        fulfilment = fulfil_payment(db, payment)
+    except SQLAlchemyError as exc:
+        db.rollback()
+        logger.error("DB error renewing with payment %s: %s", payment.tx_ref, exc)
+        raise HTTPException(status_code=500, detail="Database error")
+    if fulfilment is None:
+        raise HTTPException(
+            status_code=409,
+            detail=f"This renewal couldn't be applied to your current plan. Contact support with reference {payment.tx_ref}.",
+        )
+
+    logger.info("Subscription %s renewed until %s for user %s",
+                fulfilment.subscription.id, fulfilment.period_end.isoformat(), clerk_user_id)
+    _email_receipt(background_tasks, db, clerk_user_id, payment, payment.plan.name, fulfilment.vehicles,
+                   fulfilment.period_start, fulfilment.period_end, added_vehicles=False)
+    return SubscriptionResponse(subscriptionId=fulfilment.subscription.id, expiresAt=fulfilment.period_end)
 
 
 @router.post("/subscriptions/vehicles", response_model=AddVehiclesResponse)
