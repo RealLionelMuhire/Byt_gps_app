@@ -13,6 +13,7 @@ from app.models.location import Location
 from app.models.device import Device
 from app.models.user import User
 from app.services.alarm_rules import CRITICAL_ALARM_TYPES, ALARM_LABELS
+from app.services.entitlements import feature_allowed
 from app.services.push_notifications import send_push_notification
 import logging
 
@@ -41,6 +42,10 @@ async def _resend_escalation_pushes(device_ids_and_alarm_types: list) -> None:
                 continue
             user = db.query(User).filter(User.id == device.user_id).first()
             if not user:
+                continue
+            # Alarm pushes stop when the plan ends (see tcp_server's
+            # _send_push_notification), escalations included.
+            if not feature_allowed(db, owner=user, key="alerts.push", route="push escalation", device_id=device.id):
                 continue
 
             _, body_text = ALARM_LABELS.get(

@@ -21,7 +21,7 @@ from app.api.locations import (
 from app.services.geocoding import build_trip_display_name
 from app.services.trip_detection import detect_trip_segments, SuggestedTrip
 from app.services.trip_settings_service import get_or_create_trip_settings
-from app.services.entitlements import require_feature
+from app.services.entitlements import history_cutoff_dependency, require_feature, retention_denied
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -376,17 +376,17 @@ async def list_trips(
     device_id: int = Query(..., description="Device ID (required - one can have many devices)"),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
+    cutoff: Optional[datetime] = history_cutoff_dependency(),
 ):
     """
-    List saved trips for a device. device_id required.
+    List saved trips for a device. device_id required. Only trips within
+    the plan's history retention window.
     """
     verify_device_access(device_id, user, db)
-    trips = (
-        db.query(Trip)
-        .filter(Trip.device_id == device_id)
-        .order_by(Trip.created_at.desc())
-        .all()
-    )
+    query = db.query(Trip).filter(Trip.device_id == device_id)
+    if cutoff is not None:
+        query = query.filter(Trip.start_time >= cutoff)
+    trips = query.order_by(Trip.created_at.desc()).all()
     return [_trip_response(trip, db) for trip in trips]
 
 
@@ -396,6 +396,7 @@ async def get_trip(
     device_id: int = Query(..., description="Device ID (required for context)"),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
+    cutoff: Optional[datetime] = history_cutoff_dependency(),
 ):
     """
     Get trip metadata and route geometry. device_id required.
@@ -405,6 +406,8 @@ async def get_trip(
     trip = db.query(Trip).filter(Trip.id == trip_id, Trip.device_id == device_id).first()
     if not trip:
         raise HTTPException(status_code=404, detail="Trip not found")
+    if cutoff is not None and trip.start_time < cutoff:
+        raise retention_denied(round((datetime.utcnow() - cutoff).total_seconds() / 86400))
 
     end_time = trip.end_time if trip.end_time is not None else _active_trip_end_time(trip, db)
 
