@@ -47,6 +47,7 @@ from app.api.auth import claim_pending_client_user
 from app.api.subscriptions import plan_config, plan_purchasable, get_plan_by_slug
 from app.core.config import settings
 from app.services.email import _user_display_name as _email_display_name, receipt_details, send_email
+from app.services.entitlements import PositionMasker
 from app.services.pay_links import verify_pay_token
 from app.services.subscription_billing import (
     SelectionError, check_slot_cap, cover_vehicles, covered_vehicle_ids, monthly_price,
@@ -2104,8 +2105,9 @@ async def admin_cancel_subscription(
 
 # ── Vehicle serialization (shared by list + update) ───────────────────────────
 
-def _serialize_vehicle(v: Vehicle, owner: Optional[User] = None) -> dict:
+def _serialize_vehicle(v: Vehicle, masker: PositionMasker, owner: Optional[User] = None) -> dict:
     device = v.device
+    pos = masker.visible(device) if device else None
     return {
         "id":        v.id,
         "nickname":  v.nickname,
@@ -2116,9 +2118,9 @@ def _serialize_vehicle(v: Vehicle, owner: Optional[User] = None) -> dict:
             "id":        device.id      if device else None,
             "imei":      device.imei    if device else None,
             "status":    device.status  if device else "unknown",
-            "latitude":  device.last_latitude  if device else None,
-            "longitude": device.last_longitude if device else None,
-            "last_seen": device.last_update    if device else None,
+            "latitude":  pos.latitude,
+            "longitude": pos.longitude,
+            "last_seen": pos.at if pos.kind == "frozen" else device.last_update,
         } if device else None,
         "created_at": v.created_at,
         # The vehicle's real owner — None for a regular user's own request
@@ -2164,9 +2166,10 @@ async def list_vehicles(
             for u in db.query(User).filter(User.clerk_user_id.in_(clerk_ids)).all()
         }
 
+    masker = PositionMasker(db, user)
     return {
         "vehicles": [
-            _serialize_vehicle(v, owner_by_clerk_id.get(v.clerk_user_id))
+            _serialize_vehicle(v, masker, owner_by_clerk_id.get(v.clerk_user_id))
             for v in vehicles
         ]
     }
@@ -2208,7 +2211,7 @@ async def update_vehicle(
         raise HTTPException(status_code=500, detail="Database error")
 
     logger.info("Vehicle %d nickname updated by %s", vehicle_id, user.clerk_user_id)
-    return _serialize_vehicle(vehicle)
+    return _serialize_vehicle(vehicle, PositionMasker(db, user))
 
 
 # ── DELETE /api/vehicles/{id}  — remove + release device to inventory ─────────

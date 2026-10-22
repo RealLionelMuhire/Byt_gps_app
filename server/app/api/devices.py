@@ -26,7 +26,7 @@ from app.api.subscriptions import SubscriptionPlanResponse
 from app.core.config import settings
 from app.models.user import User, Role
 from app.services.plan_resolution import resolve_owner_plan
-from app.services.entitlements import require_feature
+from app.services.entitlements import PositionMasker, history_cutoff_dependency, require_feature
 from app.services.speed_limit import close_open_episode
 from pydantic import BaseModel, field_validator, model_validator
 
@@ -381,6 +381,29 @@ def _apply_vehicle_info(device: Device, vehicle: Optional[Vehicle]) -> None:
     device.model = vehicle.model if vehicle else None
 
 
+def _with_visible_positions(db: Session, viewer: User, devices: list) -> List["DeviceResponse"]:
+    """DeviceResponse per device with the position the viewer may see (see
+    PositionMasker: live, frozen where it was when the plan ended, or
+    hidden). Built as response objects so the masking never touches the
+    ORM rows — handlers here override mapped attributes in place and rely
+    on nothing flushing them."""
+    masker = PositionMasker(db, viewer)
+    responses = []
+    for device in devices:
+        response = DeviceResponse.model_validate(device)
+        pos = masker.visible(device)
+        if pos.kind != "live":
+            response.last_latitude = pos.latitude
+            response.last_longitude = pos.longitude
+            response.position_confirmed_at = pos.at
+            if pos.kind == "frozen":
+                # "Last seen" must match the frozen position, not the
+                # tracker's latest packet.
+                response.last_update = pos.at
+        responses.append(response)
+    return responses
+
+
 @router.get("/", response_model=List[DeviceResponse])
 async def list_devices(
     skip: int = Query(0, ge=0),
@@ -533,7 +556,7 @@ async def list_devices(
             device.owner_name = f"{owner.first_name} {owner.last_name}".strip() or owner.email
             device.owner_email = owner.email
         devices.append(device)
-    return devices
+    return _with_visible_positions(db, user, devices)
 
 
 @router.get("/rejected")
@@ -641,23 +664,23 @@ async def get_device_billing(
     )
 
 
-@router.get("/{device_id}/trips", response_model=List[TripResponse])
+@router.get("/{device_id}/trips", response_model=List[TripResponse], dependencies=[require_feature("history.trips")])
 async def list_device_trips(
     device_id: int,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
+    cutoff: Optional[datetime] = history_cutoff_dependency(),
 ):
-    """List trips for a device. Access trips via device_id."""
+    """List trips for a device. Access trips via device_id. Same plan gate
+    and retention window as GET /api/trips (this one used to have neither)."""
     device = db.query(Device).filter(Device.id == device_id).first()
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
     require_device_access(device, user)
-    trips = (
-        db.query(Trip)
-        .filter(Trip.device_id == device_id)
-        .order_by(Trip.created_at.desc())
-        .all()
-    )
+    query = db.query(Trip).filter(Trip.device_id == device_id)
+    if cutoff is not None:
+        query = query.filter(Trip.start_time >= cutoff)
+    trips = query.order_by(Trip.created_at.desc()).all()
     return trips
 
 
@@ -685,7 +708,7 @@ async def get_device(
     device.plan = resolved.plan
     device.plan_id = resolved.plan.id if resolved.plan else None
     _apply_vehicle_info(device, _latest_vehicle_by_device_id(db, {device.id}).get(device.id))
-    return device
+    return _with_visible_positions(db, user, [device])[0]
 
 
 @router.get("/imei/{imei}", response_model=DeviceResponse)
@@ -700,7 +723,7 @@ async def get_device_by_imei(
         raise HTTPException(status_code=404, detail="Device not found")
     require_device_access(device, user)
     _apply_vehicle_info(device, _latest_vehicle_by_device_id(db, {device.id}).get(device.id))
-    return device
+    return _with_visible_positions(db, user, [device])[0]
 
 
 @router.post("/", response_model=DeviceResponse, status_code=201)
@@ -769,7 +792,7 @@ async def update_device(
     db.commit()
     db.refresh(device)
 
-    return device
+    return _with_visible_positions(db, user, [device])[0]
 
 
 @router.put("/{device_id}/plan")
@@ -829,7 +852,7 @@ async def update_device_marker_icon(
     db.commit()
     db.refresh(device)
 
-    return device
+    return _with_visible_positions(db, user, [device])[0]
 
 
 @router.delete("/{device_id}", status_code=204)
@@ -1092,18 +1115,19 @@ async def get_device_status(
         # Mobile app device-wait screen — minimal payload
         return {"status": device.status}
 
+    pos = PositionMasker(db, user).visible(device)
     return {
         "id": device.id,
         "imei": device.imei,
         "name": device.name,
         "status": device.status,
-        "last_update": device.last_update,
+        "last_update": pos.at if pos.kind == "frozen" else device.last_update,
         "battery_level": device.battery_level,
         "gsm_signal": device.gsm_signal,
         "location": {
-            "latitude": device.last_latitude,
-            "longitude": device.last_longitude,
-        } if device.last_latitude and device.last_longitude else None,
+            "latitude": pos.latitude,
+            "longitude": pos.longitude,
+        } if pos.latitude and pos.longitude else None,
     }
 
 

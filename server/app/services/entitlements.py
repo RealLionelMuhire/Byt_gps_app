@@ -25,7 +25,7 @@ editable metadata, and plan_features says which plan includes which.
 
 import logging
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Dict, List, Optional
 
 from fastapi import Depends, HTTPException, Request
@@ -37,6 +37,7 @@ from app.core.config import settings
 from app.core.database import get_db
 from app.models.device import Device
 from app.models.entitlement import EntitlementCheckLog, Feature, PlanFeature
+from app.models.location import Location
 from app.models.subscription import SubscriptionPlan
 from app.models.user import User
 from app.models.vehicle import Vehicle
@@ -310,6 +311,153 @@ def check_limit(db: Session, *, owner: Optional[User], actor: Optional[User], ke
         _deny(db, owner=owner, actor=actor, key=key, reason=reason, route=route, mode=mode, limit=limit)
 
 
+def feature_allowed(db: Session, *, owner: Optional[User], key: str, route: str,
+                    device_id: Optional[int] = None) -> bool:
+    """Non-raising check_feature for paths that aren't HTTP requests — the
+    live WebSocket feed and alarm pushes: True unless enforce mode denies
+    `key` to `owner` (for `device_id`'s vehicle, when given). Log mode
+    records the would-be denial and returns True. Same commit caveat as
+    check_feature."""
+    mode = _mode()
+    if mode == "off" or owner is None or _is_admin(owner):
+        return True
+    entitlements = _safe_resolve(db, owner)
+    if entitlements is None:
+        return True
+    reason = entitlements.denial_reason(key)
+    if reason is None and _vehicle_not_covered(db, entitlements, owner, device_id):
+        reason = "vehicle_not_covered"
+    if reason is None:
+        return True
+    _record(db, owner=owner, actor=None, key=key, reason=reason, route=route, mode=mode)
+    return mode != "enforce"
+
+
+# How long an ended plan's vehicles keep showing where they were when it
+# ended. Live updates stop at once; after this the position is hidden too.
+POSITION_GRACE = timedelta(days=3)
+
+
+@dataclass(frozen=True)
+class PositionAccess:
+    kind: str  # live | frozen | hidden
+    # frozen: show the vehicle's last position at or before this time.
+    as_of: Optional[datetime] = None
+
+
+LIVE = PositionAccess("live")
+HIDDEN = PositionAccess("hidden")
+
+
+class PositionPolicy:
+    """What position a customer may see for their vehicles, resolved once
+    per owner (a device list is all one owner's vehicles):
+
+    - plan active with tracking.live, vehicle covered -> live;
+    - plan ended less than POSITION_GRACE ago -> frozen where it was when
+      the plan ended;
+    - otherwise (ended longer ago, never subscribed, plan without live
+      tracking, vehicle not on the plan) -> hidden.
+
+    Only applies in enforce mode — log/off are always live. Never writes or
+    commits: callers mask fields on response objects built from ORM rows
+    that must not be flushed (see list_devices)."""
+
+    def __init__(self, db: Session, owner: Optional[User], now: Optional[datetime] = None):
+        self._now = now or datetime.utcnow()
+        self._entitlements: Optional[Entitlements] = None
+        self._ended_at: Optional[datetime] = None
+        self._all_live = _mode() != "enforce" or owner is None or _is_admin(owner)
+        self._owner = owner
+        if self._all_live:
+            return
+        try:
+            resolved = resolve_owner_plan(db, owner)
+            self._entitlements = resolve_entitlements(db, owner)
+        except SQLAlchemyError as exc:
+            db.rollback()
+            logger.error("Position policy for owner=%s failed — showing live (failing open): %s", owner.id, exc)
+            self._all_live = True
+            return
+        sub = resolved.subscription
+        if resolved.status == "expired" and sub is not None:
+            ended = sub.expires_at
+            # A cancellation ends the plan when it happens, not at the
+            # expires_at it would have reached.
+            if sub.status == "cancelled" and sub.updated_at is not None:
+                ended = min(ended, sub.updated_at) if ended else sub.updated_at
+            self._ended_at = ended
+
+    def for_device(self, db: Session, device_id: int) -> PositionAccess:
+        if self._all_live:
+            return LIVE
+        ent = self._entitlements
+        if ent.status == "active":
+            if ent.denial_reason("tracking.live") or _vehicle_not_covered(db, ent, self._owner, device_id):
+                return HIDDEN
+            return LIVE
+        if self._ended_at is not None and self._now - self._ended_at < POSITION_GRACE:
+            return PositionAccess("frozen", as_of=self._ended_at)
+        return HIDDEN
+
+
+def position_as_of(db: Session, device_id: int, as_of: datetime) -> Optional[Location]:
+    """The vehicle's last trustworthy fix at or before `as_of` — where it
+    was when its owner's plan ended."""
+    return (
+        db.query(Location)
+        .filter(
+            Location.device_id == device_id,
+            Location.timestamp <= as_of,
+            Location.gps_valid.is_(True),
+            Location.is_outlier.is_(False),
+        )
+        .order_by(Location.timestamp.desc())
+        .first()
+    )
+
+
+@dataclass(frozen=True)
+class VisiblePosition:
+    kind: str  # live | frozen | hidden
+    latitude: Optional[float] = None
+    longitude: Optional[float] = None
+    # When that position was fixed (frozen) or confirmed (live).
+    at: Optional[datetime] = None
+
+
+class PositionMasker:
+    """One request's view of device positions: admins see everything live;
+    a customer sees what PositionPolicy allows for the device's owner
+    (cached per owner). Never writes or commits."""
+
+    def __init__(self, db: Session, viewer: Optional[User], now: Optional[datetime] = None):
+        self._db = db
+        self._viewer_is_admin = _is_admin(viewer)
+        self._viewer = viewer
+        self._now = now
+        self._policies: Dict[Optional[int], PositionPolicy] = {}
+
+    def visible(self, device: Device) -> VisiblePosition:
+        live = VisiblePosition("live", device.last_latitude, device.last_longitude,
+                               getattr(device, "position_confirmed_at", None))
+        if self._viewer_is_admin or device.user_id is None:
+            return live
+        policy = self._policies.get(device.user_id)
+        if policy is None:
+            owner = (self._viewer if self._viewer is not None and self._viewer.id == device.user_id
+                     else self._db.query(User).filter(User.id == device.user_id).first())
+            policy = self._policies[device.user_id] = PositionPolicy(self._db, owner, now=self._now)
+        access = policy.for_device(self._db, device.id)
+        if access.kind == "live":
+            return live
+        if access.kind == "frozen":
+            fix = position_as_of(self._db, device.id, access.as_of)
+            if fix is not None:
+                return VisiblePosition("frozen", fix.latitude, fix.longitude, fix.timestamp)
+        return VisiblePosition("hidden")
+
+
 def _route_label(request: Request) -> str:
     route = request.scope.get("route")
     path = getattr(route, "path", None) or request.url.path
@@ -354,6 +502,66 @@ def require_feature(key: str):
         check_feature(db, owner=owner, actor=user, key=key, route=_route_label(request), device_id=device_id)
 
     return Depends(_check)
+
+
+def history_cutoff(db: Session, *, owner: Optional[User], actor: Optional[User],
+                   now: Optional[datetime] = None) -> Optional[datetime]:
+    """The earliest moment `owner`'s plan lets them look back to
+    (history.retention_days), or None for no limit. Enforce mode only —
+    access to history itself is gated separately (history.trips/period);
+    this only narrows how far back. Never commits."""
+    if _mode() != "enforce" or owner is None or _is_admin(actor) or _is_admin(owner):
+        return None
+    entitlements = _safe_resolve(db, owner)
+    if entitlements is None or entitlements.status != "active":
+        return None
+    grant = entitlements.grants.get("history.retention_days")
+    if grant is None or not grant.enabled or grant.limit is None:
+        return None
+    return (now or datetime.utcnow()) - timedelta(days=grant.limit)
+
+
+def clamp_start(start: Optional[datetime], cutoff: Optional[datetime]) -> Optional[datetime]:
+    """`start` moved forward to the retention cutoff when it's earlier (or
+    unset, meaning "from the beginning")."""
+    if cutoff is None:
+        return start
+    if start is None:
+        return cutoff
+    naive = start.replace(tzinfo=None) if start.tzinfo else start
+    return cutoff if naive < cutoff else start
+
+
+def retention_denied(limit_days: int) -> HTTPException:
+    """402 for a record (a trip) entirely older than the plan lets the
+    customer see — same body shape as any other feature denial."""
+    feature = FEATURES_BY_KEY["history.retention_days"]
+    return HTTPException(
+        status_code=402,
+        detail={
+            "code": "feature_not_in_plan",
+            "feature": feature.key,
+            "feature_name": feature.name,
+            "reason": "over_limit",
+            "limit": limit_days,
+            "message": f"Your plan keeps {limit_days} days of history.",
+        },
+    )
+
+
+def history_cutoff_dependency():
+    """Route dependency resolving the request's history_cutoff — owner from
+    the path/query device_id like require_feature."""
+
+    async def _cutoff(
+        request: Request,
+        user: User = Depends(get_current_user),
+        db: Session = Depends(get_db),
+    ) -> Optional[datetime]:
+        owner, _ = _owner_for_request(db, request, user)
+        return history_cutoff(db, owner=owner, actor=user)
+
+    return Depends(_cutoff)
 
 
 def seed_plan_features(db: Session, plan: SubscriptionPlan) -> None:

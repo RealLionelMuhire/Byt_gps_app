@@ -13,7 +13,7 @@ from math import radians, degrees, cos, sin, asin, atan2, sqrt
 from app.core.config import settings
 from app.core.database import get_db
 from app.core.auth import get_current_user, require_device_access
-from app.services.entitlements import require_feature
+from app.services.entitlements import clamp_start, history_cutoff_dependency, require_feature
 from app.models.location import Location
 from app.models.location_quality_log import LocationQualityLog
 from app.models.device import Device
@@ -915,9 +915,13 @@ async def get_location_history(
     limit: int = Query(1000, ge=1, le=10000, description="Maximum number of points"),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
+    cutoff: Optional[datetime] = history_cutoff_dependency(),
 ):
     """Get location history for a device."""
     device = verify_device_access(device_id, user, db)
+    # Not before the plan's history retention window.
+    if start_time is not None:
+        start_time = clamp_start(start_time, cutoff)
     
     # Build query
     query = db.query(Location).filter(Location.device_id == device_id)
@@ -1082,9 +1086,13 @@ async def get_device_route(
     ),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
+    cutoff: Optional[datetime] = history_cutoff_dependency(),
 ):
     """Get device route (optimized for map display)."""
     device = verify_device_access(device_id, user, db)
+    # Not before the plan's history retention window.
+    if start_time is not None:
+        start_time = clamp_start(start_time, cutoff)
 
     query = db.query(Location).filter(*location_quality_filters(device_id))
 
@@ -1113,6 +1121,7 @@ async def get_device_distance(
     end_time: Optional[datetime] = Query(None, description="End time (UTC)"),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
+    cutoff: Optional[datetime] = history_cutoff_dependency(),
 ):
     """
     Get total distance covered by a device within a time range.
@@ -1121,6 +1130,9 @@ async def get_device_distance(
     Only GPS-valid points are used.
     """
     device = verify_device_access(device_id, user, db)
+    # Not before the plan's history retention window.
+    if start_time is not None:
+        start_time = clamp_start(start_time, cutoff)
 
     if not start_time:
         start_time = datetime.utcnow() - timedelta(hours=24)
@@ -1149,6 +1161,7 @@ async def get_device_route_line(
     end_time: Optional[datetime] = Query(None, description="End time (UTC)"),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
+    cutoff: Optional[datetime] = history_cutoff_dependency(),
 ):
     """
     Get device route as a MultiLineString (one sub-segment per contiguous
@@ -1156,6 +1169,9 @@ async def get_device_route_line(
     aligned to coordinates, plus a `gaps` list of the breaks themselves.
     """
     device = verify_device_access(device_id, user, db)
+    # Not before the plan's history retention window.
+    if start_time is not None:
+        start_time = clamp_start(start_time, cutoff)
 
     if not start_time:
         start_time = datetime.utcnow() - timedelta(hours=24)
@@ -1182,6 +1198,7 @@ async def get_period_route(
     ),
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
+    cutoff: Optional[datetime] = history_cutoff_dependency(),
 ):
     """
     Aggregate ALL trips/segments for a device within [start, end] into one
@@ -1205,6 +1222,8 @@ async def get_period_route(
         )
 
     device = verify_device_access(device_id, user, db)
+    # Not before the plan's history retention window.
+    start = clamp_start(start, cutoff)
     settings = get_or_create_trip_settings(user.id, db)
 
     query = db.query(Location).filter(*location_quality_filters(device_id))

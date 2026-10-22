@@ -19,7 +19,7 @@ from app.models.device import Device
 from app.models.location import Location
 from app.models.overspeed_episode import OverspeedEpisode
 from app.models.user import User
-from app.services.entitlements import require_feature
+from app.services.entitlements import clamp_start, history_cutoff_dependency, require_feature
 from app.services.geocoding import (
     format_fallback_location,
     reverse_geocode_many,
@@ -121,6 +121,7 @@ async def get_fleet_report(
     tz_offset_minutes: int = _TZ_OFFSET_QUERY,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
+    cutoff: Optional[datetime] = history_cutoff_dependency(),
 ):
     """Summary totals for every device the caller owns, one row each, for
     comparing vehicles side by side. Scoped to the caller's own devices
@@ -128,6 +129,8 @@ async def get_fleet_report(
     can read on a phone, and admins have the dashboard for that."""
     start, end = _naive_utc(start), _naive_utc(end)
     _validate_period(start, end)
+    # Not before the plan's history retention window.
+    start = min(clamp_start(start, cutoff), end)
     offset = timedelta(minutes=tz_offset_minutes)
     settings = get_or_create_trip_settings(user.id, db)
 
@@ -163,6 +166,7 @@ async def get_device_report(
     tz_offset_minutes: int = _TZ_OFFSET_QUERY,
     db: Session = Depends(get_db),
     user: User = Depends(get_current_user),
+    cutoff: Optional[datetime] = history_cutoff_dependency(),
 ):
     """
     Everything one device did over [start, end], as report tables:
@@ -176,6 +180,8 @@ async def get_device_report(
     start, end = _naive_utc(start), _naive_utc(end)
     _validate_period(start, end)
     device = verify_device_access(device_id, user, db)
+    # Not before the plan's history retention window.
+    start = min(clamp_start(start, cutoff), end)
     settings = get_or_create_trip_settings(user.id, db)
     offset = timedelta(minutes=tz_offset_minutes)
 

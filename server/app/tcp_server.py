@@ -29,6 +29,7 @@ from app.services.geocoding import reverse_geocode, format_fallback_location
 from app.core.config import settings
 from app.services.trip_settings_service import DEFAULT_STOP_SPEED_KMH, get_or_create_trip_settings
 from app.services.push_notifications import send_push_notification
+from app.services.entitlements import feature_allowed
 from app.services.alarm_rules import (
     ALARM_LABELS,
     ALARM_SETTING_FIELDS,
@@ -1240,6 +1241,17 @@ class TCPServer:
 
             alarm_key = str(data.get("alarm_type", "")).lower()
             location = db.query(Location).filter(Location.id == location_id).first() if location_id else None
+
+            # Plan gate first — ahead of the critical bypass below: alarm
+            # pushes stop when the owner's plan ends (product decision,
+            # 2026-10-22), SOS included. Stamped like a mute so the digest
+            # job never sends it later either. Log mode only records.
+            if not feature_allowed(db, owner=user, key="alerts.push", route="push alarm", device_id=device_id):
+                if location is not None and location.digested_at is None:
+                    location.digested_at = datetime.utcnow()
+                    db.commit()
+                return
+
             critical = is_critical(alarm_key)
 
             # None -> send. "below_threshold" -> suppressed, eligible for digest.

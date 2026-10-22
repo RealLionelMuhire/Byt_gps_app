@@ -11,6 +11,7 @@ from app.core.database import SessionLocal
 from app.models.location import Location
 from app.models.device import Device
 from app.models.user import User
+from app.services.entitlements import feature_allowed
 from app.services.push_notifications import send_push_notification
 import logging
 
@@ -40,6 +41,10 @@ async def _send_digest_pushes(digest_targets: list) -> None:
         for user_id, alarm_counts, device_names in digest_targets:
             user = db.query(User).filter(User.id == user_id).first()
             if not user:
+                continue
+            # Alarm pushes stop when the plan ends (see tcp_server's
+            # _send_push_notification) — the summary of them too.
+            if not feature_allowed(db, owner=user, key="alerts.push", route="push digest"):
                 continue
             await send_push_notification(
                 user,

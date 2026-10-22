@@ -13,46 +13,61 @@ one socket per vehicle. See its docstring below for details.
 
 import logging
 import asyncio
+import time
 from typing import Dict, Set, Optional
 
-import httpx
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect, Query
 from sqlalchemy.orm import Session
 
-from app.core.config import settings
 from app.core.database import SessionLocal
 from app.core.auth import _verify_clerk_token as _resolve_clerk_user_id
 from app.models.device import Device
 from app.models.user import Role, User
+from app.services.entitlements import feature_allowed
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-async def _verify_clerk_token(token: str) -> bool:
-    """
-    Verify a Clerk session token via the Clerk REST API.
-    Returns True if valid. Falls back to True on network errors (Clerk outage)
-    so we don't lock out users unintentionally.
-    In dev mode (no CLERK_SECRET_KEY), always returns True.
-    """
-    if not settings.CLERK_SECRET_KEY:
-        logger.warning("WS auth: CLERK_SECRET_KEY not set — skipping verification (dev mode)")
-        return True
+def _feed_key(payload: dict) -> Optional[str]:
+    """The plan feature a WS message type needs a customer to have:
+    location -> tracking.live, alarm -> alerts.push. Other types (e.g.
+    device_status) aren't plan-gated."""
+    return {"location": "tracking.live", "alarm": "alerts.push"}.get(payload.get("type"))
+
+
+# (device_id, feature key) -> (monotonic expiry, allowed). A tracker sends a
+# fix every few seconds; re-resolving the owner's plan for each would be a
+# DB round trip per packet. 60s means a plan that just ended stops the live
+# feed within a minute.
+_GATE_TTL_SECONDS = 60.0
+_gate_cache: Dict[tuple, tuple] = {}
+
+
+def _customer_may_receive(device_id: int, key: str) -> bool:
+    """Whether the device's owner's plan lets customers (non-admin sockets)
+    receive this feed — see entitlements.feature_allowed (log mode: always
+    True, with the would-be denial recorded)."""
+    now = time.monotonic()
+    cached = _gate_cache.get((device_id, key))
+    if cached is not None and cached[0] > now:
+        return cached[1]
+    db = SessionLocal()
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(
-                "https://api.clerk.com/v1/me",
-                headers={"Authorization": f"Bearer {token}"},
-            )
-            if resp.status_code == 200:
-                return True
-            logger.warning("WS auth: Clerk rejected token (HTTP %d)", resp.status_code)
-            return False
-    except Exception as exc:
-        # Fail open on transient network errors — don't block real users
-        logger.error("WS auth: token verification error — %s", exc)
-        return True
+        device = db.query(Device).filter(Device.id == device_id).first()
+        owner = (
+            db.query(User).filter(User.id == device.user_id).first()
+            if device is not None and device.user_id is not None
+            else None
+        )
+        allowed = feature_allowed(db, owner=owner, key=key, route=f"WS {key}", device_id=device_id)
+    except Exception as exc:  # noqa: BLE001 — never break the live feed over a gate lookup
+        logger.error("WS gate for device %d (%s) failed — allowing: %s", device_id, key, exc)
+        allowed = True
+    finally:
+        db.close()
+    _gate_cache[(device_id, key)] = (now + _GATE_TTL_SECONDS, allowed)
+    return allowed
 
 
 class ConnectionManager:
@@ -86,11 +101,17 @@ class ConnectionManager:
         # frames / races — it does NOT serialize sends across different
         # sockets, only concurrent sends to the same one.
         self.fleet_locks: Dict[WebSocket, asyncio.Lock] = {}
+        # Admins see every feed regardless of the owner's plan (support);
+        # customers only what the owner's plan allows (_customer_may_receive).
+        self.admin_sockets: Set[WebSocket] = set()
+        self.admin_users: Set[int] = set()
 
-    async def connect(self, device_id: int, ws: WebSocket) -> None:
+    async def connect(self, device_id: int, ws: WebSocket, is_admin: bool = False) -> None:
         """Accept and register a new WebSocket subscriber for device_id."""
         await ws.accept()
         self.active.setdefault(device_id, set()).add(ws)
+        if is_admin:
+            self.admin_sockets.add(ws)
         total = len(self.active[device_id])
         logger.info(
             "WS client connected for device %d — total subscribers: %d",
@@ -101,6 +122,7 @@ class ConnectionManager:
     def disconnect(self, device_id: int, ws: WebSocket) -> None:
         """Remove a WebSocket from the subscriber set."""
         self.active.get(device_id, set()).discard(ws)
+        self.admin_sockets.discard(ws)
         remaining = len(self.active.get(device_id, set()))
         logger.info(
             "WS client disconnected from device %d — remaining: %d",
@@ -109,10 +131,12 @@ class ConnectionManager:
         )
 
     async def connect_fleet(
-        self, user_id: int, device_ids: Set[int], ws: WebSocket
+        self, user_id: int, device_ids: Set[int], ws: WebSocket, is_admin: bool = False
     ) -> None:
         """Accept and register a fleet-wide subscriber covering device_ids."""
         await ws.accept()
+        if is_admin:
+            self.admin_users.add(user_id)
         self.fleet_locks[ws] = asyncio.Lock()
         self.fleet_subscribers.setdefault(user_id, set()).add(ws)
         for device_id in device_ids:
@@ -137,6 +161,7 @@ class ConnectionManager:
         self.fleet_locks.pop(ws, None)
         if not subscribers:
             self.fleet_subscribers.pop(user_id, None)
+            self.admin_users.discard(user_id)
             for device_id in device_ids:
                 owners = self.device_owners.get(device_id)
                 if owners is None:
@@ -151,8 +176,17 @@ class ConnectionManager:
         Send a JSON payload to every per-device subscriber of device_id, and
         to every fleet subscriber whose fleet includes device_id.
         Dead connections are pruned automatically from both registries.
+
+        Location and alarm messages reach customers only while the device
+        owner's plan allows them (see _customer_may_receive); admins always
+        get them.
         """
-        clients = list(self.active.get(device_id, set()))
+        key = _feed_key(payload)
+        customers_allowed = key is None or _customer_may_receive(device_id, key)
+        clients = [
+            ws for ws in self.active.get(device_id, set())
+            if customers_allowed or ws in self.admin_sockets
+        ]
         if clients:
             dead: list[WebSocket] = []
             for ws in clients:
@@ -168,7 +202,10 @@ class ConnectionManager:
             for ws in dead:
                 self.active.get(device_id, set()).discard(ws)
 
-        owner_user_ids = list(self.device_owners.get(device_id, set()))
+        owner_user_ids = [
+            uid for uid in self.device_owners.get(device_id, set())
+            if customers_allowed or uid in self.admin_users
+        ]
         for user_id in owner_user_ids:
             fleet_clients = list(self.fleet_subscribers.get(user_id, set()))
             dead_fleet: list[WebSocket] = []
@@ -229,15 +266,29 @@ async def location_stream(
           "timestamp": str (ISO-8601) }
     - Client may send any text frame as a keep-alive ping (ignored by server).
     """
-    # --- Authentication ---
-    # In dev mode (no CLERK_SECRET_KEY), _verify_clerk_token always returns True.
-    # In production, a missing or invalid token closes with 4001.
-    if not await _verify_clerk_token(token or ""):
+    # --- Authentication + ownership ---
+    # Same local JWKS verification as /ws/fleet. This used to only check the
+    # token against Clerk's REST API — failing OPEN on any network error —
+    # and never checked the device: any signed-in user could follow any
+    # vehicle live by its id. 4001 = not signed in, 4003 = not your device.
+    clerk_user_id = await _resolve_clerk_user_id(token or "")
+    if not clerk_user_id:
         await websocket.close(code=4001, reason="Unauthorized")
         logger.warning("WS: rejected unauthenticated connection for device %d", device_id)
         return
+    db = SessionLocal()
+    try:
+        user = db.query(User).filter(User.clerk_user_id == clerk_user_id).first()
+        device = db.query(Device).filter(Device.id == device_id).first()
+    finally:
+        db.close()
+    is_admin = user is not None and user.role in (Role.SUPER_ADMIN, Role.ADMIN)
+    if user is None or device is None or not (is_admin or device.user_id == user.id):
+        await websocket.close(code=4003, reason="Forbidden")
+        logger.warning("WS: rejected connection for device %d (not the owner)", device_id)
+        return
 
-    await manager.connect(device_id, websocket)
+    await manager.connect(device_id, websocket, is_admin=is_admin)
     try:
         while True:
             # Block waiting for client messages (keep-alive pings, etc.)
@@ -277,11 +328,8 @@ async def fleet_stream(websocket: WebSocket, token: Optional[str] = Query(None))
     sends no frame for 60s.
     """
     # --- Authentication ---
-    # Unlike /ws/locations/{device_id} (which only needs to know the token is
-    # valid), resolving a fleet requires knowing *who* connected, so this
-    # uses core.auth's JWKS-based verifier (returns the Clerk user id) rather
-    # than this module's local _verify_clerk_token (bool-only, calls Clerk's
-    # REST API instead of verifying locally).
+    # core.auth's JWKS-based verifier — returns the Clerk user id, which
+    # resolving a fleet needs.
     clerk_user_id = await _resolve_clerk_user_id(token or "")
     if not clerk_user_id:
         await websocket.close(code=4001, reason="Unauthorized")
@@ -301,7 +349,9 @@ async def fleet_stream(websocket: WebSocket, token: Optional[str] = Query(None))
     finally:
         db.close()
 
-    await manager.connect_fleet(user.id, device_ids, websocket)
+    await manager.connect_fleet(
+        user.id, device_ids, websocket, is_admin=user.role in (Role.SUPER_ADMIN, Role.ADMIN),
+    )
     try:
         while True:
             # Block waiting for client messages (keep-alive pings, etc.)
