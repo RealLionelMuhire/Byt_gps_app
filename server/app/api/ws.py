@@ -24,6 +24,7 @@ from app.core.auth import _verify_clerk_token as _resolve_clerk_user_id
 from app.models.device import Device
 from app.models.user import Role, User
 from app.services.entitlements import feature_allowed
+from app.services.ws_broadcaster import WsBroadcaster
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -105,6 +106,7 @@ class ConnectionManager:
         # customers only what the owner's plan allows (_customer_may_receive).
         self.admin_sockets: Set[WebSocket] = set()
         self.admin_users: Set[int] = set()
+        self.broadcaster = WsBroadcaster(local_broadcast_fn=self._broadcast_local)
 
     async def connect(self, device_id: int, ws: WebSocket, is_admin: bool = False) -> None:
         """Accept and register a new WebSocket subscriber for device_id."""
@@ -173,8 +175,16 @@ class ConnectionManager:
 
     async def broadcast(self, device_id: int, payload: dict) -> None:
         """
-        Send a JSON payload to every per-device subscriber of device_id, and
-        to every fleet subscriber whose fleet includes device_id.
+        Broadcast a message to subscribers. Dispatches through WsBroadcaster,
+        which distributes across worker nodes via Redis if REDIS_URL is configured,
+        or delivers locally.
+        """
+        await self.broadcaster.broadcast(device_id, payload)
+
+    async def _broadcast_local(self, device_id: int, payload: dict) -> None:
+        """
+        Send a JSON payload to every per-device subscriber of device_id connected to
+        THIS worker, and to every fleet subscriber whose fleet includes device_id.
         Dead connections are pruned automatically from both registries.
 
         Location and alarm messages reach customers only while the device

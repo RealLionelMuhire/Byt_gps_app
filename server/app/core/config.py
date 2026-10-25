@@ -26,6 +26,17 @@ class Settings(BaseSettings):
     # Direct/session-mode connection (bypasses the transaction pooler) — used for
     # DDL/migrations. Falls back to DATABASE_URL if not set.
     DIRECT_URL: Optional[str] = None
+
+    # Redis Pub/Sub for horizontal multi-worker WebSocket broadcast scaling.
+    # When set (e.g. "redis://localhost:6379/0"), WebSocket events are broadcast
+    # across all Uvicorn worker processes / backend replicas via Redis channels.
+    # When None, broadcasts fall back gracefully to the local in-memory registry.
+    REDIS_URL: Optional[str] = None
+
+    # Location ingestion batching
+    ENABLE_LOCATION_BATCHING: bool = False
+    LOCATION_BATCH_MAX_SIZE: int = 50
+    LOCATION_BATCH_FLUSH_INTERVAL_SECONDS: float = 0.2
     
     # Security
     SECRET_KEY: str = "your-secret-key-change-this-in-production"

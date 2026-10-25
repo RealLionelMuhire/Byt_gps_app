@@ -13,6 +13,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from app.core.config import settings
 from app.core.database import init_db
+from app.services.location_batcher import location_batcher
 from app.tcp_server import TCPServer
 from app.api import devices, locations, auth, commands, trips, webhooks, geofences, contact_requests
 from app.api import ws as ws_module
@@ -131,6 +132,8 @@ async def lifespan(app: FastAPI):
     # location updates to mobile clients in real time
     app.state.ws_manager = ws_module.manager
     tcp_server.ws_manager = ws_module.manager
+    await ws_module.manager.broadcaster.start()
+    location_batcher.start()
 
     # Run TCP server in background task
     tcp_task = asyncio.create_task(tcp_server.start())
@@ -142,6 +145,8 @@ async def lifespan(app: FastAPI):
 
     # Shutdown
     logger.info("Shutting down...")
+    await location_batcher.stop()
+    await ws_module.manager.broadcaster.stop()
     trip_stale_task.cancel()
     try:
         await trip_stale_task

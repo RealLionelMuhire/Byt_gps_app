@@ -27,6 +27,7 @@ from app.services.relay_state import apply_relay_report, is_deferred_relay_reply
 from app.models.command_log import CommandLog
 from app.services.geocoding import reverse_geocode, format_fallback_location
 from app.core.config import settings
+from app.services.location_batcher import location_batcher
 from app.services.trip_settings_service import DEFAULT_STOP_SPEED_KMH, get_or_create_trip_settings
 from app.services.push_notifications import send_push_notification
 from app.services.entitlements import feature_allowed
@@ -139,10 +140,17 @@ def _apply_geofence_transitions(
     transitions = evaluate_geofences(
         db, device.id, device.user_id, device.last_longitude, device.last_latitude,
     )
+    for t in transitions:
+        if hasattr(t, "geofence") and t.geofence is not None:
+            _ = t.geofence.name
+            try:
+                db.expunge(t.geofence)
+            except Exception:
+                pass
     if transitions and not location.is_alarm:
         location.is_alarm = True
         location.alarm_type = "Enter fence" if transitions[0].entered else "Exit fence"
-        location.geofence_name = transitions[0].geofence.name
+        location.geofence_name = getattr(transitions[0].geofence, "name", "")
     return transitions
 
 
@@ -237,7 +245,7 @@ def _apply_speed_limit_check(
 OVERSPEED_GEOCODE_TIMEOUT_SECONDS = settings.NOMINATIM_TIMEOUT_SECONDS + 1.0
 
 
-async def _resolve_overspeed_road_name(location: Location) -> str:
+async def _resolve_overspeed_road_name(location_or_lat, lon: Optional[float] = None) -> str:
     """
     Resolve a road name for a just-fired overspeed alarm's position,
     cache-first with a live Nominatim fallback (see
@@ -252,15 +260,20 @@ async def _resolve_overspeed_road_name(location: Location) -> str:
     "lat, lon" string, so every overspeed alert always carries some
     location text.
     """
+    if isinstance(location_or_lat, (int, float)) and lon is not None:
+        latitude, longitude = float(location_or_lat), float(lon)
+    else:
+        latitude, longitude = location_or_lat.latitude, location_or_lat.longitude
+
     try:
         name = await asyncio.wait_for(
-            asyncio.to_thread(reverse_geocode, location.latitude, location.longitude),
+            asyncio.to_thread(reverse_geocode, latitude, longitude),
             timeout=OVERSPEED_GEOCODE_TIMEOUT_SECONDS,
         )
     except Exception as e:
         logger.warning("Overspeed road-name lookup failed/timed out: %s", e)
         name = None
-    return name or format_fallback_location(location.latitude, location.longitude)
+    return name or format_fallback_location(latitude, longitude)
 
 
 def _relay_target(command: Optional[str]) -> Optional[bool]:
@@ -271,6 +284,249 @@ def _relay_target(command: Optional[str]) -> Optional[bool]:
     if normalized.startswith("RELAY,0"):
         return False
     return None
+
+
+def _db_handle_login(imei: str) -> Optional[dict]:
+    db = SessionLocal()
+    try:
+        device = db.query(Device).filter(Device.imei == imei).first()
+        if not device:
+            return None
+        device.status = 'online'
+        device.last_connect = datetime.utcnow()
+        if device.lifecycle == 'registered':
+            device.lifecycle = 'in_stock'
+            logger.info(
+                f"Device IMEI {imei} promoted to 'in_stock' "
+                "(first TCP handshake received — device is operational)"
+            )
+        db.commit()
+        return {
+            "id": device.id,
+            "lifecycle": device.lifecycle,
+        }
+    finally:
+        db.close()
+
+
+def _db_handle_heartbeat(device_imei: str, data: Dict) -> dict:
+    db = SessionLocal()
+    try:
+        device = db.query(Device).filter(Device.imei == device_imei).first()
+        if not device:
+            return {"found": False}
+        device.battery_level = data['battery_percent']
+        device.gsm_signal = data['gsm_signal']
+        device.status = 'online'
+        device.last_update = datetime.utcnow()
+        relay_changed = apply_relay_report(device, data.get('oil_elec_disconnected'))
+        db.commit()
+        return {
+            "found": True,
+            "device_id": device.id,
+            "relay_cut": device.relay_cut,
+            "relay_changed": relay_changed,
+            "relay_payload": relay_state_payload(device) if relay_changed else None,
+        }
+    finally:
+        db.close()
+
+
+def _db_handle_alarm(device_imei: str, data: Dict, is_real_alarm: bool) -> dict:
+    db = SessionLocal()
+    try:
+        device = db.query(Device).filter(Device.imei == device_imei).first()
+        if not device:
+            return {"found": False}
+
+        alarm_type = data.get('alarm_type', 'Unknown')
+        evaluation = _evaluate_incoming_point(
+            db, device.id, data['longitude'], data['latitude'],
+            data['course'], data['satellites'], data['timestamp']
+        )
+        is_outlier = evaluation["is_outlier"]
+        location = Location(
+            device_id=device.id,
+            latitude=data['latitude'],
+            longitude=data['longitude'],
+            speed=data['speed'],
+            course=data['course'],
+            satellites=data['satellites'],
+            gps_valid=data['gps_valid'],
+            timestamp=data['timestamp'],
+            is_alarm=is_real_alarm,
+            alarm_type=alarm_type if is_real_alarm else None,
+            is_outlier=is_outlier
+        )
+        db.add(location)
+        db.flush()
+        db.add(LocationQualityLog(
+            location_id=location.id,
+            device_id=device.id,
+            timestamp=data['timestamp'],
+            is_outlier=is_outlier,
+            **evaluation["quality_fields"],
+        ))
+
+        if data['gps_valid'] and not is_outlier:
+            device.last_latitude = data['latitude']
+            device.last_longitude = data['longitude']
+            device.position_confirmed_at = datetime.utcnow()
+        device.pending_latitude = None
+        device.pending_longitude = None
+        device.pending_since = None
+        device.last_update = datetime.utcnow()
+
+        geofence_transitions = _apply_geofence_transitions(db, device, location)
+        relay_changed = apply_relay_report(device, data.get('oil_elec_disconnected'))
+
+        db.commit()
+
+        return {
+            "found": True,
+            "device_id": device.id,
+            "location_id": location.id,
+            "relay_changed": relay_changed,
+            "relay_payload": relay_state_payload(device) if relay_changed else None,
+            "geofence_transitions": geofence_transitions,
+        }
+    finally:
+        db.close()
+
+
+def _db_handle_location(device_imei: str, data: Dict) -> dict:
+    db = SessionLocal()
+    try:
+        device = db.query(Device).filter(Device.imei == device_imei).first()
+        if not device:
+            return {"found": False}
+
+        evaluation = _evaluate_incoming_point(
+            db, device.id, data['longitude'], data['latitude'],
+            data['course'], data['satellites'], data['timestamp']
+        )
+        is_outlier = evaluation["is_outlier"]
+        location = Location(
+            device_id=device.id,
+            latitude=data['latitude'],
+            longitude=data['longitude'],
+            speed=data['speed'],
+            course=data['course'],
+            satellites=data['satellites'],
+            gps_valid=data['gps_valid'],
+            timestamp=data['timestamp'],
+            is_outlier=is_outlier
+        )
+        db.add(location)
+        db.flush()
+        db.add(LocationQualityLog(
+            location_id=location.id,
+            device_id=device.id,
+            timestamp=data['timestamp'],
+            is_outlier=is_outlier,
+            **evaluation["quality_fields"],
+        ))
+
+        if data['gps_valid'] and not is_outlier:
+            if device.user_id:
+                trip_settings = get_or_create_trip_settings(device.user_id, db)
+                stop_speed_threshold_kmh = trip_settings.stop_speed_threshold_kmh
+            else:
+                stop_speed_threshold_kmh = DEFAULT_STOP_SPEED_KMH
+            resolve_live_position(
+                device, data['latitude'], data['longitude'], data['speed'],
+                stop_speed_threshold_kmh, datetime.utcnow(),
+            )
+        device.last_update = datetime.utcnow()
+        device.status = 'online'
+
+        geofence_transitions = _apply_geofence_transitions(db, device, location)
+        speed_limit_fired = _apply_speed_limit_check(
+            db, device, location, data['speed'], data['gps_valid'], is_outlier
+        )
+
+        db.commit()
+
+        live_data = None
+        if device.last_latitude is not None and device.last_longitude is not None:
+            live_data = {
+                **data,
+                'latitude': device.last_latitude,
+                'longitude': device.last_longitude,
+                'position_confirmed_at': device.position_confirmed_at,
+            }
+
+        try:
+            if device.user_id and data['gps_valid'] and not is_outlier:
+                from app.models.trip import Trip
+
+                trip_settings = get_or_create_trip_settings(device.user_id, db)
+                if data['speed'] >= trip_settings.stop_speed_threshold_kmh:
+                    has_active_trip = (
+                        db.query(Trip)
+                        .filter(Trip.device_id == device.id, Trip.end_time.is_(None))
+                        .first()
+                    )
+                    if not has_active_trip:
+                        prev_point = (
+                            db.query(Location)
+                            .filter(*location_quality_filters(device.id))
+                            .filter(Location.id != location.id)
+                            .order_by(Location.timestamp.desc())
+                            .first()
+                        )
+                        sustained = (
+                            prev_point is not None
+                            and prev_point.speed is not None
+                            and prev_point.speed >= trip_settings.stop_speed_threshold_kmh
+                            and data['timestamp'] > prev_point.timestamp
+                            and (data['timestamp'] - prev_point.timestamp)
+                                <= timedelta(minutes=trip_settings.stop_splits_trip_after_minutes)
+                        )
+                        if sustained:
+                            new_trip = Trip(
+                                device_id=device.id,
+                                user_id=device.user_id,
+                                name=f"Trip {prev_point.timestamp:%Y-%m-%d %H:%M}",
+                                start_time=prev_point.timestamp,
+                                end_time=None,
+                                total_distance_km=0.0,
+                            )
+                            db.add(new_trip)
+                            db.commit()
+                            logger.info(
+                                "Auto-started trip for device %s at %s",
+                                device_imei, prev_point.timestamp,
+                            )
+        except Exception as e:
+            logger.error(
+                "Trip auto-start failed for device %s: %s",
+                device_imei, e, exc_info=True,
+            )
+
+        return {
+            "found": True,
+            "device_id": device.id,
+            "location_id": location.id,
+            "latitude": location.latitude,
+            "longitude": location.longitude,
+            "live_data": live_data,
+            "geofence_transitions": geofence_transitions,
+            "speed_limit_fired": speed_limit_fired,
+        }
+    finally:
+        db.close()
+
+
+def _db_update_location_road_name(location_id: int, road_name: str) -> None:
+    db = SessionLocal()
+    try:
+        loc = db.query(Location).filter(Location.id == location_id).first()
+        if loc:
+            loc.road_name = road_name
+            db.commit()
+    finally:
+        db.close()
 
 
 class GPSTrackerConnection:
@@ -304,7 +560,7 @@ class GPSTrackerConnection:
         # command's real reply arrives, so the first call times out despite
         # succeeding, and/or the wrong reply gets attributed to the wrong
         # caller. Serializing means a second caller just waits its turn.
-        self._command_lock = asyncio.Lock()
+        self._command_lock: Optional[asyncio.Lock] = None
         # GT06 0x15 replies echo the 4-byte server flag of the 0x80 command
         # they answer. Every command used to go out with flag 1, so replies
         # could not be matched: a reply landing after the 10s wait was lost,
@@ -425,273 +681,92 @@ class GPSTrackerConnection:
 
             logger.info(f"Device login attempt: IMEI {imei}")
 
-            db = SessionLocal()
-            try:
-                device = db.query(Device).filter(Device.imei == imei).first()
+            device_info = await asyncio.to_thread(_db_handle_login, imei)
+            if not device_info:
+                # IMEI not whitelisted — reject the connection
+                logger.warning(
+                    f"Rejected unknown IMEI {imei} — not in device inventory. "
+                    "Pre-register the device via the admin dashboard first."
+                )
+                # Track rejected IMEI for the dashboard
+                await self.server.record_rejection(imei, self.address[0])
 
-                if not device:
-                    # IMEI not whitelisted — reject the connection
-                    logger.warning(
-                        f"Rejected unknown IMEI {imei} — not in device inventory. "
-                        "Pre-register the device via the admin dashboard first."
-                    )
-                    # Track rejected IMEI for the dashboard
-                    await self.server.record_rejection(imei, self.address[0])
-                    
-                    self.device_imei = None
-                    self.authenticated = False
-                    self.writer.close()
-                    return
+                self.device_imei = None
+                self.authenticated = False
+                self.writer.close()
+                return
 
-                # Known device — accept and mark online
-                device.status = 'online'
-                device.last_connect = datetime.utcnow()
-
-                # Auto-promote: first TCP handshake proves the device is functional.
-                # Transition: registered → in_stock (device is now ready to sell).
-                if device.lifecycle == 'registered':
-                    device.lifecycle = 'in_stock'
-                    logger.info(
-                        f"Device IMEI {imei} promoted to 'in_stock' "
-                        "(first TCP handshake received — device is operational)"
-                    )
-
-                db.commit()
-                logger.info(f"Device accepted: IMEI {imei} (id={device.id}, lifecycle='{device.lifecycle}')")
-
-            finally:
-                db.close()
-
+            logger.info(f"Device accepted: IMEI {imei} (id={device_info['id']}, lifecycle='{device_info['lifecycle']}')")
             self.authenticated = True
             # Register connection in server
             self.server.register_device(imei, self)
 
         except Exception as e:
             logger.error(f"Error handling login: {e}", exc_info=True)
-    
+
     async def handle_location(self, data: Dict):
         """Handle location packet"""
         try:
             if not self.authenticated or not self.device_imei:
                 logger.warning("Location data from unauthenticated device")
                 return
-            
+
             logger.info(f"Location update from {self.device_imei}: "
                        f"({data['latitude']:.6f}, {data['longitude']:.6f}), "
                        f"speed: {data['speed']}km/h, satellites: {data['satellites']}")
-            
-            # Store location in database
-            db = SessionLocal()
-            try:
-                device = db.query(Device).filter(Device.imei == self.device_imei).first()
-                
-                if device:
-                    evaluation = _evaluate_incoming_point(
-                        db, device.id, data['longitude'], data['latitude'],
-                        data['course'], data['satellites'], data['timestamp']
-                    )
-                    is_outlier = evaluation["is_outlier"]
-                    # Create location record
-                    location = Location(
-                        device_id=device.id,
-                        latitude=data['latitude'],
-                        longitude=data['longitude'],
-                        speed=data['speed'],
-                        course=data['course'],
-                        satellites=data['satellites'],
-                        gps_valid=data['gps_valid'],
-                        timestamp=data['timestamp'],
-                        is_outlier=is_outlier
-                    )
-                    db.add(location)
-                    db.flush()  # assigns location.id, needed for the quality-log FK below
-                    db.add(LocationQualityLog(
-                        location_id=location.id,
-                        device_id=device.id,
-                        timestamp=data['timestamp'],
-                        is_outlier=is_outlier,
-                        **evaluation["quality_fields"],
-                    ))
 
-                    # Update device's CONFIRMED live position — gated behind
-                    # the same gps_valid/is_outlier check every historical
-                    # query already applies (location_quality_filters), plus
-                    # a corroboration hold for the case that check can't
-                    # catch: a slow, "plausible" jump while the device
-                    # reports itself stopped (GPS reacquisition after a
-                    # reconnect). See app/services/live_position.py.
-                    if data['gps_valid'] and not is_outlier:
-                        if device.user_id:
-                            trip_settings = get_or_create_trip_settings(device.user_id, db)
-                            stop_speed_threshold_kmh = trip_settings.stop_speed_threshold_kmh
-                        else:
-                            stop_speed_threshold_kmh = DEFAULT_STOP_SPEED_KMH
-                        resolve_live_position(
-                            device, data['latitude'], data['longitude'], data['speed'],
-                            stop_speed_threshold_kmh, datetime.utcnow(),
-                        )
-                    device.last_update = datetime.utcnow()
-                    device.status = 'online'
+            # Process fix via LocationBatcher and worker thread off the event loop
+            res = await location_batcher.submit(self.device_imei, data, _db_handle_location)
+            if not res or not res.get("found"):
+                return
 
-                    geofence_transitions = _apply_geofence_transitions(db, device, location)
-                    speed_limit_fired = _apply_speed_limit_check(
-                        db, device, location, data['speed'], data['gps_valid'], is_outlier
-                    )
+            device_id = res["device_id"]
+            location_id = res["location_id"]
 
-                    db.commit()
+            # Broadcast CONFIRMED position to WebSocket subscribers
+            if res.get("live_data") is not None:
+                await self.server.broadcast_location_update(device_id, res["live_data"])
 
-                    # Broadcast to WebSocket clients — deliberately runs
-                    # before trip auto-start below, and nothing after this
-                    # point may ever raise into the same try/except that
-                    # guards it. A prior version had trip auto-start *before*
-                    # this call in the same unguarded block: any exception in
-                    # that bookkeeping silently skipped the broadcast
-                    # entirely (caught by this function's outer except,
-                    # logged server-side only) — location writes kept
-                    # succeeding while every live client silently stopped
-                    # receiving updates, with no client-visible symptom at
-                    # all. Broadcasting first, and isolating trip auto-start
-                    # in its own try/except below, makes that class of bug
-                    # structurally impossible regardless of what trip
-                    # auto-start does in the future.
-                    # Broadcast the CONFIRMED position (device.last_latitude/
-                    # longitude), not the raw ping — otherwise a held
-                    # candidate (see resolve_live_position above) would still
-                    # reach live clients even though it wasn't trusted enough
-                    # to update the device row. Other fields (speed, course,
-                    # timestamp) are still the raw values; only lat/lon is
-                    # gated. Skipped entirely if there's no confirmed
-                    # position yet at all (e.g. device's very first ping was
-                    # itself invalid).
-                    if device.last_latitude is not None and device.last_longitude is not None:
-                        live_data = {
-                            **data,
-                            'latitude': device.last_latitude,
-                            'longitude': device.last_longitude,
-                            'position_confirmed_at': device.position_confirmed_at,
-                        }
-                        await self.server.broadcast_location_update(device.id, live_data)
-                    await _broadcast_geofence_transitions(self.server, device.id, data, geofence_transitions, location_id=location.id)
-                    if speed_limit_fired:
-                        road_name = await _resolve_overspeed_road_name(location)
-                        # Always persist -- format_fallback_location's
-                        # coordinate string is still worth recording, so
-                        # GET /{device_id}/alarms shows the same text the
-                        # live push/WS broadcast just did.
-                        location.road_name = road_name
-                        db.commit()
-                        speed_alarm_data = {**data, "alarm_type": "Over speed", "road_name": road_name}
-                        await self.server.broadcast_alarm(device.id, speed_alarm_data, location_id=location.id)
+            await _broadcast_geofence_transitions(
+                self.server, device_id, data, res.get("geofence_transitions", []), location_id=location_id
+            )
 
-                    # Auto-start a trip once this device shows SUSTAINED
-                    # movement — the immediately preceding quality-filtered
-                    # point must also be at/above the owner's "moving" speed
-                    # threshold, not just this one point. A single ping
-                    # above threshold used to be enough, which meant any
-                    # noisy/glitched fix (e.g. a reconnect GPS-reacquisition
-                    # transient — see app/services/live_position.py, added
-                    # for the sibling bug on the live-map side of this same
-                    # failure mode) opened a real trip on its own. Mirrors
-                    # the auto-*end* logic in trip_service.py/main.py's
-                    # stale checker, which only ever closes a trip, never
-                    # opens one — without this, no Trip row is ever created
-                    # unless something calls POST /api/trips/start
-                    # explicitly.
-                    try:
-                        if device.user_id and data['gps_valid'] and not is_outlier:
-                            from app.models.trip import Trip
+            if res.get("speed_limit_fired"):
+                road_name = await _resolve_overspeed_road_name(res["latitude"], res["longitude"])
+                await asyncio.to_thread(_db_update_location_road_name, location_id, road_name)
+                speed_alarm_data = {**data, "alarm_type": "Over speed", "road_name": road_name}
+                await self.server.broadcast_alarm(device_id, speed_alarm_data, location_id=location_id)
 
-                            trip_settings = get_or_create_trip_settings(device.user_id, db)
-                            if data['speed'] >= trip_settings.stop_speed_threshold_kmh:
-                                has_active_trip = (
-                                    db.query(Trip)
-                                    .filter(Trip.device_id == device.id, Trip.end_time.is_(None))
-                                    .first()
-                                )
-                                if not has_active_trip:
-                                    prev_point = (
-                                        db.query(Location)
-                                        .filter(*location_quality_filters(device.id))
-                                        .filter(Location.id != location.id)
-                                        .order_by(Location.timestamp.desc())
-                                        .first()
-                                    )
-                                    sustained = (
-                                        prev_point is not None
-                                        and prev_point.speed is not None
-                                        and prev_point.speed >= trip_settings.stop_speed_threshold_kmh
-                                        and data['timestamp'] > prev_point.timestamp
-                                        and (data['timestamp'] - prev_point.timestamp)
-                                            <= timedelta(minutes=trip_settings.stop_splits_trip_after_minutes)
-                                    )
-                                    if sustained:
-                                        new_trip = Trip(
-                                            device_id=device.id,
-                                            user_id=device.user_id,
-                                            name=f"Trip {prev_point.timestamp:%Y-%m-%d %H:%M}",
-                                            start_time=prev_point.timestamp,
-                                            end_time=None,
-                                            total_distance_km=0.0,
-                                        )
-                                        db.add(new_trip)
-                                        db.commit()
-                                        logger.info(
-                                            "Auto-started trip for device %s at %s",
-                                            self.device_imei, prev_point.timestamp,
-                                        )
-                    except Exception as e:
-                        logger.error(
-                            "Trip auto-start failed for device %s: %s",
-                            self.device_imei, e, exc_info=True,
-                        )
-
-            finally:
-                db.close()
-        
         except Exception as e:
             logger.error(f"Error handling location: {e}", exc_info=True)
-    
+
     async def handle_heartbeat(self, data: Dict):
         """Handle heartbeat packet"""
         try:
             if not self.authenticated or not self.device_imei:
                 logger.warning("Heartbeat from unauthenticated device")
                 return
-            
+
             logger.info(f"Heartbeat from {self.device_imei}: "
                        f"Battery {data['battery_percent']}%, "
                        f"Signal: {data['signal_bars']}/4 bars")
-            
-            # Update device status in database
-            db = SessionLocal()
-            try:
-                device = db.query(Device).filter(Device.imei == self.device_imei).first()
-                
-                if device:
-                    device.battery_level = data['battery_percent']
-                    device.gsm_signal = data['gsm_signal']
-                    device.status = 'online'
-                    device.last_update = datetime.utcnow()
-                    relay_changed = apply_relay_report(device, data.get('oil_elec_disconnected'))
-                    db.commit()
-                    if relay_changed:
-                        logger.info(f"Relay state for {self.device_imei}: "
-                                    f"{'CUT' if device.relay_cut else 'connected'}")
-                        await self.server.broadcast_device_status(device.id, relay_state_payload(device))
-            
-            finally:
-                db.close()
-        
+
+            res = await asyncio.to_thread(_db_handle_heartbeat, self.device_imei, data)
+            if res.get("relay_changed") and res.get("relay_payload"):
+                logger.info(f"Relay state for {self.device_imei}: "
+                            f"{'CUT' if res.get('relay_cut') else 'connected'}")
+                await self.server.broadcast_device_status(res["device_id"], res["relay_payload"])
+
         except Exception as e:
             logger.error(f"Error handling heartbeat: {e}", exc_info=True)
-    
+
     async def handle_alarm(self, data: Dict):
         """Handle alarm packet"""
         try:
             if not self.authenticated or not self.device_imei:
                 logger.warning("Alarm from unauthenticated device")
                 return
-            
+
             alarm_type = data.get('alarm_type', 'Unknown')
             # See HARDWARE_FENCE_ALARM_TYPES: kept as a position fix (it's
             # still a real GPS report, and still runs through server-side
@@ -704,76 +779,26 @@ class GPSTrackerConnection:
                 logger.info(f"Ignoring hardware '{alarm_type}' alarm from {self.device_imei} "
                             f"at ({data['latitude']:.6f}, {data['longitude']:.6f}) — "
                             f"not a server-side geofence crossing")
-            
-            # Store alarm as location with alarm flag
-            db = SessionLocal()
-            try:
-                device = db.query(Device).filter(Device.imei == self.device_imei).first()
-                
-                if device:
-                    evaluation = _evaluate_incoming_point(
-                        db, device.id, data['longitude'], data['latitude'],
-                        data['course'], data['satellites'], data['timestamp']
-                    )
-                    is_outlier = evaluation["is_outlier"]
-                    location = Location(
-                        device_id=device.id,
-                        latitude=data['latitude'],
-                        longitude=data['longitude'],
-                        speed=data['speed'],
-                        course=data['course'],
-                        satellites=data['satellites'],
-                        gps_valid=data['gps_valid'],
-                        timestamp=data['timestamp'],
-                        is_alarm=is_real_alarm,
-                        alarm_type=alarm_type if is_real_alarm else None,
-                        is_outlier=is_outlier
-                    )
-                    db.add(location)
-                    db.flush()  # assigns location.id, needed for the quality-log FK below
-                    db.add(LocationQualityLog(
-                        location_id=location.id,
-                        device_id=device.id,
-                        timestamp=data['timestamp'],
-                        is_outlier=is_outlier,
-                        **evaluation["quality_fields"],
-                    ))
 
-                    # Same gps_valid/is_outlier gate as handle_location, but
-                    # never held for corroboration — an alarm's reported
-                    # position must never be silently delayed. Clears any
-                    # pending candidate either way so a stale hold can't
-                    # later confirm against an unrelated point.
-                    if data['gps_valid'] and not is_outlier:
-                        device.last_latitude = data['latitude']
-                        device.last_longitude = data['longitude']
-                        device.position_confirmed_at = datetime.utcnow()
-                    device.pending_latitude = None
-                    device.pending_longitude = None
-                    device.pending_since = None
-                    device.last_update = datetime.utcnow()
+            res = await asyncio.to_thread(_db_handle_alarm, self.device_imei, data, is_real_alarm)
+            if not res or not res.get("found"):
+                return
 
-                    # For a real hardware alarm, location.is_alarm is already
-                    # True with its own alarm_type above, so this can only
-                    # add *additional* geofence transitions to broadcast — it
-                    # never overwrites a real device alarm on the stored row.
-                    # For an ignored hardware fence byte the row is a plain
-                    # fix, so a genuine server-side transition is recorded on
-                    # it exactly as handle_location would.
-                    geofence_transitions = _apply_geofence_transitions(db, device, location)
-                    relay_changed = apply_relay_report(device, data.get('oil_elec_disconnected'))
+            device_id = res["device_id"]
+            location_id = res["location_id"]
 
-                    db.commit()
+            if res.get("relay_changed") and res.get("relay_payload"):
+                await self.server.broadcast_device_status(device_id, res["relay_payload"])
 
-                    if relay_changed:
-                        await self.server.broadcast_device_status(device.id, relay_state_payload(device))
-                    # Broadcast alarm to WebSocket clients
-                    if is_real_alarm:
-                        await self.server.broadcast_alarm(device.id, data, location_id=location.id)
-                    await _broadcast_geofence_transitions(self.server, device.id, data, geofence_transitions, location_id=location.id)
-            
-            finally:
-                db.close()
+            if is_real_alarm:
+                await self.server.broadcast_alarm(device_id, data, location_id=location_id)
+
+            await _broadcast_geofence_transitions(
+                self.server, device_id, data, res.get("geofence_transitions", []), location_id=location_id
+            )
+
+        except Exception as e:
+            logger.error(f"Error handling alarm: {e}", exc_info=True)
         
         except Exception as e:
             logger.error(f"Error handling alarm: {e}", exc_info=True)
@@ -986,6 +1011,8 @@ class GPSTrackerConnection:
             current = asyncio.current_task()
             if self._relay_confirm_task is not current and not self._relay_confirm_task.done():
                 self._relay_confirm_task.cancel()
+        if self._command_lock is None:
+            self._command_lock = asyncio.Lock()
         async with self._command_lock:
             self._command_serial = (self._command_serial + 1) & 0xFFFF
             server_flag = self._new_server_flag()
@@ -1079,12 +1106,14 @@ class TCPServer:
         self.ws_manager: Optional[object] = None
         # Track recently rejected IMEIs (max 20) for the admin dashboard
         self.rejected_imeis = []
-        self._rejection_lock = asyncio.Lock()
+        self._rejection_lock: Optional[asyncio.Lock] = None
 
     async def record_rejection(self, imei: str, ip: str):
         """Record an unregistered IMEI connection attempt.
         Thread-safe via asyncio.Lock so concurrent connection handlers
         can't corrupt the shared list."""
+        if self._rejection_lock is None:
+            self._rejection_lock = asyncio.Lock()
         async with self._rejection_lock:
             entry = {"imei": imei, "ip": ip, "time": datetime.utcnow()}
             # Remove if already exists to update time
@@ -1228,21 +1257,40 @@ class TCPServer:
             explicit mute, deduped) stamps digested_at immediately so the
             digest job never double-notifies or resurrects a muted alert.
         """
+        try:
+            eval_result = await asyncio.to_thread(TCPServer._db_evaluate_push, device_id, data, location_id)
+            if not eval_result:
+                return
+
+            await send_push_notification(
+                eval_result["user"],
+                title=eval_result["title"],
+                body=eval_result["body_text"],
+                data=eval_result["push_data"],
+                channel_id="gps-alarms",
+            )
+
+            await asyncio.to_thread(TCPServer._db_stamp_push_sent, device_id, eval_result["alarm_key"], location_id)
+        except Exception as exc:
+            logger.error("Failed to send push notification for device %d: %s", device_id, exc)
+
+    @staticmethod
+    def _db_evaluate_push(device_id: int, data: Dict, location_id: Optional[int]) -> Optional[Dict]:
         db = SessionLocal()
         try:
             device = db.query(Device).filter(Device.id == device_id).first()
             if not device or not device.user_id:
-                return
+                return None
 
             from app.models.user import User
             user = db.query(User).filter(User.id == device.user_id).first()
             if not user:
-                return
+                return None
 
             alarm_key = str(data.get("alarm_type", "")).lower()
             location = db.query(Location).filter(Location.id == location_id).first() if location_id else None
 
-            # Plan gate first — ahead of the critical bypass below: alarm
+            # Plan gate first \u2014 ahead of the critical bypass below: alarm
             # pushes stop when the owner's plan ends (product decision,
             # 2026-10-22), SOS included. Stamped like a mute so the digest
             # job never sends it later either. Log mode only records.
@@ -1250,7 +1298,7 @@ class TCPServer:
                 if location is not None and location.digested_at is None:
                     location.digested_at = datetime.utcnow()
                     db.commit()
-                return
+                return None
 
             critical = is_critical(alarm_key)
 
@@ -1287,13 +1335,13 @@ class TCPServer:
                         skip_reason = "deduped"
 
             if skip_reason == "below_threshold":
-                return
+                return None
 
             if skip_reason is not None:
                 if location is not None and location.digested_at is None:
                     location.digested_at = datetime.utcnow()
                     db.commit()
-                return
+                return None
 
             title, body_text = ALARM_LABELS.get(
                 alarm_key,
@@ -1334,14 +1382,30 @@ class TCPServer:
             if location_id is not None:
                 push_data["location_id"] = location_id
 
-            await send_push_notification(
-                user,
-                title=title,
-                body=body_text,
-                data=push_data,
-                channel_id="gps-alarms",
+            user_obj = User(
+                id=user.id,
+                clerk_user_id=user.clerk_user_id,
+                email=user.email,
+                first_name=user.first_name,
+                last_name=user.last_name,
+                role=user.role,
+                fcm_token=user.fcm_token,
+                expo_push_token=user.expo_push_token,
             )
+            return {
+                "user": user_obj,
+                "title": title,
+                "body_text": body_text,
+                "push_data": push_data,
+                "alarm_key": alarm_key,
+            }
+        finally:
+            db.close()
 
+    @staticmethod
+    def _db_stamp_push_sent(device_id: int, alarm_key: str, location_id: Optional[int]) -> None:
+        db = SessionLocal()
+        try:
             push_state = db.query(AlarmPushState).filter(
                 AlarmPushState.device_id == device_id,
                 AlarmPushState.alarm_type == alarm_key,
@@ -1351,11 +1415,10 @@ class TCPServer:
                 db.add(push_state)
             push_state.last_push_at = datetime.utcnow()
             push_state.last_alarm_state = "fired"
-            if location is not None and location.digested_at is None:
-                location.digested_at = datetime.utcnow()
+            if location_id:
+                location = db.query(Location).filter(Location.id == location_id).first()
+                if location is not None and location.digested_at is None:
+                    location.digested_at = datetime.utcnow()
             db.commit()
-
-        except Exception as exc:
-            logger.error("Failed to send push notification for device %d: %s", device_id, exc)
         finally:
             db.close()
