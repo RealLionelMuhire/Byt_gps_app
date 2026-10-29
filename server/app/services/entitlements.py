@@ -236,20 +236,27 @@ def _deny(db: Session, *, owner: User, actor: Optional[User], key: str, reason: 
             "feature_name": feature.name if feature else key,
             "reason": reason,
             "limit": limit,
-            "message": _denial_message(feature.name if feature else key, reason, limit),
+            "message": _denial_message(feature.name if feature else key, reason, limit, key=key),
         },
     )
 
 
-def _denial_message(name: str, reason: str, limit: Optional[int]) -> str:
+# History the tracker keeps recording while the plan is off — every fix and
+# trip is saved regardless of plan (tcp_server never checks one), and shows
+# again once the plan is active.
+HISTORY_FEATURES = {"history.trips", "history.period"}
+
+
+def _denial_message(name: str, reason: str, limit: Optional[int], key: Optional[str] = None) -> str:
     # Shown inside the mobile apps, so it states the fact only — no
     # "upgrade"/"renew" call to action: the apps don't sell plans, and store
     # rules forbid pointing to paying elsewhere (see the Flutter app's
     # CurrentPlanCard doc).
+    kept = " Your trips are still being recorded." if key in HISTORY_FEATURES else ""
     if reason == "no_subscription":
-        return f"{name} needs an active plan."
+        return f"{name} needs an active plan.{kept}"
     if reason == "subscription_expired":
-        return f"Your plan has expired, so {name} is paused."
+        return f"Your plan has expired, so {name} is paused.{kept}"
     if reason == "over_limit":
         return f"Your plan allows up to {limit} for {name}."
     if reason == "vehicle_not_covered":

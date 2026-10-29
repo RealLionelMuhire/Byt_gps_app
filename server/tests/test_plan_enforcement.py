@@ -337,3 +337,53 @@ def test_the_device_trip_list_is_now_plan_gated(client, owner_setup):
     *_, device, plan_state = owner_setup
     plan_state("ended")
     assert client.get(f"/api/devices/{device.id}/trips").status_code == 402
+
+
+# --- History while unpaid ------------------------------------------------------------
+
+
+def test_trips_recorded_while_unpaid_are_hidden_then_shown_once_paid(client, db_session, owner_setup):
+    owner, _, _, device, plan_state = owner_setup
+    plan_state("ended", ended_days_ago=5)
+    before = make_trip(db_session, owner, device, 10, "before it ended")
+    unpaid = make_trip(db_session, owner, device, 1, "while unpaid")
+    window = {"start_time": (NOW - timedelta(days=2)).isoformat(), "end_time": NOW.isoformat()}
+    period = {"start": window["start_time"], "end": window["end_time"]}
+
+    locked = [
+        client.get("/api/trips", params={"device_id": device.id}),
+        client.get(f"/api/devices/{device.id}/trips"),
+        client.get(f"/api/trips/{unpaid.id}", params={"device_id": device.id}),
+        client.get(f"/api/locations/{device.id}/route", params=window),
+        client.get(f"/api/locations/{device.id}/period-route", params=period),
+    ]
+    assert [r.status_code for r in locked] == [402] * len(locked)
+    detail = locked[0].json()["detail"]
+    assert detail["reason"] == "subscription_expired"
+    assert "still being recorded" in detail["message"]
+    # Hidden, not deleted.
+    assert db_session.query(Trip).filter_by(device_id=device.id).count() == 2
+
+    plan_state("active")
+    names = {t["name"] for t in client.get("/api/trips", params={"device_id": device.id}).json()}
+    assert names == {"before it ended", "while unpaid"}
+    assert client.get(f"/api/trips/{unpaid.id}", params={"device_id": device.id}).status_code == 200
+    assert client.get(f"/api/trips/{before.id}", params={"device_id": device.id}).status_code == 200
+    route = client.get(f"/api/locations/{device.id}/period-route", params=period)
+    assert route.status_code == 200
+
+
+@pytest.mark.parametrize("role", [Role.SUPER_ADMIN, Role.ADMIN])
+def test_admins_see_an_unpaid_customers_history(client, db_session, current_clerk_id, owner_setup, role):
+    owner, _, _, device, plan_state = owner_setup
+    plan_state("ended", ended_days_ago=30)
+    trip = make_trip(db_session, owner, device, 1, "while unpaid")
+    current_clerk_id["value"] = make_user(db_session, f"clerk_{role.value.lower()}", role=role).clerk_user_id
+    window = {"start_time": (NOW - timedelta(days=3)).isoformat(), "end_time": NOW.isoformat()}
+    period = {"start": window["start_time"], "end": window["end_time"]}
+
+    assert [t["name"] for t in client.get(f"/api/devices/{device.id}/trips").json()] == ["while unpaid"]
+    assert client.get(f"/api/trips/{trip.id}", params={"device_id": device.id}).status_code == 200
+    assert client.get(f"/api/locations/{device.id}/route", params=window).status_code == 200
+    assert client.get(f"/api/locations/{device.id}/period-route", params=period).status_code == 200
+    assert client.get(f"/api/reports/{device.id}", params=period).status_code == 200
