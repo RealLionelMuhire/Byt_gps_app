@@ -20,6 +20,9 @@ class Settings(BaseSettings):
     HOST: str = "0.0.0.0"
     HTTP_PORT: int = 8000
     TCP_PORT: int = 7018
+    # A tracker socket that hasn't logged in by then is closed (and what it
+    # sent, if anything, is logged) — a GT06 tracker logs in first thing.
+    TCP_LOGIN_TIMEOUT_SECONDS: float = 120.0
     
     # Database
     DATABASE_URL: str = "postgresql://gps_user:gps_password@localhost:5432/gps_tracking"
