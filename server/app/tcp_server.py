@@ -543,6 +543,11 @@ class GPSTrackerConnection:
         self.authenticated = False
         self.buffer = bytearray()
         self.last_activity = datetime.utcnow()
+        # Before login: the first bytes received (capped) and the total, for
+        # the log line when a socket never logs in — the parser drops
+        # anything that isn't a 0x7878 packet without a trace.
+        self._pre_login_bytes = bytearray()
+        self._pre_login_total = 0
         self._command_serial = 0xA000
         self._pending_response: asyncio.Future = None
         # Which command _pending_response is waiting on — lets
@@ -579,16 +584,37 @@ class GPSTrackerConnection:
     
     async def handle(self):
         """Handle GPS tracker connection"""
+        login_deadline = asyncio.get_running_loop().time() + settings.TCP_LOGIN_TIMEOUT_SECONDS
         try:
             while True:
                 # Read data from tracker
-                data = await self.reader.read(1024)
-                
+                if self.authenticated:
+                    data = await self.reader.read(1024)
+                else:
+                    # Seen live 2026-10-29: a tracker opened a socket every
+                    # ~52s and none ever logged in; each was left open
+                    # forever, and nothing said what (if anything) it sent.
+                    remaining = login_deadline - asyncio.get_running_loop().time()
+                    try:
+                        data = await asyncio.wait_for(self.reader.read(1024), timeout=max(remaining, 0))
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            f"No login from {self.address} within {settings.TCP_LOGIN_TIMEOUT_SECONDS:.0f}s — "
+                            f"closing. {self._describe_pre_login_bytes()}"
+                        )
+                        break
+
                 if not data:
-                    logger.info(f"Connection closed by {self.address}")
+                    if self.authenticated:
+                        logger.info(f"Connection closed by {self.address}")
+                    else:
+                        logger.info(f"Connection closed by {self.address} before login. {self._describe_pre_login_bytes()}")
                     break
-                
+
                 self.last_activity = datetime.utcnow()
+                if not self.authenticated:
+                    self._pre_login_total += len(data)
+                    self._pre_login_bytes.extend(data[:max(0, 64 - len(self._pre_login_bytes))])
                 self.buffer.extend(data)
                 
                 # Process complete packets in buffer
@@ -612,6 +638,12 @@ class GPSTrackerConnection:
         finally:
             await self.close()
     
+    def _describe_pre_login_bytes(self) -> str:
+        if not self._pre_login_total:
+            return "Received nothing."
+        return (f"Received {self._pre_login_total} byte(s), first: {bytes(self._pre_login_bytes).hex()} "
+                f"(expected a 7878 login packet).")
+
     async def process_buffer(self):
         """Process packets in the buffer"""
         while len(self.buffer) >= 7:  # Minimum packet size

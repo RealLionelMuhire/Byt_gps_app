@@ -140,3 +140,65 @@ async def test_a_reset_by_the_tracker_is_logged_as_info_not_an_error(env, db_ses
     assert IMEI not in server.device_connections
     db_session.refresh(device)
     assert device.status == "offline"
+
+
+def _unauthenticated(server, reader):
+    return GPSTrackerConnection(reader=reader, writer=_Writer(), address=("1.2.3.4", 9), server=server)
+
+
+async def test_a_socket_that_never_logs_in_is_closed_and_says_what_it_sent(env, monkeypatch, caplog):
+    server, _ = env
+    monkeypatch.setattr(tcp_server_module.settings, "TCP_LOGIN_TIMEOUT_SECONDS", 0.05)
+
+    class _UnknownThenSilent:
+        def __init__(self):
+            self.sent = False
+
+        async def read(self, _n):
+            if not self.sent:
+                self.sent = True
+                return bytes.fromhex("79790011") + b"\x00" * 4
+            await asyncio.sleep(10)
+
+    conn = _unauthenticated(server, _UnknownThenSilent())
+    with caplog.at_level("INFO", logger=tcp_server_module.logger.name):
+        await asyncio.wait_for(conn.handle(), timeout=2)
+
+    assert conn.writer.closed
+    [warning] = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert "No login from" in warning
+    assert "Received 8 byte(s), first: 7979001100000000" in warning
+
+
+async def test_a_silent_socket_is_closed_too(env, monkeypatch, caplog):
+    server, _ = env
+    monkeypatch.setattr(tcp_server_module.settings, "TCP_LOGIN_TIMEOUT_SECONDS", 0.05)
+
+    class _Silent:
+        async def read(self, _n):
+            await asyncio.sleep(10)
+
+    conn = _unauthenticated(server, _Silent())
+    with caplog.at_level("INFO", logger=tcp_server_module.logger.name):
+        await asyncio.wait_for(conn.handle(), timeout=2)
+
+    assert conn.writer.closed
+    assert any("Received nothing." in r.getMessage() for r in caplog.records if r.levelname == "WARNING")
+
+
+async def test_a_logged_in_tracker_is_never_timed_out(env, monkeypatch, caplog):
+    server, _ = env
+    monkeypatch.setattr(tcp_server_module.settings, "TCP_LOGIN_TIMEOUT_SECONDS", 0.01)
+
+    class _SlowThenEOF:
+        async def read(self, _n):
+            await asyncio.sleep(0.1)  # quiet for longer than the login timeout
+            return b""
+
+    conn = _logged_in(server, 1, reader=_SlowThenEOF())
+    with caplog.at_level("INFO", logger=tcp_server_module.logger.name):
+        await conn.handle()
+
+    messages = [r.getMessage() for r in caplog.records]
+    assert not any("No login from" in m for m in messages)
+    assert "Connection closed by ('1.2.3.4', 1)" in messages  # ended by the tracker, not the timeout
