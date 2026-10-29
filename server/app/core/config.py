@@ -87,7 +87,7 @@ class Settings(BaseSettings):
     WEB_APP_URL: str = "http://localhost:3000"
     # Shown in customer emails as the place to ask for help (payment
     # problems, refunds). Track IQ is a Bythron product.
-    SUPPORT_EMAIL: str = "support@bythron.tech"
+    SUPPORT_EMAIL: str = "contact@bythron.tech"
     # Customer-facing dates in emails are shown in this fixed UTC offset —
     # Rwanda (CAT, UTC+2, no daylight saving), where every customer pays.
     DISPLAY_UTC_OFFSET_HOURS: int = 2
@@ -128,7 +128,7 @@ class Settings(BaseSettings):
     TRIP_AUTO_END_STALE_SECONDS: int = 300  # Same as offline timeout; end trip if no update
 
     # Nominatim (OpenStreetMap) reverse geocoding
-    NOMINATIM_USER_AGENT: str = "BYThron-GPS/1.0 (contact@bythron.com)"
+    NOMINATIM_USER_AGENT: str = "BYThron-GPS/1.0 (contact@bythron.tech)"
     NOMINATIM_BASE_URL: str = "https://nominatim.openstreetmap.org"
     NOMINATIM_TIMEOUT_SECONDS: float = 5.0
 
