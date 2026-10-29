@@ -593,6 +593,12 @@ class GPSTrackerConnection:
                 
                 # Process complete packets in buffer
                 await self.process_buffer()
+
+                # Self-heal: this socket is demonstrably alive, so commands
+                # must be able to reach it — re-claim the registry slot if a
+                # stale socket's cleanup (or anything else) lost it.
+                if self.authenticated and self.device_imei:
+                    self.server.ensure_registered(self.device_imei, self)
         
         except asyncio.CancelledError:
             logger.info(f"Connection cancelled for {self.address}")
@@ -1065,8 +1071,14 @@ class GPSTrackerConnection:
         if self._relay_confirm_task is not None and not self._relay_confirm_task.done():
             self._relay_confirm_task.cancel()
         try:
-            if self.device_imei:
-                self.server.unregister_device(self.device_imei)
+            # Only the CURRENT connection for this IMEI may mark the device
+            # offline. A tracker that silently lost its mobile link reconnects
+            # on a new socket while the old one is still open; when the old
+            # one finally dies, its cleanup used to unregister the new
+            # connection (every command then failed "Device not connected"
+            # while fixes kept arriving), mark the device offline and end its
+            # trip — until the tracker happened to reconnect again.
+            if self.device_imei and self.server.unregister_device(self.device_imei, self):
                 
                 # Update device status and end any active trips
                 db = SessionLocal()
@@ -1148,15 +1160,41 @@ class TCPServer:
             self.connections.discard(connection)
     
     def register_device(self, imei: str, connection: GPSTrackerConnection):
-        """Register device connection"""
+        """Register device connection (newest login wins).
+
+        A previous socket for the same IMEI is a half-open leftover from a
+        dropped mobile link — the tracker has only one modem — so it's
+        closed now rather than left to time out and race the cleanup.
+        """
+        previous = self.device_connections.get(imei)
         self.device_connections[imei] = connection
+        if previous is not None and previous is not connection:
+            logger.info(f"Device {imei} reconnected from {connection.address}; closing stale socket {previous.address}")
+            try:
+                previous.writer.close()
+            except Exception:
+                pass
         logger.info(f"Registered device: {imei} (total: {len(self.device_connections)})")
+
+    def ensure_registered(self, imei: str, connection: GPSTrackerConnection):
+        """Re-register a live, authenticated connection that lost its slot."""
+        if self.device_connections.get(imei) is not connection:
+            logger.warning(f"Device {imei} was sending on an unregistered connection {connection.address}; re-registering")
+            self.register_device(imei, connection)
     
-    def unregister_device(self, imei: str):
-        """Unregister device connection"""
-        if imei in self.device_connections:
-            del self.device_connections[imei]
-            logger.info(f"Unregistered device: {imei} (total: {len(self.device_connections)})")
+    def unregister_device(self, imei: str, connection: Optional[GPSTrackerConnection] = None) -> bool:
+        """Unregister a device connection.
+
+        With `connection`, only removes the entry if it still points at that
+        connection — a stale socket closing must never unregister the
+        tracker's newer one. Returns True if an entry was removed.
+        """
+        current = self.device_connections.get(imei)
+        if current is None or (connection is not None and current is not connection):
+            return False
+        del self.device_connections[imei]
+        logger.info(f"Unregistered device: {imei} (total: {len(self.device_connections)})")
+        return True
     
     async def broadcast_location_update(self, device_id: int, data: Dict):
         """Broadcast location update to all WebSocket subscribers of this device."""
