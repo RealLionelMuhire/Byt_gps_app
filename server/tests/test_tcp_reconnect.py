@@ -114,3 +114,29 @@ async def test_live_connection_reclaims_a_lost_registry_slot(env):
     await conn.handle()
 
     assert seen_registered == [conn], "incoming data re-registers the connection"
+
+
+async def test_a_reset_by_the_tracker_is_logged_as_info_not_an_error(env, db_session, caplog):
+    server, device = env
+
+    class _ResetReader:
+        async def read(self, _n):
+            raise ConnectionResetError(104, "Connection reset by peer")
+
+    class _ResetWriter(_Writer):
+        async def wait_closed(self):
+            raise ConnectionResetError(104, "Connection reset by peer")
+
+    conn = _logged_in(server, 1, reader=_ResetReader())
+    conn.writer = _ResetWriter()
+
+    with caplog.at_level("INFO", logger=tcp_server_module.logger.name):
+        await conn.handle()
+
+    assert not [r for r in caplog.records if r.levelname == "ERROR"]
+    assert any("Connection lost from" in r.getMessage() and r.levelname == "INFO" for r in caplog.records)
+    assert any("Connection closed for" in r.getMessage() for r in caplog.records)
+    # The cleanup still ran.
+    assert IMEI not in server.device_connections
+    db_session.refresh(device)
+    assert device.status == "offline"

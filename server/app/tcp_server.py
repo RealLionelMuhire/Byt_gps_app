@@ -602,6 +602,11 @@ class GPSTrackerConnection:
         
         except asyncio.CancelledError:
             logger.info(f"Connection cancelled for {self.address}")
+        except ConnectionError as e:
+            # The tracker's modem (or the carrier's NAT) dropped the link —
+            # routine for cellular trackers, which reconnect within a second.
+            # Not a server error, so no traceback.
+            logger.info(f"Connection lost from {self.address} ({self.device_imei or 'not logged in'}): {e}")
         except Exception as e:
             logger.error(f"Error handling connection from {self.address}: {e}", exc_info=True)
         finally:
@@ -1096,7 +1101,10 @@ class GPSTrackerConnection:
                     db.close()
             
             self.writer.close()
-            await self.writer.wait_closed()
+            try:
+                await self.writer.wait_closed()
+            except ConnectionError:
+                pass  # already reset by the tracker — nothing left to close
             logger.info(f"Connection closed for {self.address}")
         
         except Exception as e:
