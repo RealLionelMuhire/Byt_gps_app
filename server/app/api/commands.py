@@ -2,7 +2,7 @@
 
 import time
 from collections import defaultdict
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException, Request
 from sqlalchemy.orm import Session
@@ -17,6 +17,10 @@ from app.models.device import Device
 from app.models.user import User
 from app.services.entitlements import require_feature
 from app.services.relay_state import relay_state_payload
+from app.services.tracker_capabilities import CAPABILITIES, capability_payload
+from app.services.tracker_models import (
+    CommandNotSupported, InvalidCommandParams, TrackerProfile, profile_for_device,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -24,15 +28,11 @@ router = APIRouter()
 
 # ── CommandSettings enforcement (confirmation, admin_only, fuel_cut_enabled, rate limit) ──
 
-# The one destructive command in this file — RELAY,1# immobilizes the
-# vehicle. Confirmed against the actual G900LS J16-4G command list (the
-# production hardware — docs/usage/CONFIGURATION_GUIDE.md's "Device 2"
-# section, Fuel/Relay Control): `RELAY,1#` = cut, `RELAY,0#` = resume. The
-# previous DYD,000000#/HFYD,000000# pair came from a generic external GT06
-# protocol spec appendix and does not match this hardware's actual firmware
-# vocabulary — replaced 2026-09-01 after checking against the vendor's own
-# G900LS command sheet.
-_CUT_FUEL_COMMAND = "RELAY,1#"
+# Every endpoint below names a capability (fuel.cut, location.query, ...)
+# and the device's tracker model supplies the exact command text — see
+# app/services/tracker_models.py. The one destructive capability is
+# fuel.cut (RELAY,1# on the G900LS, stop123456 on the TK903ELE).
+_FUEL_CAPABILITIES = {"fuel.cut", "fuel.restore", "fuel.query"}
 
 
 class _DefaultCommandSettings:
@@ -71,7 +71,7 @@ def _check_command_rate_limit(device_id: int, limit: int) -> None:
     _command_attempts[device_id].append(now)
 
 
-def _enforce_command_policy(db: Session, device: Device, user: User, command: str) -> None:
+def _enforce_command_policy(db: Session, device: Device, user: User, capability: str | None) -> None:
     """
     Apply CommandSettings policy to an outgoing command for `device`. Raises
     HTTPException on violation. Called after require_device_access(), so
@@ -86,7 +86,7 @@ def _enforce_command_policy(db: Session, device: Device, user: User, command: st
     if settings.admin_only and not user.is_admin:
         raise HTTPException(status_code=403, detail="Only an admin may send commands to this device")
 
-    if not settings.fuel_cut_enabled and command.strip().upper() == _CUT_FUEL_COMMAND:
+    if not settings.fuel_cut_enabled and capability == "fuel.cut":
         raise HTTPException(status_code=403, detail="Fuel cut is disabled for this device")
 
     _check_command_rate_limit(device.id, settings.commands_per_hour)
@@ -229,7 +229,10 @@ async def send_raw_command(
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
     require_device_access(device, user)
-    _enforce_command_policy(db, device, user, body.command)
+    # A raw command that IS this model's fuel cut still gets the fuel-cut
+    # policy (fuel_cut_enabled) and the relay state in the response.
+    capability = profile_for_device(db, device).classify(body.command)
+    _enforce_command_policy(db, device, user, capability)
 
     tcp = _get_tcp_server(request)
     result = await tcp.send_command_to_device(device.imei, body.command, user_id=user.id)
@@ -237,13 +240,17 @@ async def send_raw_command(
     if not result.get("success"):
         raise HTTPException(status_code=409, detail=result.get("error", "Command failed"))
 
-    return {
+    response = {
         "device_id": device.id,
         "imei": device.imei,
         "command_sent": body.command,
         "device_response": result.get("response"),
         "note": result.get("note"),
     }
+    if capability in _FUEL_CAPABILITIES:
+        db.refresh(device)
+        response.update(relay_state_payload(device))
+    return response
 
 
 # ── Convenience endpoints for common alarm operations ──────────────────────
@@ -278,8 +285,9 @@ async def toggle_vibration_alarm(
     user: User = Depends(get_current_user),
 ):
     """Enable or disable the vibration/motion-sensor alarm (SENALM)."""
-    cmd = f"SENALM,ON,{body.mode}#" if body.enabled else "SENALM,OFF#"
-    return await _send(device_id, cmd, "vibration alarm", request, db, user)
+    if body.enabled:
+        return await _send(device_id, "alarm.vibration.on", "vibration alarm", request, db, user, {"mode": body.mode})
+    return await _send(device_id, "alarm.vibration.off", "vibration alarm", request, db, user)
 
 
 @router.post("/{device_id}/alarm/power-cut", dependencies=[require_feature("commands.alarm_config")])
@@ -295,12 +303,11 @@ async def toggle_power_cut_alarm(
     (the G900LS command list has no such command); previously exposed here
     as "low battery", which was the wrong description for this command.
     """
-    cmd = (
-        f"POWERALM,ON,{body.mode},{body.detect_seconds},{body.min_charge_seconds},#"
-        if body.enabled
-        else "POWERALM,OFF#"
-    )
-    return await _send(device_id, cmd, "power cut alarm", request, db, user)
+    if body.enabled:
+        params = {"mode": body.mode, "detect_seconds": body.detect_seconds,
+                  "min_charge_seconds": body.min_charge_seconds}
+        return await _send(device_id, "alarm.power_cut.on", "power cut alarm", request, db, user, params)
+    return await _send(device_id, "alarm.power_cut.off", "power cut alarm", request, db, user)
 
 
 @router.post("/{device_id}/alarm/ignition-on", dependencies=[require_feature("commands.alarm_config")])
@@ -316,8 +323,9 @@ async def toggle_ignition_on_alarm(
     the G900LS models these as two separate, separately-armable alarms,
     not one "ignition changed" alarm.
     """
-    cmd = f"ACCALM,ON,{body.mode}#" if body.enabled else "ACCALM,OFF#"
-    return await _send(device_id, cmd, "ignition-on alarm", request, db, user)
+    if body.enabled:
+        return await _send(device_id, "alarm.ignition_on.on", "ignition-on alarm", request, db, user, {"mode": body.mode})
+    return await _send(device_id, "alarm.ignition_on.off", "ignition-on alarm", request, db, user)
 
 
 @router.post("/{device_id}/alarm/ignition-off", dependencies=[require_feature("commands.alarm_config")])
@@ -332,8 +340,9 @@ async def toggle_ignition_off_alarm(
     ACC turns off. See toggle_ignition_on_alarm's doc for why this is a
     separate endpoint rather than a second field on that one.
     """
-    cmd = f"ACCOFFALM,ON,{body.mode}#" if body.enabled else "ACCOFFALM,OFF#"
-    return await _send(device_id, cmd, "ignition-off alarm", request, db, user)
+    if body.enabled:
+        return await _send(device_id, "alarm.ignition_off.on", "ignition-off alarm", request, db, user, {"mode": body.mode})
+    return await _send(device_id, "alarm.ignition_off.off", "ignition-off alarm", request, db, user)
 
 
 class FuelCutRequest(BaseModel):
@@ -369,7 +378,7 @@ async def cut_fuel(
             detail='Fuel cut requires confirmation — resend with {"confirm": true}',
         )
 
-    return await _send(device_id, _CUT_FUEL_COMMAND, "cut fuel", request, db, user)
+    return await _send(device_id, "fuel.cut", "cut fuel", request, db, user)
 
 
 @router.post("/{device_id}/fuel/restore", dependencies=[require_feature("commands.fuel_cut")])
@@ -380,7 +389,7 @@ async def restore_fuel(
     user: User = Depends(get_current_user),
 ):
     """Restore fuel/relay (re-enable vehicle) via RELAY,0#."""
-    return await _send(device_id, "RELAY,0#", "restore fuel", request, db, user)
+    return await _send(device_id, "fuel.restore", "restore fuel", request, db, user)
 
 
 @router.post("/{device_id}/query/relay", dependencies=[require_feature("commands.fuel_cut")])
@@ -396,7 +405,7 @@ async def query_relay(
     itself reported (heartbeat bit 7 — see app/services/relay_state.py).
     Same feature gate as cut/restore: anyone allowed to cut fuel must be
     able to check whether it's cut."""
-    return await _send(device_id, "RELAY#", "query relay", request, db, user)
+    return await _send(device_id, "fuel.query", "query relay", request, db, user)
 
 
 @router.post("/{device_id}/query/location", dependencies=[require_feature("commands.query")])
@@ -407,7 +416,7 @@ async def query_location(
     user: User = Depends(get_current_user),
 ):
     """Query current location from device via WHERE# (G900LS command list — returns latitude/longitude by SMS reply)."""
-    return await _send(device_id, "WHERE#", "query location", request, db, user)
+    return await _send(device_id, "location.query", "query location", request, db, user)
 
 
 @router.post("/{device_id}/query/status", dependencies=[require_feature("commands.query")])
@@ -418,7 +427,44 @@ async def query_status(
     user: User = Depends(get_current_user),
 ):
     """Query current device status (battery, GPS, GSM, ACC)."""
-    return await _send(device_id, "STATUS#", "query status", request, db, user)
+    return await _send(device_id, "status.query", "query status", request, db, user)
+
+
+@router.get("/{device_id}/capabilities")
+async def get_device_capabilities(
+    device_id: int,
+    db: Session = Depends(get_db),
+    user: User = Depends(get_current_user),
+):
+    """What this tracker can do, for the apps to render only controls that
+    will work: the device's tracker model and its capabilities, each with
+    the catalog's label/params. Customers get only verified, customer-
+    visible capabilities; admins get every one the model has (with
+    `verified`) plus its admin-only extras."""
+    device = db.query(Device).filter(Device.id == device_id).first()
+    if not device:
+        raise HTTPException(status_code=404, detail="Device not found")
+    require_device_access(device, user)
+    profile = profile_for_device(db, device)
+
+    capabilities = []
+    for cap in CAPABILITIES:
+        cmd = profile.command(cap.key)
+        if cmd is None:
+            continue
+        if not user.is_admin and not (cmd.verified and cap.customer_visible):
+            continue
+        capabilities.append({**capability_payload(cap), "verified": cmd.verified})
+    extras = [
+        {"key": c.key, "label": c.label or c.key, "verified": c.verified}
+        for c in profile.commands.values() if c.key.startswith("extra.")
+    ] if user.is_admin else []
+    return {
+        "device_id": device.id,
+        "tracker_model": {"id": profile.model_id, "name": profile.name},
+        "capabilities": capabilities,
+        "extras": extras,
+    }
 
 
 @router.get("/{device_id}/command_log")
@@ -463,19 +509,39 @@ async def get_command_log(
 # ── Helper ─────────────────────────────────────────────────────────────────
 
 
+def resolve_command(profile: TrackerProfile, key: str, user: User, params: Optional[dict] = None) -> str:
+    """The exact command text `key` means on this tracker model, or the
+    HTTP error to give instead: 422 when the model doesn't have it (never
+    send another model's command), 403 for a customer when it hasn't been
+    verified on a real tracker of this model yet."""
+    cmd = profile.command(key)
+    if cmd is None:
+        raise HTTPException(status_code=422, detail=f"{profile.name} trackers don't support this command.")
+    if not cmd.verified and not user.is_admin:
+        raise HTTPException(status_code=403, detail=f"This command hasn't been verified on {profile.name} trackers yet.")
+    try:
+        return profile.render(key, params)
+    except InvalidCommandParams as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+    except CommandNotSupported as exc:
+        raise HTTPException(status_code=422, detail=str(exc))
+
+
 async def _send(
     device_id: int,
-    command: str,
+    capability: str,
     label: str,
     request: Request,
     db: Session,
     user: User,
+    params: Optional[dict] = None,
 ) -> dict:
     device = db.query(Device).filter(Device.id == device_id).first()
     if not device:
         raise HTTPException(status_code=404, detail="Device not found")
     require_device_access(device, user)
-    _enforce_command_policy(db, device, user, command)
+    command = resolve_command(profile_for_device(db, device), capability, user, params)
+    _enforce_command_policy(db, device, user, capability)
 
     tcp = _get_tcp_server(request)
     result = await tcp.send_command_to_device(device.imei, command, user_id=user.id)
@@ -491,7 +557,7 @@ async def _send(
         "device_response": result.get("response"),
         "note": result.get("note"),
     }
-    if command.upper().startswith("RELAY"):
+    if capability in _FUEL_CAPABILITIES:
         # The tracker's own last-reported relay state, re-read after the
         # command (a heartbeat may have landed while we waited). Clients
         # confirm a cut/restore against THIS, never against the command

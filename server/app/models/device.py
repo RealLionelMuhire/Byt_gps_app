@@ -40,7 +40,10 @@ class Device(Base):
     description = Column(String(500), nullable=True)
     pairing_pin = Column(String(8), nullable=True)  # Secret PIN printed inside device box
     sim_number = Column(String(20), nullable=True)   # Phone number of the SIM card inside device
-    hardware_model = Column(String(50), nullable=True) # e.g. 'G900LS J16-4G', 'TK903ELE'
+    hardware_model = Column(String(50), nullable=True) # e.g. 'G900LS J16-4G', 'TK903ELE' — free-text label only
+    # Which command vocabulary this tracker speaks (migration 057). NULL =
+    # the default model — see app/services/tracker_models.py.
+    tracker_model_id = Column(Integer, ForeignKey('tracker_models.id', ondelete='SET NULL'), nullable=True, index=True)
     sim_renewal_date = Column(DateTime, nullable=True) # When the SIM airtime/data expires
 
     # Map marker glyph. Values: 'arrow' (default) | 'sedan' | 'truck_small' |
@@ -121,6 +124,7 @@ class Device(Base):
     # Relationships
     user = relationship("User", backref="devices")
     plan = relationship("SubscriptionPlan", foreign_keys=[plan_id])  # deprecated, see plan_id above
+    tracker_model = relationship("TrackerModel")
     locations = relationship("Location", back_populates="device", cascade="all, delete-orphan")
 
     def __repr__(self):

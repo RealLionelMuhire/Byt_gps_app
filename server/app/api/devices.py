@@ -17,6 +17,7 @@ from app.core.serialization import UtcDateTime
 from app.core.auth import require_auth, require_admin, get_current_user, require_device_access
 from app.models.alert_settings import AlertSettings
 from app.models.device import Device
+from app.models.tracker_model import TrackerModel
 from app.models.location import Location
 from app.models.trip import Trip
 from app.models.vehicle import Vehicle
@@ -68,6 +69,7 @@ class DeviceBase(BaseModel):
 class DeviceCreate(DeviceBase):
     imei: str
     pairing_pin: Optional[str] = None  # Auto-generated if omitted
+    tracker_model_id: Optional[int] = None  # None = the default model (app/services/tracker_models.py)
 
 
 class DeviceUpdate(DeviceBase):
@@ -152,6 +154,7 @@ class DeviceResponse(DeviceBase):
     lifecycle: str              # registered | in_stock | sold
     status: str
     user_id: Optional[int]
+    tracker_model_id: Optional[int] = None  # None = the default model
     plan_id: Optional[int] = None
     plan: Optional[SubscriptionPlanResponse] = None  # Linked subscription scheme
     subscription: Optional[DeviceSubscriptionInfo] = None  # Owner's payment/subscription mode
@@ -748,11 +751,18 @@ async def create_device(
         alphabet = string.ascii_uppercase + string.digits
         pin = "".join(secrets.choice(alphabet) for _ in range(6))
 
+    if device_data.tracker_model_id is not None:
+        model = db.query(TrackerModel).filter(TrackerModel.id == device_data.tracker_model_id).first()
+        if model is None or not model.is_active:
+            raise HTTPException(status_code=422, detail="Unknown or deactivated tracker model")
+
     device = Device(
         imei=device_data.imei,
         name=device_data.name or f"Tracker-{device_data.imei[-6:]}",
         description=device_data.description,
         sim_number=device_data.sim_number,
+        hardware_model=device_data.hardware_model,
+        tracker_model_id=device_data.tracker_model_id,
         pairing_pin=pin,
         lifecycle='registered',  # Starts as 'registered' until TCP handshake received
         user_id=None,

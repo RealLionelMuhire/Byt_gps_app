@@ -45,6 +45,7 @@ from typing import Any, Iterable, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import StreamingResponse
 from sqlalchemy import and_, case, func, literal_column, or_, select
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session, joinedload
 
 from app.core.auth import require_admin
@@ -56,6 +57,7 @@ from app.models.location import Location
 from app.models.subscription import (
     Payment, Subscription, SubscriptionPlan, SubscriptionReminder, SubscriptionVehicle,
 )
+from app.models.tracker_model import TrackerModel
 from app.models.trip import Trip
 from app.models.user import Role, User
 from app.models.vehicle import Vehicle
@@ -902,6 +904,19 @@ async def client_detail(
 INVENTORY_SORTS = {"name", "imei", "lifecycle", "connectivity", "last_update", "owner_name", "created_at"}
 
 
+def _tracker_model_names(db: Session) -> tuple[dict, Optional[str]]:
+    """{model id: name} and the default model's name (what a device with
+    no model uses). Empty if migration 057 hasn't run — inventory must
+    still load."""
+    try:
+        models = db.query(TrackerModel).all()
+    except SQLAlchemyError:
+        db.rollback()
+        return {}, None
+    default = next((m.name for m in models if m.is_default and m.is_active), None)
+    return {m.id: m.name for m in models}, default
+
+
 def _inventory_rows(db: Session, now: datetime) -> list[dict]:
     devices = db.query(Device, User).outerjoin(User, User.id == Device.user_id).all()
     rn = func.row_number().over(
@@ -918,6 +933,8 @@ def _inventory_rows(db: Session, now: datetime) -> list[dict]:
         .filter(SubscriptionVehicle.subscription_id.in_(active_sub_ids))
     } if active_sub_ids else set()
 
+    model_names, default_model_name = _tracker_model_names(db)
+
     rows = []
     for d, u in devices:
         v = vehicles.get(d.id)
@@ -925,6 +942,8 @@ def _inventory_rows(db: Session, now: datetime) -> list[dict]:
         conn = _connectivity(d.last_update, now)
         rows.append({
             "id": d.id, "imei": d.imei, "name": d.name, "hardware_model": d.hardware_model,
+            "tracker_model_id": d.tracker_model_id,
+            "tracker_model_name": model_names.get(d.tracker_model_id, default_model_name),
             "sim_number": d.sim_number, "sim_renewal_date": d.sim_renewal_date,
             "lifecycle": d.lifecycle, "sold": d.user_id is not None,
             "connectivity": conn, "last_update": d.last_update, "last_connect": d.last_connect,

@@ -11,7 +11,7 @@ be wired).
 
 import re
 from datetime import datetime
-from typing import Optional
+from typing import Dict, Optional
 
 from app.models.device import Device
 
@@ -59,16 +59,38 @@ _FAILURE_WORDS = ("fail", "error", "invalid", "not support", "unsupport", "denie
 _DEFERRED_WORDS = ("will be executed", "no longer execute", "after speed")
 
 
-def is_deferred_relay_reply(text: Optional[str]) -> bool:
-    """The tracker accepted a cut/restore but will apply it later."""
-    return bool(text) and any(word in text.lower() for word in _DEFERRED_WORDS)
+def _model_match(patterns: Optional[Dict[str, str]], name: str, text: str) -> bool:
+    pattern = (patterns or {}).get(name)
+    if not pattern:
+        return False
+    try:
+        return re.search(pattern, text, re.IGNORECASE | re.DOTALL) is not None
+    except re.error:
+        return False
 
 
-def parse_relay_reply(text: Optional[str]) -> Optional[bool]:
+def is_deferred_relay_reply(text: Optional[str], patterns: Optional[Dict[str, str]] = None) -> bool:
+    """The tracker accepted a cut/restore but will apply it later.
+    `patterns` are the tracker model's own reply patterns (TrackerModel.
+    reply_patterns), checked before the built-in G900LS wording."""
+    if not text:
+        return False
+    return _model_match(patterns, "relay_deferred", text) or any(word in text.lower() for word in _DEFERRED_WORDS)
+
+
+def parse_relay_reply(text: Optional[str], patterns: Optional[Dict[str, str]] = None) -> Optional[bool]:
     """The relay output state a tracker reply STATES as current, or None
-    when it doesn't (deferred, pending, failed, or unrelated replies)."""
+    when it doesn't (deferred, pending, failed, or unrelated replies).
+    A model's own relay_cut/relay_restored patterns win over the built-in
+    G900LS rules below."""
     if not text:
         return None
+    if _model_match(patterns, "relay_deferred", text):
+        return None
+    if _model_match(patterns, "relay_cut", text):
+        return True
+    if _model_match(patterns, "relay_restored", text):
+        return False
     lowered = text.lower()
     if any(word in lowered for word in _FAILURE_WORDS) or is_deferred_relay_reply(text):
         return None

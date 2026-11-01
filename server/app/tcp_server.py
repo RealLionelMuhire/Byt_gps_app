@@ -24,6 +24,7 @@ from app.services.geofencing import evaluate_geofences, GeofenceTransition
 from app.services.speed_limit import evaluate_speed_limit, is_evaluable_fix, track_overspeed_episode
 from app.services.live_position import resolve_live_position
 from app.services.relay_state import apply_relay_report, is_deferred_relay_reply, parse_relay_reply, relay_state_payload
+from app.services.tracker_models import BUILTIN_G900LS, RELAY_CAPABILITIES, TrackerProfile, profile_for_imei
 from app.models.command_log import CommandLog
 from app.services.geocoding import reverse_geocode, format_fallback_location
 from app.core.config import settings
@@ -274,16 +275,6 @@ async def _resolve_overspeed_road_name(location_or_lat, lon: Optional[float] = N
         logger.warning("Overspeed road-name lookup failed/timed out: %s", e)
         name = None
     return name or format_fallback_location(latitude, longitude)
-
-
-def _relay_target(command: Optional[str]) -> Optional[bool]:
-    """True for a cut (RELAY,1#), False for a restore (RELAY,0#), else None."""
-    normalized = (command or "").replace(" ", "").upper()
-    if normalized.startswith("RELAY,1"):
-        return True
-    if normalized.startswith("RELAY,0"):
-        return False
-    return None
 
 
 def _db_handle_login(imei: str) -> Optional[dict]:
@@ -554,6 +545,11 @@ class GPSTrackerConnection:
         # handle_command_response() decide whether to parse the reply as a
         # location fix (see parse_where_reply). Set by send_command().
         self._pending_command: Optional[str] = None
+        self._pending_capability: Optional[str] = None
+        # The tracker model's command vocabulary, reloaded on every command
+        # sent (models are edited in the admin portal) — see
+        # app/services/tracker_models.py. Until then, the built-in G900LS.
+        self._profile: TrackerProfile = BUILTIN_G900LS
         # Serializes send_command() calls on this connection: GT06 command
         # responses carry a serial number, but it's the device's own
         # independent outgoing-packet counter (see parse_command_response),
@@ -861,7 +857,7 @@ class GPSTrackerConnection:
 
         # Which command does this reply answer? See _recent_flags' doc.
         if reply_flag in self._recent_flags:
-            log_id, command = self._recent_flags[reply_flag]
+            log_id, command, capability = self._recent_flags[reply_flag]
             is_current = reply_flag == self._pending_flag
             outcome = "replied" if is_current else "late_reply"
         elif self._pending_command is not None:
@@ -869,17 +865,20 @@ class GPSTrackerConnection:
             # "next reply belongs to the in-flight command" behavior, but
             # record that the match is unverified.
             log_id, command, is_current, outcome = self._pending_log_id, self._pending_command, True, "replied_unverified"
+            capability = self._pending_capability or self._profile.classify(command)
         else:
             log_id, command, is_current, outcome = None, None, False, "unmatched"
+            capability = None
         if outcome != "replied":
             logger.warning(f"Reply from {self.device_imei} recorded as {outcome} (flag {reply_flag}): {content}")
         self._log_command_reply(log_id, content, reply_flag, outcome)
+        patterns = self._profile.reply_patterns
         await self._apply_relay_from_reply(content)
-        target = _relay_target(command)
-        if target is not None and parse_relay_reply(content) is None and is_deferred_relay_reply(content):
+        target = RELAY_CAPABILITIES.get(capability)
+        if target is not None and parse_relay_reply(content, patterns) is None and is_deferred_relay_reply(content, patterns):
             self._start_relay_confirmation(target)
 
-        if is_current and command == "WHERE#":
+        if is_current and capability == "location.query":
             parsed = self.parser.parse_where_reply(content)
             if parsed:
                 if self.authenticated and self.device_imei:
@@ -984,7 +983,7 @@ class GPSTrackerConnection:
         """A reply that states the relay state ("RELAY:0", "Stop engine
         succeed RELAY 1 OK") is the tracker's own report — apply it now
         instead of waiting up to a heartbeat (~5 min) for bit 7."""
-        cut = parse_relay_reply(content)
+        cut = parse_relay_reply(content, self._profile.reply_patterns)
         if cut is None or not self.device_imei:
             return
         db = SessionLocal()
@@ -1023,7 +1022,8 @@ class GPSTrackerConnection:
             db.close()
 
     async def _confirm_relay_change(self, target_cut: bool) -> None:
-        """Ask the tracker RELAY# periodically until it reports
+        """Ask the tracker (its model's fuel.query, RELAY# on a G900LS)
+        periodically until it reports
         `target_cut` (each reply updates Device.relay_cut and is pushed to
         the apps via _apply_relay_from_reply), or give up after
         RELAY_CONFIRM_MAX_CHECKS. Logged in command_log with no user."""
@@ -1032,10 +1032,15 @@ class GPSTrackerConnection:
                 await asyncio.sleep(self.RELAY_CONFIRM_INTERVAL_S)
                 if self._current_relay_cut() == target_cut:
                     return
-                result = await self.send_command("RELAY#", timeout=10.0)
+                if self._profile.command("fuel.query") is None:
+                    # This model can't be asked — the heartbeat's relay bit
+                    # (~5 min) is the only confirmation.
+                    logger.info(f"{self.device_imei}: {self._profile.name} has no fuel status query; waiting for heartbeat")
+                    return
+                result = await self.send_command(self._profile.render("fuel.query"), timeout=10.0)
                 if not result.get("success"):
                     return
-                if parse_relay_reply(result.get("response")) == target_cut:
+                if parse_relay_reply(result.get("response"), self._profile.reply_patterns) == target_cut:
                     return
             logger.warning(f"{self.device_imei}: relay still not {'cut' if target_cut else 'restored'} after follow-up checks")
         except asyncio.CancelledError:
@@ -1043,13 +1048,25 @@ class GPSTrackerConnection:
         except Exception as e:
             logger.error(f"Relay confirmation polling failed for {self.device_imei}: {e}")
 
+    def _load_profile(self) -> TrackerProfile:
+        db = SessionLocal()
+        try:
+            return profile_for_imei(db, self.device_imei)
+        except Exception as e:
+            logger.error(f"Could not load tracker model for {self.device_imei}: {e}")
+            return self._profile
+        finally:
+            db.close()
+
     async def send_command(self, command: str, timeout: float = 10.0, user_id: Optional[int] = None) -> Dict:
         """Send an ASCII command to the device (Protocol 0x80) and wait for the 0x15 response.
 
         Serialized per-connection via _command_lock — see its doc in
         __init__ for why (GT06 command responses can't be reliably
         correlated to a specific in-flight request)."""
-        if _relay_target(command) is not None and self._relay_confirm_task is not None:
+        self._profile = self._load_profile()
+        capability = self._profile.classify(command)
+        if capability in RELAY_CAPABILITIES and self._relay_confirm_task is not None:
             # A new cut/restore supersedes any follow-up for the old one.
             current = asyncio.current_task()
             if self._relay_confirm_task is not current and not self._relay_confirm_task.done():
@@ -1064,13 +1081,14 @@ class GPSTrackerConnection:
                 return {"success": False, "error": "Failed to build command packet"}
 
             log_id = self._log_command_sent(command, server_flag, user_id)
-            self._recent_flags[server_flag] = (log_id, command)
+            self._recent_flags[server_flag] = (log_id, command, capability)
             while len(self._recent_flags) > self._RECENT_FLAGS_KEPT:
                 self._recent_flags.popitem(last=False)
 
             loop = asyncio.get_event_loop()
             self._pending_response = loop.create_future()
             self._pending_command = command
+            self._pending_capability = capability
             self._pending_flag = server_flag
             self._pending_log_id = log_id
 
@@ -1091,6 +1109,7 @@ class GPSTrackerConnection:
             finally:
                 self._pending_response = None
                 self._pending_command = None
+                self._pending_capability = None
                 self._pending_flag = None
                 self._pending_log_id = None
     
