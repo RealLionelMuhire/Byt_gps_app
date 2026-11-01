@@ -20,5 +20,6 @@ from app.models.alarm_push_state import AlarmPushState
 from app.models.contact_request import ContactRequest
 from app.models.command_log import CommandLog
 from app.models.overspeed_episode import OverspeedEpisode
+from app.models.tracker_model import TrackerModel, TrackerModelCommand
 
-__all__ = ['Device', 'Location', 'LocationQualityLog', 'User', 'Geofence', 'GeofenceDeviceState', 'GeofenceDevice', 'GeofenceVersion', 'Feature', 'PlanFeature', 'EntitlementCheckLog', 'Trip', 'TripSettings', 'Vehicle', 'Subscription', 'Payment', 'SubscriptionVehicle', 'GeocodeCache', 'CommandSettings', 'AlertSettings', 'AlarmPushState', 'ContactRequest', 'CommandLog', 'OverspeedEpisode']
+__all__ = ['Device', 'Location', 'LocationQualityLog', 'User', 'Geofence', 'GeofenceDeviceState', 'GeofenceDevice', 'GeofenceVersion', 'Feature', 'PlanFeature', 'EntitlementCheckLog', 'Trip', 'TripSettings', 'Vehicle', 'Subscription', 'Payment', 'SubscriptionVehicle', 'GeocodeCache', 'CommandSettings', 'AlertSettings', 'AlarmPushState', 'ContactRequest', 'CommandLog', 'OverspeedEpisode', 'TrackerModel', 'TrackerModelCommand']

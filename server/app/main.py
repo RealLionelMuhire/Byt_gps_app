@@ -23,6 +23,7 @@ from app.api import entitlements
 from app.api import disbursements
 from app.api import admin_dashboard
 from app.api import reports
+from app.api import tracker_models
 from app import dashboard
 
 # Configure logging
@@ -192,6 +193,7 @@ app.include_router(entitlements.me_router, prefix="/api/me", tags=["entitlements
 app.include_router(entitlements.admin_router, prefix="/api/admin", tags=["entitlements"])
 app.include_router(contact_requests.router, prefix="/api/contact-requests", tags=["contact-requests"])
 app.include_router(reports.router,    prefix="/api/reports", tags=["reports"])
+app.include_router(tracker_models.router, prefix="/api/admin", tags=["tracker-models"])
 app.include_router(ws_module.router,  tags=["websocket"])
 app.include_router(dashboard.router,  tags=["dashboard"])
 
