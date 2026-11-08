@@ -40,6 +40,24 @@ def relay_state_payload(device: Device) -> dict:
     }
 
 
+def device_status_payload(device: Device) -> dict:
+    """Body of the WS `device_status` event: the relay state above plus the
+    tracker's connection and health, so the app's Commands screen stays in
+    sync without polling. Sent on every heartbeat (battery/GSM arrive
+    there, ~every 5 min), on login, when the tracker goes offline, and when
+    the relay state changes. `status` is "online" | "offline"; `last_update`
+    is the tracker's last packet of any kind.
+    """
+    last = device.last_update
+    return {
+        **relay_state_payload(device),
+        "status": device.status,
+        "battery_level": device.battery_level,
+        "gsm_signal": device.gsm_signal,
+        "last_update": last.isoformat() if last else None,
+    }
+
+
 # Real G900LS replies, from the production command_log (2026-10-16/17):
 #   RELAY#    -> "RELAY:0" / "RELAY:1"                       current output state
 #   RELAY,1#  -> "Stop engine succeed RELAY 1 OK"            cut NOW

@@ -23,6 +23,24 @@ class Settings(BaseSettings):
     # A tracker socket that hasn't logged in by then is closed (and what it
     # sent, if anything, is logged) — a GT06 tracker logs in first thing.
     TCP_LOGIN_TIMEOUT_SECONDS: float = 120.0
+    # A logged-in tracker that sends nothing for this long is treated as a
+    # dead link: the socket is closed and the device marked offline. The
+    # G900LS heartbeats every ~5 min, so this is 4 missed heartbeats. Seen
+    # live 2026-11-04: the link died at 10:17 but the socket stayed
+    # registered (and the device "online") for days.
+    TCP_IDLE_TIMEOUT_SECONDS: float = 1200.0
+
+    # Tracker watchdog (app/services/tracker_watchdog.py): pushes admins when
+    # a tracker that was reporting goes quiet. Faster when there's evidence
+    # the link is broken (sockets that open and send nothing, or repeated
+    # logins with no data — 2026-11-04..08), slower otherwise so a tracker
+    # that's simply asleep while parked doesn't page anyone at night.
+    TRACKER_WATCHDOG_INTERVAL_SECONDS: float = 300.0
+    TRACKER_SILENT_WITH_EVIDENCE_MINUTES: int = 30
+    TRACKER_SILENT_MINUTES: int = 120
+    # Devices silent for longer than this are not alerted on (long-retired
+    # or never-installed units).
+    TRACKER_WATCHDOG_MAX_SILENCE_DAYS: int = 7
     
     # Database
     DATABASE_URL: str = "postgresql://gps_user:gps_password@localhost:5432/gps_tracking"

@@ -7,7 +7,7 @@ Handles binary protocol communication
 import asyncio
 import logging
 import secrets
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from typing import Dict, List, Optional, Set
 from datetime import datetime, timedelta
 import struct
@@ -23,7 +23,12 @@ from app.api.locations import classify_outlier, compute_quality_log_fields, loca
 from app.services.geofencing import evaluate_geofences, GeofenceTransition
 from app.services.speed_limit import evaluate_speed_limit, is_evaluable_fix, track_overspeed_episode
 from app.services.live_position import resolve_live_position
-from app.services.relay_state import apply_relay_report, is_deferred_relay_reply, parse_relay_reply, relay_state_payload
+from app.services.relay_state import (
+    apply_relay_report,
+    device_status_payload,
+    is_deferred_relay_reply,
+    parse_relay_reply,
+)
 from app.services.tracker_models import BUILTIN_G900LS, RELAY_CAPABILITIES, TrackerProfile, profile_for_imei
 from app.models.command_log import CommandLog
 from app.services.geocoding import reverse_geocode, format_fallback_location
@@ -295,6 +300,7 @@ def _db_handle_login(imei: str) -> Optional[dict]:
         return {
             "id": device.id,
             "lifecycle": device.lifecycle,
+            "status_payload": device_status_payload(device),
         }
     finally:
         db.close()
@@ -317,7 +323,9 @@ def _db_handle_heartbeat(device_imei: str, data: Dict) -> dict:
             "device_id": device.id,
             "relay_cut": device.relay_cut,
             "relay_changed": relay_changed,
-            "relay_payload": relay_state_payload(device) if relay_changed else None,
+            # Battery/GSM/online arrive with every heartbeat: the app's
+            # Commands screen shows them live, so this goes out every time.
+            "status_payload": device_status_payload(device),
         }
     finally:
         db.close()
@@ -378,7 +386,7 @@ def _db_handle_alarm(device_imei: str, data: Dict, is_real_alarm: bool) -> dict:
             "device_id": device.id,
             "location_id": location.id,
             "relay_changed": relay_changed,
-            "relay_payload": relay_state_payload(device) if relay_changed else None,
+            "relay_payload": device_status_payload(device) if relay_changed else None,
             "geofence_transitions": geofence_transitions,
         }
     finally:
@@ -539,6 +547,10 @@ class GPSTrackerConnection:
         # anything that isn't a 0x7878 packet without a trace.
         self._pre_login_bytes = bytearray()
         self._pre_login_total = 0
+        # Packets other than login since this socket logged in. A socket
+        # that logs in and closes with none is watchdog evidence: on
+        # 2026-11-05 the tracker logged in every 1-2 min and sent no data.
+        self._packets_since_login = 0
         self._command_serial = 0xA000
         self._pending_response: asyncio.Future = None
         # Which command _pending_response is waiting on — lets
@@ -585,7 +597,21 @@ class GPSTrackerConnection:
             while True:
                 # Read data from tracker
                 if self.authenticated:
-                    data = await self.reader.read(1024)
+                    # Seen live 2026-11-04: the tracker's link died at 10:17
+                    # and this read never returned — the socket stayed
+                    # registered and the device "online" for days. A
+                    # logged-in tracker heartbeats every ~5 min, so silence
+                    # this long means the link is gone.
+                    try:
+                        data = await asyncio.wait_for(
+                            self.reader.read(1024), timeout=settings.TCP_IDLE_TIMEOUT_SECONDS
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            f"No data from {self.device_imei} ({self.address}) for "
+                            f"{settings.TCP_IDLE_TIMEOUT_SECONDS / 60:.0f} min — dead link, closing."
+                        )
+                        break
                 else:
                     # Seen live 2026-10-29: a tracker opened a socket every
                     # ~52s and none ever logged in; each was left open
@@ -598,6 +624,7 @@ class GPSTrackerConnection:
                             f"No login from {self.address} within {settings.TCP_LOGIN_TIMEOUT_SECONDS:.0f}s — "
                             f"closing. {self._describe_pre_login_bytes()}"
                         )
+                        self._record_if_silent()
                         break
 
                 if not data:
@@ -605,6 +632,7 @@ class GPSTrackerConnection:
                         logger.info(f"Connection closed by {self.address}")
                     else:
                         logger.info(f"Connection closed by {self.address} before login. {self._describe_pre_login_bytes()}")
+                        self._record_if_silent()
                     break
 
                 self.last_activity = datetime.utcnow()
@@ -629,11 +657,20 @@ class GPSTrackerConnection:
             # routine for cellular trackers, which reconnect within a second.
             # Not a server error, so no traceback.
             logger.info(f"Connection lost from {self.address} ({self.device_imei or 'not logged in'}): {e}")
+            if not self.authenticated:
+                self._record_if_silent()
         except Exception as e:
             logger.error(f"Error handling connection from {self.address}: {e}", exc_info=True)
         finally:
             await self.close()
     
+    def _record_if_silent(self) -> None:
+        """A socket that opened and sent nothing at all is evidence for the
+        tracker watchdog — the tracker reaches us but its data doesn't
+        (2026-11-04..08: one every ~52s for days)."""
+        if not self._pre_login_total:
+            self.server.record_silent_socket(self.address)
+
     def _describe_pre_login_bytes(self) -> str:
         if not self._pre_login_total:
             return "Received nothing."
@@ -690,10 +727,27 @@ class GPSTrackerConnection:
                 return
             
             logger.info(f"Parsed packet type: {parsed['type']} from {self.address}")
-            
+
+            if parsed['type'] != 'login':
+                if not self.authenticated:
+                    # Never ACK what we're about to drop: the ACK tells the
+                    # tracker the fix was delivered, so it deletes it from
+                    # its memory and never re-sends it. Unanswered, it keeps
+                    # it buffered and re-uploads it after logging in.
+                    logger.warning(
+                        f"Ignoring {parsed['type']} packet from {self.address} before login — not acknowledged"
+                    )
+                    return
+                self._packets_since_login += 1
+
             # Handle based on packet type
             if parsed['type'] == 'login':
                 await self.handle_login(parsed)
+                if not self.authenticated:
+                    # Rejected IMEI, or the login failed (e.g. DB error): an
+                    # ACK would make the tracker think it's logged in and
+                    # start sending fixes we'd drop. Unanswered, it retries.
+                    return
             elif parsed['type'] == 'location':
                 await self.handle_location(parsed)
             elif parsed['type'] == 'heartbeat':
@@ -737,8 +791,10 @@ class GPSTrackerConnection:
 
             logger.info(f"Device accepted: IMEI {imei} (id={device_info['id']}, lifecycle='{device_info['lifecycle']}')")
             self.authenticated = True
+            self._packets_since_login = 0
             # Register connection in server
             self.server.register_device(imei, self)
+            await self.server.broadcast_device_status(device_info["id"], device_info["status_payload"])
 
         except Exception as e:
             logger.error(f"Error handling login: {e}", exc_info=True)
@@ -791,10 +847,12 @@ class GPSTrackerConnection:
                        f"Signal: {data['signal_bars']}/4 bars")
 
             res = await asyncio.to_thread(_db_handle_heartbeat, self.device_imei, data)
-            if res.get("relay_changed") and res.get("relay_payload"):
+            if not res.get("found"):
+                return
+            if res.get("relay_changed"):
                 logger.info(f"Relay state for {self.device_imei}: "
                             f"{'CUT' if res.get('relay_cut') else 'connected'}")
-                await self.server.broadcast_device_status(res["device_id"], res["relay_payload"])
+            await self.server.broadcast_device_status(res["device_id"], res["status_payload"])
 
         except Exception as e:
             logger.error(f"Error handling heartbeat: {e}", exc_info=True)
@@ -993,7 +1051,7 @@ class GPSTrackerConnection:
                 return
             changed = apply_relay_report(device, cut)
             db.commit()
-            payload = relay_state_payload(device)
+            payload = device_status_payload(device)
             device_id = device.id
         finally:
             db.close()
@@ -1126,6 +1184,9 @@ class GPSTrackerConnection:
         """Close connection"""
         if self._relay_confirm_task is not None and not self._relay_confirm_task.done():
             self._relay_confirm_task.cancel()
+        if self.authenticated and self.device_imei and self._packets_since_login == 0:
+            self.server.record_login_without_data(self.device_imei)
+        offline_status = None
         try:
             # Only the CURRENT connection for this IMEI may mark the device
             # offline. A tracker that silently lost its mobile link reconnects
@@ -1143,6 +1204,7 @@ class GPSTrackerConnection:
                     if device:
                         device.status = 'offline'
                         db.commit()
+                        offline_status = (device.id, device_status_payload(device))
                         # Auto-end active trips when device stops sending
                         from app.services.trip_service import end_active_trips_for_device
                         ended = end_active_trips_for_device(device.id, db)
@@ -1150,7 +1212,9 @@ class GPSTrackerConnection:
                             logger.info("Auto-ended %d trip(s) for device %s (disconnected)", ended, self.device_imei)
                 finally:
                     db.close()
-            
+                if offline_status is not None:
+                    await self.server.broadcast_device_status(*offline_status)
+
             self.writer.close()
             try:
                 await self.writer.wait_closed()
@@ -1178,6 +1242,24 @@ class TCPServer:
         # Track recently rejected IMEIs (max 20) for the admin dashboard
         self.rejected_imeis = []
         self._rejection_lock: Optional[asyncio.Lock] = None
+        # Evidence of broken tracker links, for the tracker watchdog (see
+        # app/services/tracker_watchdog.py): when sockets opened and sent
+        # nothing at all (no IMEI to attribute them to), and per IMEI, when
+        # a logged-in socket closed without sending any data.
+        self._silent_sockets: deque = deque(maxlen=5000)
+        self._logins_without_data: Dict[str, deque] = {}
+
+    def record_silent_socket(self, address) -> None:
+        self._silent_sockets.append(datetime.utcnow())
+
+    def record_login_without_data(self, imei: str) -> None:
+        self._logins_without_data.setdefault(imei, deque(maxlen=500)).append(datetime.utcnow())
+
+    def silent_sockets_since(self, since: datetime) -> int:
+        return sum(1 for at in self._silent_sockets if at >= since)
+
+    def logins_without_data_since(self, imei: str, since: datetime) -> int:
+        return sum(1 for at in self._logins_without_data.get(imei, ()) if at >= since)
 
     async def record_rejection(self, imei: str, ip: str):
         """Record an unregistered IMEI connection attempt.
@@ -1276,10 +1358,12 @@ class TCPServer:
         await self.ws_manager.broadcast(device_id, payload)
 
     async def broadcast_device_status(self, device_id: int, relay_state: Dict):
-        """Broadcast a tracker-reported fuel/relay state change —
-        {"type": "device_status", "device_id", "relay_cut", "relay_state_at"}.
-        Sent only when the state changes (see apply_relay_report). Older
-        clients drop unknown message types, so this is backward-compatible.
+        """Broadcast the tracker's state — {"type": "device_status",
+        "device_id", **device_status_payload(device)}: relay_cut/
+        relay_state_at plus status, battery_level, gsm_signal, last_update.
+        Sent on every heartbeat, login, offline and relay change. Older
+        clients only read relay_cut/relay_state_at (and ignore an unchanged
+        report), so the extra fields and frequency are backward-compatible.
         """
         if self.ws_manager is None:
             return

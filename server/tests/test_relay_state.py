@@ -69,7 +69,7 @@ def _heartbeat(cut):
     return {"battery_percent": 80, "gsm_signal": 3, "signal_bars": 3, "oil_elec_disconnected": cut}
 
 
-async def test_heartbeat_records_relay_state_and_broadcasts_only_on_change(tcp_env, db_session):
+async def test_heartbeat_records_relay_state_and_broadcasts_every_report(tcp_env, db_session):
     device = Device(imei=IMEI, name="Truck", lifecycle="sold")
     db_session.add(device)
     db_session.commit()
@@ -81,13 +81,16 @@ async def test_heartbeat_records_relay_state_and_broadcasts_only_on_change(tcp_e
     assert device.relay_state_at is not None
     assert len(conn.server.statuses) == 1  # first report ever
 
+    # Unchanged relay state is still broadcast: every heartbeat carries the
+    # battery/GSM/online status the Commands screen shows live.
     await conn.handle_heartbeat(_heartbeat(False))
-    assert len(conn.server.statuses) == 1  # unchanged -> no broadcast
+    assert len(conn.server.statuses) == 2
+    assert conn.server.statuses[-1][1]["relay_cut"] is False
 
     await conn.handle_heartbeat(_heartbeat(True))
     db_session.refresh(device)
     assert device.relay_cut is True
-    assert len(conn.server.statuses) == 2
+    assert len(conn.server.statuses) == 3
     device_id, payload = conn.server.statuses[-1]
     assert device_id == device.id
     assert payload["relay_cut"] is True
@@ -103,7 +106,8 @@ async def test_heartbeat_without_status_byte_leaves_state_alone(tcp_env, db_sess
     await conn.handle_heartbeat(_heartbeat(None))
     db_session.refresh(device)
     assert device.relay_cut is True
-    assert conn.server.statuses == []
+    [(_, payload)] = conn.server.statuses  # the health status still goes out
+    assert payload["relay_cut"] is True and payload["relay_state_at"] is None
 
 
 class _FakeTcp:

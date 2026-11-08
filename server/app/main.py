@@ -142,17 +142,22 @@ async def lifespan(app: FastAPI):
     # Run trip stale checker: end active trips when device stops sending
     trip_stale_task = asyncio.create_task(_trip_stale_checker())
 
+    # Push admins when a tracker that was reporting goes quiet
+    from app.services.tracker_watchdog import TrackerWatchdog
+    tracker_watchdog_task = asyncio.create_task(TrackerWatchdog(tcp_server).run())
+
     yield
 
     # Shutdown
     logger.info("Shutting down...")
     await location_batcher.stop()
     await ws_module.manager.broadcaster.stop()
-    trip_stale_task.cancel()
-    try:
-        await trip_stale_task
-    except asyncio.CancelledError:
-        pass
+    for task in (trip_stale_task, tracker_watchdog_task):
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
     tcp_task.cancel()
     try:
         await tcp_task
